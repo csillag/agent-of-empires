@@ -530,16 +530,13 @@ pub struct AcpConfig {
     /// reducing the false-positive rate, but cannot rescue every wedge
     /// (transport-level stalls, child process hangs, lost terminal
     /// frames), so the watchdog stays as the vendor-agnostic floor.
-    /// Default 120s; raised
-    /// from 60s in #1360 so async-agent flows (Claude SDK `Agent` tool
-    /// with `isAsync: true`) get a longer wait window before the
-    /// watchdog cancels them. `0` disables the watchdog. Long-running
-    /// tools are not affected; the watchdog only fires when no
-    /// in-flight tool call is open. The async-agent extension lifts the
-    /// effective grace to at least 30 minutes when the daemon observes
-    /// an async-agent launch in the current prompt. Nonzero values
-    /// below 120 clamp up at runtime so a typo cannot disable the
-    /// watchdog accidentally. See #1240, #1360.
+    /// Default 1800s (30 min). A quiet turn with no end-of-turn cost
+    /// marker is indistinguishable from a long server-side think, so
+    /// nonzero values below 1800 clamp up at runtime; once the cost
+    /// marker lands a fixed 20s fast grace applies instead. `0`
+    /// disables the watchdog. Long-running tools are not affected; the
+    /// watchdog only fires when no in-flight tool call is open. See
+    /// #1240, #1360.
     #[serde(default = "default_silent_orphan_grace_secs")]
     #[setting(
         label = "Silent-orphan grace (s)",
@@ -627,7 +624,7 @@ fn default_compaction_reminder_percent() -> u8 {
 }
 
 fn default_silent_orphan_grace_secs() -> u32 {
-    120
+    1800
 }
 
 impl Default for AcpConfig {

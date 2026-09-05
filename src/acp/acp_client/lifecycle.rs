@@ -59,7 +59,7 @@ pub(crate) enum LifecycleSignal {
     /// running from the previous progress event.
     TerminalUsage,
     /// The Claude SDK `ScheduleWakeup` tool registered an absolute wake
-    /// timestamp. Suppresses the watchdog until `at + base_grace`,
+    /// timestamp. Suppresses the watchdog until `at + floor`,
     /// converted to a monotonic `Instant` deadline at signal receipt so
     /// wall-clock jumps don't perturb the suppression. After the
     /// deadline the watchdog rearms with its normal grace. See #1401.
@@ -365,7 +365,7 @@ pub(super) fn detect_off_protocol_work_completed(
 /// known to have succeeded, and a later `Failed` status means no
 /// wakeup was ever registered. Either case would let a real adapter
 /// wedge masquerade as a pending wake and pin the prompt open for
-/// `delay + base_grace`.
+/// `delay + floor`.
 ///
 /// Gate: source must be a `ToolCallUpdate` whose status is NOT
 /// `Failed` (Completed or InProgress are both acceptable; real
@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn wakeup_lifecycle_signal_none_on_failed_completion() {
         // A failed ScheduleWakeup means no wakeup was actually
-        // registered; suppressing for `delay + base_grace` would
+        // registered; suppressing for `delay + floor` would
         // hide a real adapter wedge.
         use agent_client_protocol::schema::v1::{
             ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
