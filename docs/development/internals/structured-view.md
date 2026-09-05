@@ -63,9 +63,9 @@ Three layers recover a turn that stops progressing:
 
 1. **Cancel escalation.** The agent ignores `session/cancel` mid-tool. After a ~10s grace the daemon ends the connection, SIGTERMs the runner, and respawns via `session/load`. Banner reason `agent_unresponsive`.
 2. **Force end turn (client).** No streaming chunk for 30s with no tool in flight surfaces a button that publishes a synthetic `Stopped` plus a best-effort cancel. With a tool in flight, or during a latched compaction phase, it stays hidden so it cannot discard real progress.
-3. **Silent-orphan watchdog (daemon).** The adapter finished streaming but never sent the `PromptResponse` that closes `session/prompt`. It fires only when no tool call is in flight, at least one progress notification has arrived, and none has arrived for `silent_orphan_grace_secs` (120, dropping to a fixed 20s once a cost-populated `UsageUpdate` lands). A turn that already emitted its cost-populated usage with no off-protocol work pending ends cleanly; otherwise the daemon cancels, waits 10s, SIGTERMs, and respawns.
+3. **Silent-orphan watchdog (daemon).** The adapter finished streaming but never sent the `PromptResponse` that closes `session/prompt`. It fires only when no tool call is in flight, at least one progress notification has arrived, and none has arrived for the effective grace. That grace is a fixed 20s once a cost-populated `UsageUpdate` lands and no off-protocol work is pending; without that marker the daemon waits `silent_orphan_grace_secs` (1800). A turn that already emitted its cost-populated usage with no off-protocol work pending ends cleanly; otherwise the daemon cancels, waits 10s, SIGTERMs, and respawns.
 
-**Off-protocol work** suppresses the watchdog, because some agent features go quiet with no ACP signal. An async `Agent` tool is tracked precisely (a tailer follows the sub-agent's transcript and an in-flight set keeps the watchdog from firing). `/compact` is detected from the adapter's text markers, since it emits no typed signal, and the start marker latches a 30-minute grace floor so a large compaction is never cut short; the same markers publish `ConversationCompactionStarted` / `ConversationCompacted` so both clients know the phase. A backgrounded `Bash` latches the floor until a cost-populated usage update arrives, and a `ScheduleWakeup` suppresses recovery until `wakeup_at` plus the floor, on a monotonic deadline that multiple wakeups extend. An agent-initiated turn that streamed output but reported no cost-bearing end and scheduled no wake is a stalled stream rather than a parked monitor, and recovers on its own 120s grace.
+**Off-protocol work** suppresses the watchdog, because some agent features go quiet with no ACP signal. An async `Agent` tool is tracked precisely (a tailer follows the sub-agent's transcript and an in-flight set keeps the watchdog from firing). `/compact` is detected from the adapter's text markers, since it emits no typed signal, and the start marker latches a 30-minute grace floor so a large compaction is never cut short; the same markers publish `ConversationCompactionStarted` / `ConversationCompacted` so both clients know the phase. A backgrounded `Bash` latches the floor until a cost-populated usage update arrives, and a `ScheduleWakeup` suppresses recovery until `wakeup_at` plus the floor, on a monotonic deadline that multiple wakeups extend. An agent-initiated turn that streamed output but reported no cost-bearing end and scheduled no wake waits the same floor: silence is not evidence the turn ended.
 
 ## Rate-limit handling
 
@@ -110,7 +110,7 @@ node_path = ""
 show_tool_durations = true
 compaction_reminder = false       # opt-in /compact nudge past the threshold
 compaction_reminder_percent = 75  # 1..99
-silent_orphan_grace_secs = 120    # 0 disables
+silent_orphan_grace_secs = 1800   # 0 disables; nonzero clamps up to 1800
 auto_stop_idle_secs = 3600        # 0 disables; the next prompt respawns the worker
 rate_limit_auto_resume = false
 ```

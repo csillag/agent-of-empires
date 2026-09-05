@@ -12,8 +12,10 @@ use super::lifecycle::{
     OffProtocolWorkKind,
 };
 
-/// Default silent-orphan grace, mirrored by `AcpConfig`.
-const SILENT_ORPHAN_GRACE_DEFAULT: Duration = Duration::from_secs(120);
+/// Default silent-orphan grace, mirrored by `AcpConfig`. Same as the
+/// off-protocol floor: without an end-of-turn cost marker, silence is not
+/// evidence the turn ended.
+const SILENT_ORPHAN_GRACE_DEFAULT: Duration = Duration::from_secs(30 * 60);
 
 /// Grace floor for work that continues without ACP progress. Finite so a
 /// real wedge still recovers.
@@ -33,9 +35,10 @@ pub(super) struct SilentOrphanWatchdogConfig {
 
 /// Per-prompt silent-orphan state machine. Time is injected for tests.
 ///
-/// An open tool call or a future wake always suppresses firing. Off-protocol
-/// work uses the grace floor; `cost_seen` switches to the fast grace until the
-/// next non-accounting signal clears it.
+/// An open tool call or a future wake always suppresses firing. Fast grace
+/// applies only once `cost_seen` is set and no off-protocol work is pending.
+/// Every other quiet turn waits the floor: silence alone is not evidence the
+/// turn ended.
 #[derive(Debug, Default)]
 pub(super) struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -45,17 +48,13 @@ pub(super) struct SilentOrphanWatchdog {
     tool_calls_in_flight: HashMap<String, bool>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<Instant>,
-    /// Distinguishes a stream that died mid-message from background work
-    /// still producing tool activity.
-    last_refresh_was_progress: bool,
 }
 
 impl SilentOrphanWatchdog {
-    fn refresh(&mut self, now: Instant, was_progress: bool) {
+    fn refresh(&mut self, now: Instant) {
         self.saw_first_progress = true;
         self.last_progress_at = Some(now);
         self.cost_seen = false;
-        self.last_refresh_was_progress = was_progress;
     }
 
     pub(super) fn apply_signal(
@@ -66,22 +65,22 @@ impl SilentOrphanWatchdog {
         cfg: SilentOrphanWatchdogConfig,
     ) {
         match sig {
-            LifecycleSignal::Progress => self.refresh(now, true),
+            LifecycleSignal::Progress => self.refresh(now),
             LifecycleSignal::CompactionStarted => {
-                self.refresh(now, true);
+                self.refresh(now);
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
             }
             LifecycleSignal::CompactionCompleted | LifecycleSignal::CompactionFailed => {
                 if self.off_protocol_work_seen == Some(OffProtocolWorkKind::Compaction) {
                     self.off_protocol_work_seen = None;
                 }
-                self.refresh(now, true);
+                self.refresh(now);
             }
             LifecycleSignal::ToolStarted {
                 id,
                 is_background_task,
             } => {
-                self.refresh(now, false);
+                self.refresh(now);
                 // OR, so a later `InProgress` without raw_input keeps the flag.
                 *self.tool_calls_in_flight.entry(id).or_default() |= is_background_task;
             }
@@ -91,7 +90,7 @@ impl SilentOrphanWatchdog {
                 off_protocol_work,
             } => {
                 let started_as_background = self.tool_calls_in_flight.remove(&id).unwrap_or(false);
-                self.refresh(now, false);
+                self.refresh(now);
                 // The raw_input flag only counts on success: a failed launch
                 // leaves nothing running.
                 let kind = off_protocol_work.or((succeeded && started_as_background)
@@ -112,7 +111,7 @@ impl SilentOrphanWatchdog {
                 }
             }
             LifecycleSignal::WakeupPending { at } => {
-                self.refresh(now, false);
+                self.refresh(now);
                 self.off_protocol_work_seen = Some(OffProtocolWorkKind::ScheduledWakeup);
                 // Monotonic deadline with the floor as a tail so the agent has
                 // room to resume after `at`. Later wakes only extend it.
@@ -130,17 +129,17 @@ impl SilentOrphanWatchdog {
     }
 
     pub(super) fn effective_grace(&self, cfg: SilentOrphanWatchdogConfig) -> Duration {
-        // A background command whose last refresh was stream output is a dead
-        // stream, not a quietly running command (#2645).
-        let background_stream_stall = self.off_protocol_work_seen
-            == Some(OffProtocolWorkKind::BackgroundCommand)
-            && self.last_refresh_was_progress;
-        if self.off_protocol_work_seen.is_some() && !background_stream_stall {
-            cfg.base_grace.max(cfg.off_protocol_grace_floor)
-        } else if self.cost_seen && cfg.fast_grace > Duration::ZERO {
+        // The cost marker is the only evidence a quiet turn ended. Without it,
+        // silence after a tool result or a partial message is indistinguishable
+        // from the model thinking, so the floor applies whether or not
+        // off-protocol work was seen.
+        if self.off_protocol_work_seen.is_none()
+            && self.cost_seen
+            && cfg.fast_grace > Duration::ZERO
+        {
             cfg.fast_grace
         } else {
-            cfg.base_grace
+            cfg.base_grace.max(cfg.off_protocol_grace_floor)
         }
     }
 
@@ -215,7 +214,8 @@ fn debug_ms_override(var: &str) -> Option<u64> {
     }
 }
 
-/// `0` disables the watchdog; other configured values clamp up to 120s.
+/// `0` disables the watchdog. Any other configured value clamps up to the
+/// off-protocol floor: a shorter grace cancels turns that are only thinking.
 pub(super) fn silent_orphan_grace(profile: Option<&str>) -> Duration {
     if let Some(ms) = debug_ms_override("AOE_SILENT_ORPHAN_GRACE_MS") {
         return Duration::from_millis(ms);
@@ -226,7 +226,7 @@ pub(super) fn silent_orphan_grace(profile: Option<&str>) -> Duration {
     };
     match acp.map(|acp| acp.silent_orphan_grace_secs) {
         Some(0) => Duration::ZERO,
-        Some(secs) => Duration::from_secs(u64::from(secs).max(120)),
+        Some(secs) => Duration::from_secs(u64::from(secs)).max(OFF_PROTOCOL_WORK_GRACE_FLOOR),
         None => SILENT_ORPHAN_GRACE_DEFAULT,
     }
 }
@@ -338,13 +338,13 @@ mod tests {
                 ],
             ),
             (
-                "compaction completed restores base grace",
+                "compaction completed without cost still waits the floor",
                 vec![
                     At(0, L::CompactionStarted),
                     At(180 * S, L::CompactionCompleted),
                     Off(None),
-                    Fires(299 * S, false),
-                    Fires(301 * S, true),
+                    Fires(301 * S, false),
+                    Fires(180 * S + 30 * 60 * S + S, true),
                 ],
             ),
             (
@@ -374,7 +374,8 @@ mod tests {
                     Cost(false),
                     Fires(30 * S, false),
                     Fires(60 * S, false),
-                    Fires(125 * S, true),
+                    Fires(125 * S, false),
+                    Fires(2 * S + 30 * 60 * S + S, true),
                 ],
             ),
             // #1858
@@ -425,16 +426,15 @@ mod tests {
                     Fires(20 * 60 * S, false),
                 ],
             ),
-            // #2645
             (
-                "background then stream stall recovers on base grace",
+                "background stream stall without cost rides the floor",
                 vec![
                     At(0, L::Progress),
                     At(S, done("bg", true, Some(K::BackgroundCommand))),
                     At(2 * S, L::Progress),
                     Off(Some(K::BackgroundCommand)),
-                    Fires(60 * S, false),
-                    Fires(125 * S, true),
+                    Fires(125 * S, false),
+                    Fires(25 * 60 * S, false),
                 ],
             ),
             (
@@ -532,7 +532,8 @@ mod tests {
                     At(S, start("bg", true)),
                     At(2 * S, done("bg", false, None)),
                     Off(None),
-                    Fires(125 * S, true),
+                    Fires(125 * S, false),
+                    Fires(2 * S + 30 * 60 * S + S, true),
                 ],
             ),
             (
