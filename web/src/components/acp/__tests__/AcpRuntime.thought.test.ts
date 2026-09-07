@@ -47,10 +47,7 @@ describe("reasoning-summary rows", () => {
   });
 
   it("joins a run of streamed thought chunks into one block", () => {
-    const out = render([
-      row("t1", "thinking", "Checking the"),
-      row("t2", "thinking", "port forwards."),
-    ]);
+    const out = render([row("t1", "thinking", "Checking the"), row("t2", "thinking", "port forwards.")]);
     expect(out.match(/💭/g) ?? []).toHaveLength(1);
     expect(out).toContain("Checking the");
     expect(out).toContain("port forwards.");
