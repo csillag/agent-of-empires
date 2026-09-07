@@ -196,6 +196,17 @@ export interface ApprovalOption {
   kind: ApprovalOptionKind;
 }
 
+/** A pick the daemon persisted without a running agent to apply it: the
+ *  session has no structured-view worker, so the value takes effect on the
+ *  next spawn. Lives on `AcpState.configOptionDeferred` so the UI can say so
+ *  instead of leaving the picker looking unchanged and unexplained. Auto-clears
+ *  when a later snapshot shows the value did land. */
+export interface ConfigOptionDeferred {
+  configId: string;
+  value: string;
+  at: string;
+}
+
 export interface Approval {
   nonce: string;
   tool_call: ToolCall;
@@ -910,6 +921,10 @@ export interface AcpState {
    *  next snapshot confirms the originally-requested value, or on
    *  `AgentSwitched`. */
   configOptionSwitchFailed: ConfigOptionSwitchFailure | null;
+  /** Non-blocking notice for a pick the daemon persisted while no worker
+   *  was running. Auto-clears when a snapshot shows the value applied, or
+   *  on `AgentSwitched`. */
+  configOptionDeferred: ConfigOptionDeferred | null;
   /** Set when the user clicks a model/effort option and the POST is
    *  in flight; cleared by the next `ConfigOptionsUpdated` snapshot
    *  (which reconciles authoritative state) or by
@@ -1269,6 +1284,7 @@ export function emptyAcpState(): AcpState {
     lastAgentSwitch: null,
     configOptions: [],
     configOptionSwitchFailed: null,
+    configOptionDeferred: null,
     pendingConfigOption: null,
   };
 }
@@ -1455,6 +1471,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       const confirmed = options.some((opt) => opt.id === failure.configId && opt.current_value === failure.value);
       if (confirmed) {
         next.configOptionSwitchFailed = null;
+      }
+    }
+    // Same for a deferred pick: the spawn applied it and the agent said so.
+    if (next.configOptionDeferred) {
+      const deferred = next.configOptionDeferred;
+      const applied = options.some((opt) => opt.id === deferred.configId && opt.current_value === deferred.value);
+      if (applied) {
+        next.configOptionDeferred = null;
       }
     }
     return next;
@@ -1686,6 +1710,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Per-adapter selectors belong to the previous backend. See #1403.
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
+    next.configOptionDeferred = null;
     next.pendingConfigOption = null;
     return next;
   }
@@ -2006,6 +2031,7 @@ export function normaliseTurnState(
     usageBaseline?: { cost: number } | null;
     configOptions?: ConfigOptionDescriptor[];
     configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
+    configOptionDeferred?: ConfigOptionDeferred | null;
     pendingConfigOption?: { configId: string; value: string } | null;
     compactionReminderDismissed?: SessionUsage | null;
   },
@@ -2037,6 +2063,7 @@ export function normaliseTurnState(
   // Pre-#1403 persisted entries lack the config-option trio.
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
+  const configOptionDeferred = state.configOptionDeferred === undefined ? null : state.configOptionDeferred;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
   // Pre-#3253 persisted entries lack the compaction-reminder dismissal;
   // backfill to null so a warm hydrate starts armed rather than reading
@@ -2059,6 +2086,7 @@ export function normaliseTurnState(
     usageBaseline,
     configOptions,
     configOptionSwitchFailed,
+    configOptionDeferred,
     pendingConfigOption,
     compactionReminderDismissed,
     serverTurnActive,

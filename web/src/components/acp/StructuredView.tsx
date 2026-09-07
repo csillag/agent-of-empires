@@ -41,7 +41,7 @@ import { promptRepinDecision } from "../../lib/promptRepin";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
-import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
+import { ConfigOptionDeferredNotice, ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { CompactionReminderBanner } from "./CompactionReminderBanner";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { SwitchAgentModal } from "./SwitchAgentModal";
@@ -331,6 +331,7 @@ function AcpChrome({
   dismissModeSwitchFailed,
   setConfigOption,
   dismissConfigOptionSwitchFailed,
+  dismissConfigOptionDeferred,
   canLoadEarlierHistory,
   loadEarlierHistory,
   loadingEarlierHistory,
@@ -950,6 +951,12 @@ function AcpChrome({
                 failure={state.configOptionSwitchFailed}
                 configOptions={state.configOptions}
                 onDismiss={dismissConfigOptionSwitchFailed}
+              />
+
+              <ConfigOptionDeferredNotice
+                deferred={state.configOptionDeferred}
+                configOptions={state.configOptions}
+                onDismiss={dismissConfigOptionDeferred}
               />
 
               <ContextPrimerBanner

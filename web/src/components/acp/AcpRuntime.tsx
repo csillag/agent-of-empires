@@ -118,6 +118,7 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
+  dismissConfigOptionDeferred: () => void;
   /** True when older rows exist above the rendered window, either already
    *  in the reducer (client window) or still on the server (recent-first
    *  paging), so the view can offer a "Load earlier" control. See #2236. */
@@ -334,6 +335,7 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
+        dismissConfigOptionDeferred: acp.dismissConfigOptionDeferred,
         canLoadEarlierHistory,
         loadEarlierHistory,
         loadingEarlierHistory: loadingOlder,

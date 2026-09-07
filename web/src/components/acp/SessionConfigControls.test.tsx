@@ -8,12 +8,17 @@
 //   - click invokes the callback with (config_id, value) and not the
 //     option's display name,
 //   - hidden chrome when the adapter advertises neither category,
-//   - non-blocking switch-failed notice renders + dismisses.
+//   - non-blocking switch-failed notice renders + dismisses,
+//   - deferred-pick notice renders + dismisses.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
-import { ConfigOptionSwitchFailedNotice, SessionConfigControls } from "./SessionConfigControls";
+import {
+  ConfigOptionDeferredNotice,
+  ConfigOptionSwitchFailedNotice,
+  SessionConfigControls,
+} from "./SessionConfigControls";
 import type { ConfigOptionDescriptor } from "../../lib/acpTypes";
 
 afterEach(() => {
@@ -395,6 +400,55 @@ describe("ConfigOptionSwitchFailedNotice", () => {
           reason: "rate limited",
           at: new Date().toISOString(),
         }}
+        configOptions={[modelOption()]}
+        onDismiss={fn}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss notice" }));
+    expect(fn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ConfigOptionDeferredNotice", () => {
+  it("renders nothing when nothing is deferred", () => {
+    const { container } = render(<ConfigOptionDeferredNotice deferred={null} configOptions={[]} onDismiss={vi.fn()} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("names the option and the value that will apply on the next start", () => {
+    render(
+      <ConfigOptionDeferredNotice
+        deferred={{ configId: "model", value: "claude-sonnet-4-6", at: new Date().toISOString() }}
+        configOptions={[modelOption()]}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const notice = screen.getByTestId("config-option-deferred-notice");
+    expect(notice.textContent ?? "").toContain("Model");
+    expect(notice.textContent ?? "").toContain("Claude Sonnet 4.6");
+    expect(notice.textContent ?? "").toContain("resumes");
+  });
+
+  // A pick made while the session is parked is exactly the case where the
+  // adapter's option list may not have been refreshed, so the raw value has
+  // to survive to the notice rather than rendering as blank.
+  it("falls back to the raw ids when the option list has no entry", () => {
+    render(
+      <ConfigOptionDeferredNotice
+        deferred={{ configId: "model", value: "opus[1m]", at: new Date().toISOString() }}
+        configOptions={[]}
+        onDismiss={vi.fn()}
+      />,
+    );
+    const notice = screen.getByTestId("config-option-deferred-notice");
+    expect(notice.textContent ?? "").toContain("opus[1m]");
+  });
+
+  it("invokes onDismiss when the dismiss button is clicked", () => {
+    const fn = vi.fn();
+    render(
+      <ConfigOptionDeferredNotice
+        deferred={{ configId: "model", value: "claude-sonnet-4-6", at: new Date().toISOString() }}
         configOptions={[modelOption()]}
         onDismiss={fn}
       />,
