@@ -54,6 +54,15 @@ pub struct SpawnConfig {
     /// changed model pin must only re-resolve inherited effort: an explicit
     /// effort is a session pin and a changed model default does not touch it.
     pub default_effort_explicit: bool,
+    /// Optional model to apply through the adapter's `category:"model"` config
+    /// option after the handshake, on a fresh session (`session/new`,
+    /// `session/fork`) and on a resumed one (`session/load`) alike.
+    ///
+    /// The env var carrying the same value (`AOE_AGENT_MODEL`) only reaches
+    /// aoe's own agent; claude-agent-acp and codex-acp never read it, and a
+    /// `session/load` restores the model recorded in the resumed transcript.
+    /// Without this re-apply a picked model reverts on every respawn.
+    pub default_model: Option<String>,
     /// Optional default mode to apply on fresh ACP sessions through the
     /// adapter's `category:"mode"` config option. Applied strictly: a value
     /// the agent does not advertise no-ops with a warning.
@@ -552,6 +561,7 @@ mod tests {
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -593,6 +603,7 @@ mod tests {
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,

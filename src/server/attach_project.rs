@@ -352,6 +352,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             additional_dirs: vec![],
             provider_env: vec![],
             model: inst.agent_model.clone(),
+            assert_model: inst.agent_model_pending,
             effort: None,
             effort_explicit: false,
             // The whole point of taking the session down and bringing it back:

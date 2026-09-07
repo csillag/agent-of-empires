@@ -220,6 +220,14 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     });
                 }
             }
+
+            // Disarm `agent_model_pending` once the agent reports the pinned
+            // model as current: the pick has landed, so no later respawn should
+            // assert it again. Leaving it armed is what would turn a one-off
+            // recovery into a pin that overrides whatever the user picks next
+            // outside aoe. A snapshot that does NOT confirm the value leaves it
+            // armed, so a failed apply is retried on the next spawn.
+            clear_model_pending_if_applied(&state, &frame.session_id, options).await;
         }
 
         // Smart-rename defer: fire the one-shot only on a clean
@@ -943,6 +951,55 @@ pub(super) fn apply_acp_session_change(
         }
     }
     Some(inst.source_profile.clone())
+}
+
+/// Clear `Instance.agent_model_pending` when `options` shows the session's
+/// pinned model is the one the agent is running. Writes memory and disk
+/// together, like `persist_selector`. No-op for a session that has no armed
+/// pin, which is every session in the common case, so the instance lock is
+/// taken for a read first and the storage write only happens on a real change.
+async fn clear_model_pending_if_applied(
+    state: &Arc<AppState>,
+    session_id: &str,
+    options: &[crate::acp::state::ConfigOptionDescriptor],
+) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+            return;
+        };
+        if !inst.agent_model_pending {
+            return;
+        }
+        let Some(pinned) = inst.agent_model.as_deref() else {
+            return;
+        };
+        let applied = options.iter().any(|opt| {
+            matches!(opt.category, crate::acp::state::ConfigOptionCategory::Model)
+                && opt.current_value == pinned
+        });
+        if !applied {
+            return;
+        }
+        inst.agent_model_pending = false;
+        inst.source_profile.clone()
+    };
+    let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) else {
+        return;
+    };
+    let id_owned = session_id.to_string();
+    if let Err(e) = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+            inst.agent_model_pending = false;
+        }
+        Ok(())
+    }) {
+        tracing::warn!(
+            target: "acp.event_listener",
+            session = %session_id,
+            "failed to clear agent_model_pending: {e}"
+        );
+    }
 }
 
 /// What an event tells the ACP-session-id listener to do. `None` means

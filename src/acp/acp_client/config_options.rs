@@ -154,6 +154,24 @@ pub(super) fn mode_config_id(
     })
 }
 
+/// Id of the first `Select` config option in the `model` category, or `None`.
+/// Mirrors `mode_config_id`.
+pub(super) fn model_config_id(
+    options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::v1::SessionConfigId> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
+
+    options.iter().find_map(|option| {
+        if !matches!(option.category, Some(SessionConfigOptionCategory::Model)) {
+            return None;
+        }
+        if !matches!(option.kind, SessionConfigKind::Select(_)) {
+            return None;
+        }
+        Some(option.id.clone())
+    })
+}
+
 /// Build a structured view `ConfigOptionDescriptor` from an ACP
 /// `SessionConfigOption`. Returns `None` when the option has a kind
 /// the structured view does not yet render (today everything except `Select`).
@@ -527,5 +545,36 @@ mod tests {
         // No config_options field at all (the adapter omitted it) returns
         // None so callers skip the emit and cached selectors persist.
         assert!(config_options_event(None).is_none());
+    }
+
+    /// The re-apply resolves the model option by CATEGORY, not by a hardcoded
+    /// `"model"` id: an adapter is free to name it anything, and picking the
+    /// wrong option here would set a model value on the mode picker.
+    #[test]
+    fn model_config_id_selects_by_category_not_by_id() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        let mode = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "default",
+            vec![SessionConfigSelectOption::new("default", "Manual")],
+        )
+        .category(SessionConfigOptionCategory::Mode);
+        let model = SessionConfigOption::select(
+            "not-called-model",
+            "Model",
+            "opus",
+            vec![SessionConfigSelectOption::new("opus", "Opus")],
+        )
+        .category(SessionConfigOptionCategory::Model);
+
+        assert_eq!(
+            model_config_id(&[mode.clone(), model]).map(|id| id.0.to_string()),
+            Some("not-called-model".to_string())
+        );
+        // No model option advertised: the caller skips rather than guessing.
+        assert!(model_config_id(&[mode]).is_none());
     }
 }

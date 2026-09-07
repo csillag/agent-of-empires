@@ -518,6 +518,11 @@ pub struct SpawnRequest {
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
+    /// Assert [`Self::model`] through the agent's model config option after the
+    /// handshake. Set only from `Instance.agent_model_pending`, i.e. when the
+    /// user's pick has not reached an agent yet. The `AOE_AGENT_MODEL` env var
+    /// is exported either way, for aoe's own agent.
+    pub assert_model: bool,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default. Only explicit
     /// effort survives a model-pin change without being re-resolved.
@@ -1705,6 +1710,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             provider_env,
             model,
+            assert_model,
             effort,
             effort_explicit,
             stored_acp_session_id,
@@ -1903,7 +1909,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         let mut env = provider_env;
-        if let Some(model) = model {
+        // Kept for aoe's own agent, which reads AOE_AGENT_MODEL. Every other
+        // adapter ignores it, so the same value also travels as
+        // `default_model` and is applied through the config option below.
+        if let Some(model) = model.clone() {
             env.push(("AOE_AGENT_MODEL".into(), model));
         }
 
@@ -1960,6 +1969,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             host_environment,
             default_effort: effort,
             default_effort_explicit: effort_explicit,
+            default_model: assert_model.then_some(model).flatten(),
             default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
@@ -5024,6 +5034,7 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5258,6 +5269,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5293,6 +5305,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5506,6 +5519,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
@@ -5595,6 +5609,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5700,6 +5715,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5776,6 +5792,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5922,6 +5939,7 @@ cursor-acp-bridge = "agent acp"
                 host_environment: vec![],
                 default_effort: None,
                 default_effort_explicit: false,
+                default_model: None,
                 default_mode: None,
                 socket_path: Some(tmp.path().join("dummy.sock")),
                 stored_acp_session_id: None,
@@ -7894,6 +7912,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -7967,6 +7986,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,

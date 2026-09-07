@@ -538,6 +538,7 @@ pub(crate) async fn spawn_structured_session(
                             cwd,
                             additional_dirs: vec![],
                             provider_env: vec![],
+                            assert_model: model.is_some(),
                             model,
                             effort,
                             effort_explicit,
