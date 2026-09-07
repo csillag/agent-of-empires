@@ -223,6 +223,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&req.agent);
+        let pinned = acp_defaults.is_some_and(|defaults| defaults.pin_model);
         let (model, effort) = crate::session::config::resolve_spawn_model_effort(
             acp_defaults,
             req.model.clone(),
@@ -349,7 +350,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
-                default_model: model,
+                // A pin is re-asserted. A stored model is re-asserted only while
+                // `assert_model` says no agent has seen it yet.
+                default_model: (req.assert_model || pinned).then_some(model).flatten(),
                 socket_path: Some(socket_path),
                 stored_acp_session_id,
                 fork_from,

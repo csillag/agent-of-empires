@@ -230,6 +230,7 @@ pub(super) fn spawn_request(session_id: &str) -> SpawnRequest {
         additional_dirs: vec![],
         provider_env: vec![],
         model: None,
+        assert_model: false,
         effort: None,
         effort_explicit: false,
         stored_acp_session_id: None,

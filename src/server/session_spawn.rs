@@ -307,8 +307,12 @@ pub(crate) async fn spawn_structured_session(
                 // Terminal sessions keep only an explicitly requested model,
                 // never an ACP-derived default (agent_model is ACP-only).
                 instance.agent_model = explicit_model;
+                instance.agent_model_pending = false;
                 // acp_effort is ACP-only too: nothing applies it in tmux mode.
                 instance.acp_effort = None;
+            } else {
+                // An explicit create-time pick has not reached an agent yet.
+                instance.agent_model_pending = explicit_model.is_some();
             }
 
             agent_effort
@@ -399,6 +403,7 @@ pub(crate) async fn spawn_structured_session(
                     instance.source_profile.clone(),
                     instance.yolo_mode,
                     instance.acp_mode_id.clone(),
+                    instance.agent_model_pending,
                     instance.command.clone(),
                     instance.import_pending == Some(true),
                     instance.fork_pending.clone(),
@@ -425,6 +430,7 @@ pub(crate) async fn spawn_structured_session(
                 source_profile,
                 yolo_mode,
                 acp_mode_id,
+                assert_model,
                 command,
                 seed_history_replay,
                 fork_from,
@@ -483,6 +489,7 @@ pub(crate) async fn spawn_structured_session(
                             additional_dirs: vec![],
                             provider_env: vec![],
                             model,
+                            assert_model,
                             effort,
                             effort_explicit,
                             stored_acp_session_id,

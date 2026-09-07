@@ -316,6 +316,12 @@ pub struct Instance {
     pub agent_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// Armed only when a model pick has not reached an agent yet. A later
+    /// spawn asserts it through the model config option, then a confirming
+    /// options snapshot clears it. A stored model with this false is not
+    /// re-asserted: it may be older than a model chosen outside aoe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_model_pending: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

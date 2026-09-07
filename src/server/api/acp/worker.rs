@@ -133,6 +133,7 @@ pub async fn spawn_acp(
             .map(|p| (p.key, p.value))
             .collect(),
         model: req.model.or_else(|| instance.agent_model.clone()),
+        assert_model: req.model.is_some() || instance.agent_model_pending,
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
     match state.acp_supervisor.spawn(request).await {
@@ -388,6 +389,7 @@ pub async fn switch_acp_agent(
     // adapter-specific, so the old pick is dropped too.
     let request = SpawnRequest {
         model: model.clone(),
+        assert_model: model.is_some(),
         effort: None,
         effort_explicit: false,
         stored_acp_session_id: None,

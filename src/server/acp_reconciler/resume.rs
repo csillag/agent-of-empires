@@ -325,6 +325,7 @@ async fn build_spawn_request(
         acp_mode_id,
         acp_effort,
         agent_model,
+        agent_model_pending,
         claude_store_pin,
     ) = {
         let _guard = inst_lock.lock().await;
@@ -339,6 +340,7 @@ async fn build_spawn_request(
             inst.acp_mode_id.clone(),
             inst.acp_effort.clone(),
             inst.agent_model.clone(),
+            inst.agent_model_pending,
             inst.selected_claude_conversation()
                 .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
         )
@@ -376,6 +378,7 @@ async fn build_spawn_request(
         additional_dirs: vec![],
         provider_env: vec![],
         model: agent_model,
+        assert_model: agent_model_pending,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.
         effort_explicit: acp_effort.is_some(),
         effort: acp_effort,

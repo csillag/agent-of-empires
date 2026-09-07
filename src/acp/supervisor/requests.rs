@@ -194,7 +194,10 @@ impl<S: BroadcastSink> Supervisor<S> {
             .get_mut(session_id)
             .map(|h| &mut h.kind)
         {
+            // The live agent already took this pick. Update the env channel
+            // and do not arm another config-option assert on the cached respawn.
             set_spawn_model(spawn_config, Some(model.to_string()));
+            spawn_config.default_model = None;
         }
     }
 

@@ -220,6 +220,10 @@ pub struct SpawnRequest {
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
+    /// Assert `model` through the agent's model config option after the
+    /// handshake. Set only when no agent has seen this pick yet. The
+    /// `AOE_AGENT_MODEL` env var is exported either way.
+    pub assert_model: bool,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default.
     pub effort_explicit: bool,
