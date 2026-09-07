@@ -19,8 +19,7 @@ pub(super) const OFF_PROTOCOL_WORK_GRACE_FLOOR: std::time::Duration =
 
 /// Default silent-orphan grace, mirrored by `AcpConfig`. Equal to the floor:
 /// the daemon has no evidence a quiet turn ended until the cost marker lands.
-pub(super) const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration =
-    OFF_PROTOCOL_WORK_GRACE_FLOOR;
+pub(super) const SILENT_ORPHAN_GRACE_DEFAULT: std::time::Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
 
 /// Short grace after end-of-turn accounting arrives without PromptResponse.
 pub(super) const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration =
@@ -376,8 +375,7 @@ pub(super) fn silent_orphan_grace(profile: Option<&str>) -> std::time::Duration 
             if secs == 0 {
                 std::time::Duration::ZERO
             } else {
-                std::time::Duration::from_secs(u64::from(secs))
-                    .max(OFF_PROTOCOL_WORK_GRACE_FLOOR)
+                std::time::Duration::from_secs(u64::from(secs)).max(OFF_PROTOCOL_WORK_GRACE_FLOOR)
             }
         }
         None => SILENT_ORPHAN_GRACE_DEFAULT,
@@ -779,7 +777,10 @@ mod tests {
         // The cost marker is the evidence the turn ended: fast grace applies.
         let wrapped = done + std::time::Duration::from_secs(10 * 60);
         w.apply_signal(LifecycleSignal::TerminalUsage, wrapped, wall, cfg);
-        assert!(w.should_fire(wrapped + cfg.fast_grace + std::time::Duration::from_secs(1), cfg));
+        assert!(w.should_fire(
+            wrapped + cfg.fast_grace + std::time::Duration::from_secs(1),
+            cfg
+        ));
     }
 
     #[tokio::test]
