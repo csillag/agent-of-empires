@@ -25,20 +25,31 @@ pub fn shim_path() -> std::path::PathBuf {
         .join("shim.mjs")
 }
 
-/// `Ok(())` when the structured view shim can be spawned; otherwise a reason
-/// callers print before skipping.
+/// `Ok(())` when the structured view shim can be spawned. `Err(reason)` only
+/// when an external tool is genuinely absent, which callers print before
+/// skipping.
+///
+/// A shim that is present but unusable panics instead: a missing file or
+/// uninstalled deps is a fixable setup error, and a silent skip reports success
+/// for tests that never ran. CI installs the deps before the integration leg; a
+/// developer runs the command in the panic message.
 pub fn shim_ready() -> Result<(), String> {
     shim_node()?;
     let shim = shim_path();
-    if !shim.exists() {
-        return Err(format!("shim missing at {}", shim.display()));
-    }
+    assert!(
+        shim.exists(),
+        "structured view test shim missing at {}; the checkout is incomplete",
+        shim.display()
+    );
     let node_modules = shim.parent().unwrap().join("node_modules");
-    if !node_modules.exists() {
-        return Err(
-            "shim deps not installed; run `cd acp-worker/test-shim && npm ci` first".into(),
-        );
-    }
+    assert!(
+        node_modules.exists(),
+        "structured view test shim deps not installed at {}; \
+         run `cd acp-worker/test-shim && npm ci` and re-run. Failing rather than \
+         skipping: node is available, so these tests CAN run here, and a silent \
+         skip reports success for a test that never executed",
+        node_modules.display()
+    );
     Ok(())
 }
 
