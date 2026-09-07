@@ -123,8 +123,12 @@ export function activityToThreadMessages(
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
       currentAssistant.appendText(`_${row.text}_`);
-    } else if (row.kind !== "thinking") {
-      // Thinking shows in the spinner; message and unknown kinds render as text.
+    } else if (row.kind === "thinking") {
+      // Reasoning-summary text. The thinking phase is still the spinner; this is
+      // the agent's own account of its reasoning, which recent models use instead
+      // of a text block. It must not look like an answer addressed to the user.
+      currentAssistant.appendThought(row.text);
+    } else {
       currentAssistant.appendText(row.text);
     }
   }
@@ -156,6 +160,8 @@ class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
+  /** The trailing part is an open reasoning-summary block the next thought row extends. */
+  private thoughtRunOpen = false;
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -164,13 +170,35 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
+    // A trailing summary is a text part too. Merging into it would splice the
+    // summary onto the answer.
+    const afterThought = this.thoughtRunOpen;
+    this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
-    if (last && last.type === "text") last.text += text;
+    if (!afterThought && last && last.type === "text") last.text += text;
     else this.parts.push({ type: "text", text });
+  }
+
+  /** Quoted reasoning-summary block. Consecutive thought rows extend it. */
+  appendThought(text: string) {
+    const body = text.trim();
+    if (!body) return;
+    const quoted = body
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    const last = this.parts[this.parts.length - 1];
+    if (this.thoughtRunOpen && last && last.type === "text") {
+      last.text += `\n${quoted}`;
+      return;
+    }
+    this.parts.push({ type: "text", text: `> 💭 *thinking*\n>\n${quoted}` });
+    this.thoughtRunOpen = true;
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
   appendToolCall(tool: ToolCall) {
+    this.thoughtRunOpen = false;
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;

@@ -108,6 +108,7 @@ impl EventStore {
                          OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                          OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
                          OR json_extract(event_json, '$.AgentMessageChunk') IS NOT NULL
+                         OR json_extract(event_json, '$.AgentThoughtChunk') IS NOT NULL
                          OR json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
                          -- A unit variant serializes as a bare JSON string.
                          OR event_json = '\"ThinkingStarted\"')

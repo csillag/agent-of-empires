@@ -1108,6 +1108,27 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Reasoning-summary body: dimmed and prefixed so it never reads as a message
+/// the agent addressed to the user. Plain text, not markdown.
+fn agent_thought_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let body = text.trim();
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 { "· " } else { "  " },
+                    Style::default().fg(theme.dimmed),
+                ),
+                Span::styled(line.to_string(), Style::default().fg(theme.dimmed)),
+            ])
+        })
+        .collect()
+}
+
 /// Agent reply as theme-neutral markdown, or `…` when it renders empty.
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     let body = crate::tui::markdown::render(text);
@@ -1152,6 +1173,23 @@ fn transcript_lines(
                     i += 1;
                 }
                 out.extend(agent_message_lines(&text, theme));
+                out.push(Line::default());
+                continue;
+            }
+            TranscriptRowKind::Thinking => {
+                // Same run-coalescing as `Message`, but rendered dimmed and
+                // marked so it never reads as something the agent said to the
+                // user. See `TranscriptRowKind::Thinking`.
+                let group = &row.group_id;
+                let mut text = String::new();
+                while i < rows.len()
+                    && rows[i].kind == TranscriptRowKind::Thinking
+                    && &rows[i].group_id == group
+                {
+                    text.push_str(&rows[i].text);
+                    i += 1;
+                }
+                out.extend(agent_thought_lines(&text, theme));
                 out.push(Line::default());
                 continue;
             }

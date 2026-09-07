@@ -670,7 +670,7 @@ export interface ActivityRow {
 export interface TranscriptRow {
   id: string;
   group_id: string;
-  kind: Exclude<ActivityRow["kind"], "thinking">;
+  kind: ActivityRow["kind"];
   at: string;
   text: string;
   tool_call_id?: string;

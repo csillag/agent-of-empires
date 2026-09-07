@@ -166,7 +166,21 @@ pub(super) fn map_update_to_events(
             }],
             other => vec![raw_event(&other)],
         },
-        SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
+        // `ThinkingStarted` is the turn-activity signal and always rides. When
+        // the chunk carries text, keep the words too: recent models route what
+        // reads as narration ("Both port forwards verified, passing this to
+        // the implementer now") into the thought channel instead of emitting a
+        // text block, so without this the user sees a turn of bare tool calls
+        // and the only record of what the agent thought it said is discarded.
+        // Adapters stream signature-only chunks with empty text; those carry
+        // no words and stay activity-only.
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) if !text.text.trim().is_empty() => vec![
+                Event::ThinkingStarted,
+                Event::AgentThoughtChunk { text: text.text },
+            ],
+            _ => vec![Event::ThinkingStarted],
+        },
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty rather than "null" without raw_input (#1713).
@@ -584,6 +598,35 @@ mod tests {
         // reset() forgets the open block.
         d.reset();
         assert!(!d.observe(&text_chunk("ab", Some("m5"))));
+    }
+
+
+    /// A thought chunk with words must keep them. Signature-only chunks stay
+    /// activity-only: recent models route narration into this channel instead
+    /// of a text block, and dropping the words loses the only record.
+    #[test]
+    fn map_agent_thought_chunk_keeps_text_and_still_signals_activity() {
+        use agent_client_protocol::schema::v1::ContentBlock;
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                "Both port forwards verified; handing to the implementer now.",
+                &["thinking_started", "agent_thought_chunk"],
+            ),
+            ("", &["thinking_started"]),
+            ("  \n ", &["thinking_started"]),
+            ("x", &["thinking_started", "agent_thought_chunk"]),
+        ];
+        for (text, want) in cases {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let events = map_update_to_events(
+                SessionUpdate::AgentThoughtChunk(chunk),
+                &agent_profiles::CLAUDE,
+            );
+            assert_eq!(kinds(&events), want, "chunk {text:?}");
+            if let Some(Event::AgentThoughtChunk { text: got }) = events.get(1) {
+                assert_eq!(got, text, "text preserved verbatim");
+            }
+        }
     }
 
     #[test]
