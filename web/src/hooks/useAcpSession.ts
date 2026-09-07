@@ -375,13 +375,29 @@ export function useAcpSession(
     async (configId: string, value: string) => {
       if (!sessionId) return;
       dispatch({ kind: "set_pending_config_option", configId, value });
-      await postReportingErrors(
-        dispatch,
-        acpUrl(sessionId, "config-option"),
-        jsonPost({ config_id: configId, value }),
-        [`set ${configId}`, `setting ${configId}`],
-        () => dispatch({ kind: "clear_pending_config_option_if_match", configId, value }),
-      );
+      try {
+        const res = await fetch(acpUrl(sessionId, "config-option"), jsonPost({ config_id: configId, value }));
+        if (!res.ok) {
+          const detail = await safeText(res);
+          dispatch({ kind: "clear_pending_config_option_if_match", configId, value });
+          dispatch({ kind: "error", message: `Could not set ${configId} (${res.status}). ${detail}`.trim() });
+          return;
+        }
+        // A body we cannot read as deferred stays on the live path: pending
+        // clears when the agent snapshot arrives.
+        let applied: unknown;
+        try {
+          applied = (await res.json())?.applied;
+        } catch {
+          applied = undefined;
+        }
+        if (applied === "deferred") {
+          dispatch({ kind: "config_option_deferred", configId, value });
+        }
+      } catch (e) {
+        dispatch({ kind: "clear_pending_config_option_if_match", configId, value });
+        dispatch({ kind: "error", message: `Network error setting ${configId}: ${describeError(e)}` });
+      }
     },
     [sessionId],
   );
@@ -404,6 +420,7 @@ export function useAcpSession(
       dismissRejectedPrompt: (id: string) => dispatch({ kind: "dismiss_rejected_prompt", id }),
       dismissModeSwitchFailed: () => dispatch({ kind: "dismiss_mode_switch_failed" }),
       dismissConfigOptionSwitchFailed: () => dispatch({ kind: "dismiss_config_option_switch_failed" }),
+      dismissConfigOptionDeferred: () => dispatch({ kind: "dismiss_config_option_deferred" }),
     }),
     [],
   );

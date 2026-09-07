@@ -62,7 +62,9 @@ export type Action =
   | { kind: "clear_pending_config_option" }
   // Only clears when still matching, so a stale failed request can't wipe a newer click.
   | { kind: "clear_pending_config_option_if_match"; configId: string; value: string }
-  | { kind: "dismiss_config_option_switch_failed" };
+  | { kind: "dismiss_config_option_switch_failed" }
+  | { kind: "config_option_deferred"; configId: string; value: string }
+  | { kind: "dismiss_config_option_deferred" };
 
 export type ApprovalResolveOutcome = { kind: "resolved" } | { kind: "error"; message: string };
 
@@ -292,6 +294,18 @@ export function reducer(state: AcpState, action: Action): AcpState {
     }
     case "dismiss_config_option_switch_failed":
       return { ...state, configOptionSwitchFailed: null };
+    case "config_option_deferred":
+      return {
+        ...state,
+        pendingConfigOption: null,
+        configOptionDeferred: {
+          configId: action.configId,
+          value: action.value,
+          at: new Date().toISOString(),
+        },
+      };
+    case "dismiss_config_option_deferred":
+      return { ...state, configOptionDeferred: null };
     default:
       return emptyAcpState();
   }
