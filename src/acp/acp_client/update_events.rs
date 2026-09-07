@@ -242,7 +242,21 @@ pub(super) fn map_update_to_events(
             }],
             other => vec![raw_event(&other)],
         },
-        SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
+        // `ThinkingStarted` is the turn-activity signal and always rides. When
+        // the chunk carries text, keep the words too: recent models route what
+        // reads as narration ("Both port forwards verified, passing this to
+        // the implementer now") into the thought channel instead of emitting a
+        // text block, so without this the user sees a turn of bare tool calls
+        // and the only record of what the agent thought it said is discarded.
+        // Adapters stream signature-only chunks with empty text; those carry
+        // no words and stay activity-only.
+        SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
+            ContentBlock::Text(text) if !text.text.trim().is_empty() => vec![
+                Event::ThinkingStarted,
+                Event::AgentThoughtChunk { text: text.text },
+            ],
+            _ => vec![Event::ThinkingStarted],
+        },
         SessionUpdate::ToolCall(tc) => {
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty (not the literal "null") when the agent ships no
@@ -1047,6 +1061,39 @@ mod tests {
                 assert!(attachments.is_empty());
             }
             other => panic!("expected UserPromptSent, got {other:?}"),
+        }
+    }
+
+    /// A thought chunk with words must keep them. Recent models route what
+    /// reads as narration into this channel instead of a text block, so
+    /// dropping it (as the mapper did before) loses the only record of what
+    /// the agent believed it told the user. Signature-only chunks carry no
+    /// words and stay activity-only.
+    #[test]
+    fn map_agent_thought_chunk_keeps_text_and_still_signals_activity() {
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
+        // (chunk text, expected event kinds)
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                "Both port forwards verified; handing to the implementer now.",
+                &["thinking_started", "agent_thought_chunk"],
+            ),
+            ("", &["thinking_started"]),
+            // Whitespace-only is as wordless as empty.
+            ("  \n ", &["thinking_started"]),
+            ("x", &["thinking_started", "agent_thought_chunk"]),
+        ];
+        for (text, want) in cases {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            let events = map_update_to_events(
+                SessionUpdate::AgentThoughtChunk(chunk),
+                &agent_profiles::CLAUDE,
+            );
+            let kinds: Vec<&str> = events.iter().map(transcript_event_kind).collect();
+            assert_eq!(kinds, want, "chunk {text:?}");
+            if let Some(Event::AgentThoughtChunk { text: got }) = events.get(1) {
+                assert_eq!(got, text, "text preserved verbatim");
+            }
         }
     }
 

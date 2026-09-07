@@ -546,8 +546,12 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
       );
     } else if (row.kind === "thinking") {
-      // Thinking is rendered by the global rattle spinner, not the
-      // message stream.
+      // Reasoning-summary text. The thinking *phase* is still the global
+      // rattle spinner; this is the agent's own account of its reasoning,
+      // which recent models use for what reads as narration instead of
+      // emitting a text block. Rendering it keeps a turn of bare tool calls
+      // from looking like the agent said nothing at all.
+      currentAssistant.appendThought(row.text);
     } else if (row.kind === "empty_output") {
       // Synthesised when the agent finished a turn without emitting any
       // text or tool calls (e.g. interactive-only slash commands like
@@ -607,6 +611,9 @@ class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
+  /** Whether the trailing part is an open reasoning-summary block that the
+   *  next thought row should extend rather than restart. */
+  private thoughtRunOpen = false;
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -615,15 +622,41 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
+    // A trailing reasoning-summary block is a text part too, so merging into
+    // it would splice the summary onto the answer and make the two
+    // indistinguishable. Start a fresh part instead.
+    const afterThought = this.thoughtRunOpen;
+    this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
-    if (last && last.type === "text") {
+    if (!afterThought && last && last.type === "text") {
       last.text += text;
     } else {
       this.parts.push({ type: "text", text });
     }
   }
 
+  /** Append reasoning-summary text as its own quoted block. Consecutive
+   *  thought rows extend the open block; anything else closes it, so a
+   *  summary never merges into an adjacent assistant message and cannot be
+   *  mistaken for something the agent addressed to the user. */
+  appendThought(text: string) {
+    const body = text.trim();
+    if (!body) return;
+    const quoted = body
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    const last = this.parts[this.parts.length - 1];
+    if (this.thoughtRunOpen && last && last.type === "text") {
+      last.text += `\n${quoted}`;
+      return;
+    }
+    this.parts.push({ type: "text", text: `> 💭 *thinking*\n>\n${quoted}` });
+    this.thoughtRunOpen = true;
+  }
+
   appendToolCall(tool: ToolCall) {
+    this.thoughtRunOpen = false;
     // Forward the ACP tool title alongside the args so per-kind
     // renderers can show a descriptive label when raw_input is
     // empty (Claude's bash tool, for example, often emits an empty
