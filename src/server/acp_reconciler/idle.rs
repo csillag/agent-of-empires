@@ -98,18 +98,29 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
     }
 }
 
-/// A worker is auto-stopped only when enabled, not mid-turn, and its last
-/// event is at least `threshold_secs` old. No events means never.
+/// A worker is auto-stopped only when enabled, not mid-turn, and both its last
+/// event and its own start are at least `threshold_secs` old. No events means
+/// never. `worker_started_ms == None` (no registry record) falls back to the
+/// event age.
 fn should_auto_stop(
     now_ms: i64,
     last_event_ms: Option<i64>,
+    worker_started_ms: Option<i64>,
     threshold_secs: u32,
     in_flight: bool,
 ) -> bool {
-    threshold_secs > 0
-        && !in_flight
-        && last_event_ms
-            .is_some_and(|ms| now_ms.saturating_sub(ms) >= i64::from(threshold_secs) * 1000)
+    if threshold_secs == 0 || in_flight {
+        return false;
+    }
+    let window_ms = i64::from(threshold_secs) * 1000;
+    // A worker younger than the threshold cannot have been idle for it,
+    // whatever the event store says. A prompt-wake spawns the worker before
+    // any event records the prompt, so the newest row is still the one from
+    // before the session went dormant.
+    if worker_started_ms.is_some_and(|ms| now_ms.saturating_sub(ms) < window_ms) {
+        return false;
+    }
+    last_event_ms.is_some_and(|ms| now_ms.saturating_sub(ms) >= window_ms)
 }
 
 fn set_dormant(inst: &mut Instance, dormant: bool) {
@@ -190,10 +201,17 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
     for (id, profile, idle_secs) in live {
+        // Pre-check before the registry read. `None` is deliberate: worker age
+        // is consulted only for sessions already outside the event window.
         let last_ms = latest.get(&id).copied();
-        if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
+        if !should_auto_stop(now_ms, last_ms, None, idle_secs, false) {
             continue;
         }
+        let worker_started_ms = crate::process::worker_registry::load(&id)
+            .ok()
+            .flatten()
+            .and_then(|rec| i64::try_from(rec.started_at).ok())
+            .map(|secs| secs.saturating_mul(1000));
         // Re-check mid-turn: a turn may have started since the snapshot.
         let in_flight = query_store(
             &state.acp_event_store,
@@ -203,7 +221,7 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         )
         .await
         .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
+        if !should_auto_stop(now_ms, last_ms, worker_started_ms, idle_secs, in_flight)
             || !set_dormant_in_memory(state, &id, true).await
         {
             continue;
@@ -239,12 +257,21 @@ mod tests {
     fn should_auto_stop_policy() {
         const HOUR_MS: i64 = 3_600_000;
         let cases = [
-            ("disabled threshold", HOUR_MS * 24, Some(0), 0, false, false),
-            ("in flight", HOUR_MS * 24, Some(0), 3600, true, false),
+            ("disabled threshold", HOUR_MS * 24, Some(0), None, 0, false, false),
+            (
+                "in flight",
+                HOUR_MS * 24,
+                Some(0),
+                None,
+                3600,
+                true,
+                false,
+            ),
             (
                 "idle past threshold",
                 HOUR_MS * 2,
                 Some(0),
+                None,
                 3600,
                 false,
                 true,
@@ -253,16 +280,43 @@ mod tests {
                 "within threshold",
                 HOUR_MS,
                 Some(HOUR_MS / 2),
+                None,
                 3600,
                 false,
                 false,
             ),
-            ("no events", HOUR_MS * 24, None, 3600, false, false),
-            ("exactly at threshold", HOUR_MS, Some(0), 3600, false, true),
+            ("no events", HOUR_MS * 24, None, None, 3600, false, false),
+            (
+                "exactly at threshold",
+                HOUR_MS,
+                Some(0),
+                None,
+                3600,
+                false,
+                true,
+            ),
+            (
+                "just spawned despite an ancient event",
+                HOUR_MS * 24,
+                Some(0),
+                Some(HOUR_MS * 24 - 300),
+                3600,
+                false,
+                false,
+            ),
+            (
+                "worker older than the window",
+                HOUR_MS * 24,
+                Some(0),
+                Some(HOUR_MS * 22),
+                3600,
+                false,
+                true,
+            ),
         ];
-        for (name, now, last, threshold, in_flight, expected) in cases {
+        for (name, now, last, started, threshold, in_flight, expected) in cases {
             assert_eq!(
-                should_auto_stop(now, last, threshold, in_flight),
+                should_auto_stop(now, last, started, threshold, in_flight),
                 expected,
                 "{name}"
             );
