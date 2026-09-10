@@ -70,6 +70,12 @@ use crate::events::{self, Order, SeqBound};
 /// the tailer's 300s `ABORT_AFTER`. See #2573.
 const BACKGROUND_AGENT_STALE_AFTER_MS: i64 = 6 * 60 * 1000;
 
+/// Activity this old stops counting toward `has_agent_turn_in_flight`, so a
+/// turn whose agent died without any terminator cannot pin a stale-build
+/// worker on its old binary forever. Generous on purpose: a foreground
+/// command can run for a long time without a single event.
+const AGENT_TURN_STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+
 const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
@@ -1878,6 +1884,85 @@ impl EventStore {
         open.is_some()
     }
 
+    /// True while the session works on a turn the agent started itself, which
+    /// `has_in_flight_turn` cannot see: that probe only counts turns opened by
+    /// a `UserPromptSent`, and an agent woken by a peer message, a monitor or a
+    /// scheduled wakeup starts one with no prompt behind it.
+    ///
+    /// Reads the newest substantive event after the latest terminator
+    /// (`Stopped` / `AgentStartupError`). A cost-populated `UsageUpdated` is
+    /// the end-of-turn marker, so it means the turn wrapped up; any other event
+    /// means work is under way. Activity older than `AGENT_TURN_STALE_AFTER_MS`
+    /// stops counting. Fails closed: an unreadable log must not license
+    /// killing a worker.
+    pub fn has_agent_turn_in_flight(&self, session_id: &str) -> bool {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let epoch_start: i64 = match conn
+            .query_row(
+                "SELECT MAX(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
+                params![session_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+        {
+            Ok(v) => v.flatten().unwrap_or(0),
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_agent_turn_in_flight epoch query for {session_id}: {e}");
+                return true;
+            }
+        };
+        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+            .iter()
+            .map(|_| "AND event_json NOT LIKE ?")
+            .collect::<Vec<_>>()
+            .join("\n                   ");
+        let sql = format!(
+            "SELECT event_json, created_at FROM acp_events
+                 WHERE session_id = ?
+                   AND seq > ?
+                   {clauses}
+                 ORDER BY seq DESC
+                 LIMIT 1"
+        );
+        let mut bind: Vec<rusqlite::types::Value> =
+            vec![session_id.to_string().into(), epoch_start.into()];
+        bind.extend(
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
+                .iter()
+                .map(|name| format!("{{\"{name}\":%").into()),
+        );
+        let (json, created_at) = match conn
+            .query_row(&sql, rusqlite::params_from_iter(bind), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .optional()
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return false,
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_agent_turn_in_flight latest event for {session_id}: {e}");
+                return true;
+            }
+        };
+        if chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(created_at)
+            > AGENT_TURN_STALE_AFTER_MS
+        {
+            return false;
+        }
+        match serde_json::from_str::<Event>(&json) {
+            Ok(Event::UsageUpdated { usage }) => usage.cost.is_none(),
+            Ok(_) | Err(_) => true,
+        }
+    }
+
     /// Latest `created_at` (ms since epoch) per session for the given
     /// ids, in a single grouped query. Sessions with no events are
     /// absent from the returned map. Backed by the
@@ -3497,6 +3582,65 @@ mod tests {
             .unwrap();
         // Progress older than the window with no Completed: treated as gone.
         assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    /// A turn the agent started itself (a peer message, a monitor, a wakeup)
+    /// has no `UserPromptSent`, so `has_in_flight_turn` misses it and a
+    /// restart onto a new build killed it mid-command.
+    #[test]
+    fn has_agent_turn_in_flight_sees_a_turn_with_no_prompt_behind_it() {
+        let (_tmp, store) = open_store(1000);
+        let tool = || Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: "tc-1".into(),
+                name: "Bash".into(),
+                kind: "execute".into(),
+                args_preview: String::new(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        let stopped = || Event::Stopped {
+            reason: "agent_idle".into(),
+        };
+        let usage = |cost: Option<f64>| Event::UsageUpdated {
+            usage: crate::acp::state::SessionUsage {
+                used: 1,
+                size: 2,
+                cost: cost.map(|amount| crate::acp::state::UsageCost {
+                    amount,
+                    currency: "USD".into(),
+                }),
+            },
+        };
+        let cases: Vec<(&str, Vec<Event>, bool)> = vec![
+            ("s-empty", vec![], false),
+            ("s-idle", vec![stopped()], false),
+            ("s-tool", vec![stopped(), tool()], true),
+            ("s-thinking", vec![stopped(), Event::ThinkingStarted], true),
+            (
+                "s-wrapped",
+                vec![stopped(), tool(), usage(Some(0.1))],
+                false,
+            ),
+            ("s-mid-usage", vec![stopped(), tool(), usage(None)], true),
+            ("s-closed", vec![stopped(), tool(), stopped()], false),
+        ];
+        for (sid, events, want) in cases {
+            for (i, event) in events.iter().enumerate() {
+                store.record(sid, i as u64 + 1, event).unwrap();
+            }
+            assert_eq!(store.has_agent_turn_in_flight(sid), want, "{sid}");
+        }
+        // Activity past the staleness bound no longer counts.
+        store.record("s-stale", 1, &stopped()).unwrap();
+        let three_hours_ago = Utc::now().timestamp_millis() - 3 * 60 * 60 * 1000;
+        store
+            .record_at("s-stale", 2, &tool(), three_hours_ago)
+            .unwrap();
+        assert!(!store.has_agent_turn_in_flight("s-stale"));
     }
 
     #[test]

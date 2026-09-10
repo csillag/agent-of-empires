@@ -164,6 +164,9 @@ struct ResumeTarget {
     stored_acp_session_id: Option<String>,
     source_profile: String,
     in_flight_turn: bool,
+    /// A turn the agent started itself is under way (`has_agent_turn_in_flight`).
+    /// Only the build-stale adopt decision reads it.
+    agent_turn_open: bool,
     yolo_mode: bool,
     /// `Instance.command`: the resolved launch command (from
     /// `session.agent_command_override` / `--cmd-override`). Threaded
@@ -510,6 +513,14 @@ pub async fn reconcile_acp_workers(
                     false
                 }
             };
+        // Fail closed: a probe that cannot answer must not license killing a
+        // stale-build worker that may be mid-command.
+        let store = Arc::clone(&state.acp_event_store);
+        let id_owned = id.clone();
+        let agent_turn_open =
+            tokio::task::spawn_blocking(move || store.has_agent_turn_in_flight(&id_owned))
+                .await
+                .unwrap_or(true);
         // Mark before spawning so the next 2s tick doesn't double-poke
         // while the parallel resume task is still in flight. A task
         // that returns RetryAfterAttachTimeout will clear itself below.
@@ -523,6 +534,7 @@ pub async fn reconcile_acp_workers(
             stored_acp_session_id,
             source_profile,
             in_flight_turn,
+            agent_turn_open,
             yolo_mode,
             command,
         });
@@ -1039,8 +1051,9 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 
 /// Respawn build-stale workers that were adopted mid-turn (flagged via
 /// `Supervisor::mark_build_respawn_pending` in `resume_one`) once their
-/// in-flight turn has finished. Idle is detected with the same
-/// `has_in_flight_turn` event-store probe the resume pass uses.
+/// in-flight turn has finished. Idle means neither the same
+/// `has_in_flight_turn` probe the resume pass uses nor
+/// `has_agent_turn_in_flight` sees work under way.
 ///
 /// For each drained session this mirrors `aoe acp restart`: write the
 /// restart marker so the reaper publishes `restart_pending` (the UI shows
@@ -1052,21 +1065,24 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
     for id in state.acp_supervisor.respawn_pending_ids() {
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
-        let in_flight =
-            match tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe)).await {
-                Ok(v) => v,
-                // Probe failed: assume still busy so a transient error
-                // never hard-kills a possibly-live turn. Retried next tick.
-                Err(e) => {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        error = %e,
-                        "in-flight probe failed for draining stale worker; deferring respawn"
-                    );
-                    true
-                }
-            };
+        let in_flight = match tokio::task::spawn_blocking(move || {
+            store.has_in_flight_turn(&id_probe) || store.has_agent_turn_in_flight(&id_probe)
+        })
+        .await
+        {
+            Ok(v) => v,
+            // Probe failed: assume still busy so a transient error
+            // never hard-kills a possibly-live turn. Retried next tick.
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    error = %e,
+                    "in-flight probe failed for draining stale worker; deferring respawn"
+                );
+                true
+            }
+        };
         if in_flight {
             continue;
         }
@@ -1599,7 +1615,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             crate::process::worker_registry::is_record_live(r),
             crate::process::worker_registry::is_build_current(r),
             crate::process::worker_registry::is_runner_current(r),
-            in_flight_turn,
+            // A turn the agent started itself is just as busy as a prompted one:
+            // treating it as idle SIGTERMs the worker mid-command.
+            in_flight_turn || target.agent_turn_open,
         )
     });
     let kind = match decision {
@@ -2117,6 +2135,10 @@ async fn resume_target_for_session(
         stored_acp_session_id: inst.acp_session_id.clone(),
         source_profile: inst.source_profile.clone(),
         in_flight_turn: false,
+        // No store probe on the prompt-wake path. Assume busy, so a live
+        // stale-build runner is adopted and drained rather than killed; the
+        // drain pass decides with the real probe.
+        agent_turn_open: true,
         yolo_mode: inst.yolo_mode,
         command: inst.command.clone(),
     })
@@ -2388,6 +2410,7 @@ mod tests {
             stored_acp_session_id: None,
             source_profile: "default".to_string(),
             in_flight_turn: false,
+            agent_turn_open: false,
             yolo_mode: false,
             command: String::new(),
         };
@@ -2430,6 +2453,7 @@ mod tests {
             stored_acp_session_id: None,
             source_profile: "default".to_string(),
             in_flight_turn: false,
+            agent_turn_open: false,
             yolo_mode: false,
             command: String::new(),
         };
@@ -3265,6 +3289,7 @@ mod tests {
             stored_acp_session_id: None,
             source_profile: String::new(),
             in_flight_turn: false,
+            agent_turn_open: false,
             yolo_mode: false,
             command: String::new(),
         };
