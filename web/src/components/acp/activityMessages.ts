@@ -156,12 +156,24 @@ type DraftPart =
     };
 type ToolPart = Extract<DraftPart, { type: "tool-call" }>;
 
+/** A reasoning summary as a quoted block under a thinking marker. */
+function quoteThought(raw: string): string {
+  const quoted = raw
+    .trim()
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  return `> 💭 *thinking*\n>\n${quoted}`;
+}
+
 class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
   /** The trailing part is an open reasoning-summary block the next thought row extends. */
   private thoughtRunOpen = false;
+  /** Verbatim text of the open reasoning-summary block, as streamed. */
+  private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -179,20 +191,20 @@ class AssistantBuilder {
     else this.parts.push({ type: "text", text });
   }
 
-  /** Quoted reasoning-summary block. Consecutive thought rows extend it. */
+  /** Quoted reasoning-summary block. Consecutive thought rows extend it.
+   *  Fragments are joined verbatim and the whole block is re-quoted: quoting
+   *  each fragment on its own line turned every mid-word split into a space. */
   appendThought(text: string) {
-    const body = text.trim();
-    if (!body) return;
-    const quoted = body
-      .split("\n")
-      .map((line) => `> ${line}`)
-      .join("\n");
+    if (!text) return;
     const last = this.parts[this.parts.length - 1];
     if (this.thoughtRunOpen && last && last.type === "text") {
-      last.text += `\n${quoted}`;
+      this.thoughtRaw += text;
+      last.text = quoteThought(this.thoughtRaw);
       return;
     }
-    this.parts.push({ type: "text", text: `> 💭 *thinking*\n>\n${quoted}` });
+    if (!text.trim()) return;
+    this.thoughtRaw = text;
+    this.parts.push({ type: "text", text: quoteThought(this.thoughtRaw) });
     this.thoughtRunOpen = true;
   }
 

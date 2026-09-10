@@ -46,11 +46,42 @@ describe("reasoning-summary rows", () => {
     expect(answer).not.toContain("I should check the ports.");
   });
 
-  it("joins a run of streamed thought chunks into one block", () => {
-    const out = render([row("t1", "thinking", "Checking the"), row("t2", "thinking", "port forwards.")]);
+  // Fragments exactly as a real summary streamed on 2026-09-08. They split
+  // mid-word ("met" + "adata") and carry the spaces between words at their
+  // edges. The first version of this test split only at word boundaries,
+  // the one case where joining fragments with line breaks looks right; in
+  // the dashboard it rendered "API/ met adata tim estamp (Sept 2, 2 026 U TC)".
+  it("joins streamed fragments verbatim, even when they split mid-word", () => {
+    const fragments = [
+      "Found that E",
+      "UINHU26-139433",
+      "'s printed date",
+      " (Sept 1, ",
+      "2026) diverges from the",
+      " API/",
+      "met",
+      "adata tim",
+      "estamp (Sept ",
+      "2, 2",
+      "026 ",
+      "U",
+      "TC).",
+    ];
+    const out = render(fragments.map((f, i) => row(`t${i}`, "thinking", f)));
     expect(out.match(/💭/g) ?? []).toHaveLength(1);
-    expect(out).toContain("Checking the");
-    expect(out).toContain("port forwards.");
+    expect(out).toContain(
+      "> Found that EUINHU26-139433's printed date (Sept 1, 2026) diverges from the API/metadata timestamp (Sept 2, 2026 UTC).",
+    );
+  });
+
+  it("keeps a whitespace-only fragment that falls between words", () => {
+    const out = render([row("t1", "thinking", "word"), row("t2", "thinking", " "), row("t3", "thinking", "next")]);
+    expect(out).toContain("> word next");
+  });
+
+  it("quotes every line of a summary whose line break spans fragments", () => {
+    const out = render([row("t1", "thinking", "First line\nSec"), row("t2", "thinking", "ond line")]);
+    expect(out).toContain("> First line\n> Second line");
   });
 
   it("ignores an empty summary rather than emitting an empty quote", () => {
