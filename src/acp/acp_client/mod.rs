@@ -61,7 +61,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::ByteStreams;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -94,6 +94,8 @@ pub struct AcpClient {
     /// The detached runner this client launched, which its lease owns.
     runner_pid: Option<u32>,
     pub(crate) native_store: Option<crate::session::ExecutionBinding>,
+    /// Epoch-ms of the last notification past the session fence. 0 = none yet.
+    last_notification_at: Arc<AtomicI64>,
 }
 
 /// What the connection task needs to serve agent fs/* and terminal/* requests.
@@ -173,6 +175,7 @@ impl Launch {
         let (ready_tx, ready_rx) = oneshot::channel();
         let pending_responders: PendingResponders = Arc::new(Mutex::new(HashMap::new()));
         let label = self.session_id.0.clone();
+        let last_notification_at = Arc::new(AtomicI64::new(0));
         let params = ConnectionParams {
             event_tx,
             cmd_rx,
@@ -194,6 +197,7 @@ impl Launch {
             default_model: self.default_model,
             mcp_servers: self.mcp_servers,
             runner,
+            last_notification_at: Arc::clone(&last_notification_at),
         };
         let span = tracing::info_span!("acp_session", session = %label);
         tokio::spawn(run_connection_task(transport, params).instrument(span));
@@ -205,6 +209,7 @@ impl Launch {
             _child: child,
             runner_pid: None,
             native_store: None,
+            last_notification_at,
         };
         (client, ready_rx)
     }
@@ -224,6 +229,7 @@ impl AcpClient {
             _child: None,
             runner_pid: None,
             native_store: None,
+            last_notification_at: Arc::new(AtomicI64::new(0)),
         };
         (client, event_tx)
     }
@@ -256,6 +262,19 @@ impl AcpClient {
             .await
             .expect("recorder drain")
             .expect("recorder acknowledgement");
+    }
+
+    /// Wall-clock ms of the last notification this connection received, or
+    /// `None` before the first. Moves while post-load replay suppression
+    /// keeps the event store quiet, which is what the idle reaper needs.
+    pub fn last_notification_ms(&self) -> Option<i64> {
+        match self
+            .last_notification_at
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            ms => Some(ms),
+        }
     }
 
     /// Attached and stdio clients have none.

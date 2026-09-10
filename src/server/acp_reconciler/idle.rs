@@ -203,7 +203,11 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
     for (id, profile, idle_secs) in live {
         // Pre-check before the registry read. `None` is deliberate: worker age
         // is consulted only for sessions already outside the event window.
-        let last_ms = latest.get(&id).copied();
+        // The store can stay quiet while the worker is busy: after a respawn's
+        // session/load, transcript events are dropped as history replay until
+        // the next prompt, so a turn the agent starts itself never reaches it.
+        let live_ms = state.acp_supervisor.last_notification_ms(&id).await;
+        let last_ms = latest.get(&id).copied().max(live_ms);
         if !should_auto_stop(now_ms, last_ms, None, idle_secs, false) {
             continue;
         }

@@ -40,8 +40,12 @@ pub(super) struct Shared {
     /// the adapter replays history the event store already holds.
     pub(super) suppress_history_replay: AtomicBool,
     /// Epoch-ms of the last inbound notification, for the resume-idle
-    /// watchdog.
+    /// watchdog. Starts at "now" so a reattached worker is not immediately idle.
     pub(super) last_event_at: AtomicI64,
+    /// Epoch-ms of the last notification past the session fence, for the idle
+    /// reaper. Starts at 0: sharing `last_event_at` would give every reattached
+    /// worker a fresh idle hour after each daemon restart.
+    pub(super) last_notification_at: Arc<AtomicI64>,
     /// A lifecycle-bearing notification arrived after attach. Ambient
     /// updates do not prove turn progress.
     pub(super) first_event_after_attach: AtomicBool,
@@ -80,6 +84,7 @@ impl Shared {
         prompt_in_flight: Arc<AtomicBool>,
         sandbox: Option<&SessionSandbox>,
         ingress: Arc<SessionIngress>,
+        last_notification_at: Arc<AtomicI64>,
     ) -> Self {
         // A sandboxed session's sub-agent transcripts live in the container.
         let bg_transcript_source = match sandbox {
@@ -96,6 +101,7 @@ impl Shared {
             profile,
             suppress_history_replay: AtomicBool::new(false),
             last_event_at: AtomicI64::new(now_ms()),
+            last_notification_at,
             first_event_after_attach: AtomicBool::new(false),
             prompt_sent_since_attach: AtomicBool::new(false),
             terminal_claim,
@@ -169,6 +175,10 @@ impl Shared {
         local_prompt_signals: bool,
     ) {
         self.last_event_at.store(now_ms(), Ordering::Relaxed);
+        // Before replay suppression, and only for a notification that already
+        // passed the session fence (callers do). A suppressed transcript event
+        // never reaches the store, so this is the clock the idle reaper uses.
+        self.last_notification_at.store(now_ms(), Ordering::Relaxed);
         let suppressing = self.suppress_history_replay.load(Ordering::Relaxed);
         // Drop the adapter's leaked restatement before anything sees it
         // (#2281). Replayed history resets rather than feeds the deduper.

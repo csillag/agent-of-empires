@@ -44,6 +44,7 @@ mod acp_smoke;
 mod acp_session_delete;
 
 mod acp_effort_respawn;
+mod acp_idle_clock;
 
 mod acp_model_respawn;
 
