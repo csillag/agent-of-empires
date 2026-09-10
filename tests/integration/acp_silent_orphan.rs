@@ -3,8 +3,8 @@
 //! turn emitted before going quiet decides the reason:
 //!   1. wrapped up (cost-bearing usage_update) then silent: the turn finished,
 //!      so `prompt_complete` on the fast grace, no cancel, no restart (#2237).
-//!   2. never wrapped up: a real wedge, so the base grace expires and the
-//!      watchdog cancels with `prompt_orphaned`.
+//!   2. never wrapped up: silence is not evidence the turn ended, so it waits
+//!      the off-protocol floor instead of the base grace.
 //!   3. off-protocol work pending (async agent, backgrounded Bash, scheduled
 //!      wakeup): suppressed until the work can be over.
 //!   4. grace = 0: watchdog skipped entirely.
@@ -171,19 +171,19 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
     );
 }
 
-/// The genuine wedge: a chunk and a cost-less mid-turn `usage_update`, then
-/// silence. Nothing arms the fast grace (set far longer than the drain here),
-/// so the base grace expires and the watchdog cancels the turn.
+/// A chunk and a cost-less mid-turn `usage_update`, then silence. Nothing arms
+/// the fast grace, and silence alone is not evidence the turn ended, so a base
+/// grace inside the drain must not cancel it.
 #[tokio::test]
 #[serial]
-async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
+async fn silent_orphan_waits_the_floor_when_the_turn_never_wraps_up() {
     skip_without_shim!();
     let outcome = observe_parked_turn(
         "silent-orphan-no-cost",
         ("300", "5000"),
         "SILENCE_NO_COST trigger",
         None,
-        15,
+        3,
     )
     .await;
 
@@ -193,9 +193,8 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
         "the fixture's cost-less UsageUpdate must reach the daemon and carry no cost"
     );
     assert_eq!(
-        outcome.stopped.as_deref(),
-        Some("prompt_orphaned"),
-        "a turn that never wrapped up must be cancelled and reported as an orphan"
+        outcome.stopped, None,
+        "a quiet turn without the cost marker must ride the floor, not be cancelled on the base grace"
     );
 }
 
@@ -338,8 +337,9 @@ async fn usage_evidence_survives_activity_and_drain() {
         ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", Some("")),
         ("USAGE_BEFORE_COST USAGE_AFTER_NO_COST", None),
     ] {
-        // Park after the ordered notifications and drain through the watchdog
-        // terminal, so an immediate PromptResponse cannot overtake delivery.
+        // Park after the ordered notifications so no PromptResponse overtakes
+        // delivery. These cases end without the cost marker, so the turn rides
+        // the floor and the drain runs to its deadline.
         let _env = EnvGuard::from_pairs(&[
             ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
             ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
@@ -371,10 +371,13 @@ async fn usage_evidence_survives_activity_and_drain() {
         outcome.await_activity(&mut client, marker).await;
         let activity_cost = outcome.usage_cost;
         outcome
-            .drain_turn(&mut client, Instant::now() + Duration::from_secs(10))
+            .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
             .await;
         let _ = client.shutdown().await;
-        assert_eq!(outcome.stopped.as_deref(), Some("prompt_orphaned"));
+        assert_eq!(
+            outcome.stopped, None,
+            "a no-cost quiet turn rides the floor"
+        );
         observed.push((activity_cost, outcome.usage_cost));
     }
 
