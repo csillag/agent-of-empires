@@ -10,9 +10,9 @@
 //!   1. wrapped up (cost-populated usage_update) then silent: the turn
 //!      demonstrably finished, so it ends as `prompt_complete` with no
 //!      cancel and no worker restart (#2237).
-//!   2. never wrapped up (usage without cost, or none at all): a genuine
-//!      wedge, so the base grace expires and the watchdog cancels and
-//!      reports `prompt_orphaned`.
+//!   2. never wrapped up (usage without cost, or none at all): silence is
+//!      indistinguishable from a long server-side think, so the turn waits
+//!      the 30-minute off-protocol floor, not the base grace.
 //!   3. off-protocol work pending (async agent, backgrounded Bash,
 //!      scheduled wakeup): suppressed until the work can be over.
 //!   4. disabled (grace = 0): watchdog skipped entirely, no Stopped.
@@ -166,21 +166,21 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
     );
 }
 
-/// The genuine wedge: the adapter streams a chunk and a cost-less
-/// mid-turn `usage_update`, then goes silent without ever wrapping up.
-/// Nothing arms the fast grace, so the base grace expires and the
-/// watchdog cancels the turn and reports `prompt_orphaned`.
+/// The adapter streams a chunk and a cost-less mid-turn `usage_update`,
+/// then goes silent without ever wrapping up. Nothing arms the fast grace
+/// and silence alone is no evidence the turn ended, so a base grace far
+/// inside the drain window must not cancel it: only the floor may.
 #[tokio::test]
 #[serial]
-async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
+async fn silent_orphan_waits_the_floor_when_the_turn_never_wraps_up() {
     if let Err(reason) = shim_ready() {
         eprintln!("skipping: {reason}");
         return;
     }
 
-    // Base grace tight, fast grace far longer: only the no-cost path can
-    // fire inside the drain, so a usage frame that wrongly armed the fast
-    // grace would not be mistaken for this one.
+    // Base grace tight, fast grace outside the drain: a cancel on the base
+    // grace would land within ~350ms, and a usage frame that wrongly armed
+    // the fast grace still could not end the turn in time.
     let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "5000"),
@@ -213,7 +213,7 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
 
     let mut outcome = TurnOutcome::default();
     outcome
-        .drain_turn(&mut client, Instant::now() + Duration::from_secs(15))
+        .drain_turn(&mut client, Instant::now() + Duration::from_secs(3))
         .await;
     let _ = client.shutdown().await;
 
@@ -223,9 +223,8 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
         "the fixture's cost-less UsageUpdate must reach the daemon and carry no cost"
     );
     assert_eq!(
-        outcome.stopped.as_deref(),
-        Some("prompt_orphaned"),
-        "a turn that never wrapped up must be cancelled and reported as an orphan"
+        outcome.stopped, None,
+        "a quiet turn without the cost marker must ride the floor, not be cancelled on the base grace"
     );
 }
 
@@ -626,8 +625,10 @@ async fn usage_evidence_survives_activity_and_drain() {
         return;
     }
 
-    // Park after the ordered notifications; drain through the watchdog terminal
-    // rather than let an immediate PromptResponse overtake notification delivery.
+    // Park after the ordered notifications so no PromptResponse overtakes
+    // notification delivery. Every case ends without the cost marker (a tool
+    // completion clears it), so the turn rides the floor and the drain runs to
+    // its deadline.
     let _env = EnvGuard::from_pairs(&[
         ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
         ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
@@ -666,10 +667,13 @@ async fn usage_evidence_survives_activity_and_drain() {
         outcome.await_activity(&mut client, marker).await;
         let activity_cost = outcome.usage_cost;
         outcome
-            .drain_turn(&mut client, Instant::now() + Duration::from_secs(10))
+            .drain_turn(&mut client, Instant::now() + Duration::from_secs(2))
             .await;
         let _ = client.shutdown().await;
-        assert_eq!(outcome.stopped.as_deref(), Some("prompt_orphaned"));
+        assert_eq!(
+            outcome.stopped, None,
+            "a no-cost quiet turn rides the floor"
+        );
         observed.push((activity_cost, outcome.usage_cost));
     }
 
