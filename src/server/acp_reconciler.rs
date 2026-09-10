@@ -3268,6 +3268,7 @@ mod tests {
     async fn resume_one_rechecks_eligibility_under_the_lease() {
         let (_home, state, _project) = capacity_test_state("s-archived-late").await;
         let target = super::ResumeTarget {
+            model_pending: false,
             id: "s-archived-late".into(),
             tool: "claude".into(),
             agent_override: Some("aoe-no-such-agent-1027".into()),

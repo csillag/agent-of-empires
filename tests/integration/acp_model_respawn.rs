@@ -25,11 +25,15 @@ fn spawn_config(
     default_model: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
-            command: "node".into(),
+            command: crate::common::shim_node()
+                .expect("shim prerequisite")
+                .to_string_lossy()
+                .into_owned(),
             args: vec![shim.to_string_lossy().to_string()],
             description: "model shim".into(),
             env_allowlist: None,
@@ -39,6 +43,7 @@ fn spawn_config(
         provider_env: env,
         host_environment: vec![],
         default_effort: None,
+        default_effort_explicit: false,
         default_model,
         default_mode: None,
         socket_path: None,

@@ -277,6 +277,7 @@ async fn shim_agent_round_trips_a_question_option_list() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        default_model: None,
         generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),
@@ -384,6 +385,7 @@ async fn shim_agent_sees_a_dismissed_question_as_cancelled() {
     let shim = shim_path();
 
     let config = SpawnConfig {
+        default_model: None,
         generation: 0,
         wrapper_substitution: None,
         agent_key: "claude".into(),

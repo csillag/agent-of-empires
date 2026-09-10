@@ -4449,6 +4449,7 @@ mod tests {
             host_environment: vec![],
             default_effort: Some("low".into()),
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -4578,6 +4579,7 @@ mod tests {
             host_environment: vec![],
             default_effort: Some("low".into()),
             default_effort_explicit: true,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -7108,6 +7110,7 @@ cursor-acp-bridge = "agent acp"
 
     fn spawn_request(session_id: &str) -> SpawnRequest {
         SpawnRequest {
+            assert_model: false,
             session_id: session_id.into(),
             agent: "claude-code".into(),
             tool: "claude-code".into(),
@@ -7130,6 +7133,7 @@ cursor-acp-bridge = "agent acp"
 
     fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         SpawnConfig {
+            default_model: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
