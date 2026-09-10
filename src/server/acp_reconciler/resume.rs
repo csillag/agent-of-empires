@@ -485,7 +485,7 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             &state.acp_event_store,
             &id,
             "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            |s, id| s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id),
         )
         .await
         .unwrap_or(true);
