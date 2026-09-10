@@ -606,6 +606,16 @@ type DraftPart =
       isError?: boolean;
     };
 
+/** A reasoning summary as a quoted block under a thinking marker. */
+function quoteThought(raw: string): string {
+  const quoted = raw
+    .trim()
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  return `> 💭 *thinking*\n>\n${quoted}`;
+}
+
 /** Mutable builder for an assistant message under construction. */
 class AssistantBuilder {
   private id: string;
@@ -614,6 +624,8 @@ class AssistantBuilder {
   /** Whether the trailing part is an open reasoning-summary block that the
    *  next thought row should extend rather than restart. */
   private thoughtRunOpen = false;
+  /** Verbatim text of the open reasoning-summary block, as streamed. */
+  private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -638,20 +650,23 @@ class AssistantBuilder {
   /** Append reasoning-summary text as its own quoted block. Consecutive
    *  thought rows extend the open block; anything else closes it, so a
    *  summary never merges into an adjacent assistant message and cannot be
-   *  mistaken for something the agent addressed to the user. */
+   *  mistaken for something the agent addressed to the user.
+   *
+   *  Rows are streamed token fragments that routinely split mid-word
+   *  ("met" + "adata"), so they are joined verbatim and the whole block is
+   *  re-quoted. Quoting each fragment on its own line turned every fragment
+   *  boundary into a rendered space. */
   appendThought(text: string) {
-    const body = text.trim();
-    if (!body) return;
-    const quoted = body
-      .split("\n")
-      .map((line) => `> ${line}`)
-      .join("\n");
+    if (!text) return;
     const last = this.parts[this.parts.length - 1];
     if (this.thoughtRunOpen && last && last.type === "text") {
-      last.text += `\n${quoted}`;
+      this.thoughtRaw += text;
+      last.text = quoteThought(this.thoughtRaw);
       return;
     }
-    this.parts.push({ type: "text", text: `> 💭 *thinking*\n>\n${quoted}` });
+    if (!text.trim()) return;
+    this.thoughtRaw = text;
+    this.parts.push({ type: "text", text: quoteThought(this.thoughtRaw) });
     this.thoughtRunOpen = true;
   }
 
