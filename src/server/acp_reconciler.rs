@@ -944,7 +944,12 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     for (id, profile, idle_secs) in live {
         // Cheap pre-check (no in-flight probe yet): skips sessions with no
         // history or still within the idle window.
-        let last_ms = latest.get(&id).copied();
+        // The store can stay quiet while the worker is busy: after a respawn's
+        // session/load, transcript events are dropped as history replay until
+        // the next prompt, so a turn the agent starts itself never reaches it.
+        // The connection's own notification clock still moves.
+        let live_ms = state.acp_supervisor.last_notification_ms(&id).await;
+        let last_ms = latest.get(&id).copied().max(live_ms);
         if !should_auto_stop(now_ms, last_ms, None, idle_secs, false) {
             continue;
         }

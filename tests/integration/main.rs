@@ -44,6 +44,7 @@ mod acp_smoke;
 mod acp_session_delete;
 
 mod acp_effort_respawn;
+mod acp_idle_clock;
 
 #[cfg(debug_assertions)]
 mod acp_midturn_resume;

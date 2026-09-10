@@ -19,6 +19,7 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicI64;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tracing::{debug, error, info, trace, warn};
@@ -180,6 +181,10 @@ pub(super) async fn run_connection_task<W, R>(
     // ACP requests and notifications onto the same typed control socket.
     // Direct stdio has no control client and speaks ACP on its process pipes.
     control_client: Option<Arc<DaemonControlClient>>,
+    // Wall-clock ms of the last notification past the session fence, bumped
+    // before replay suppression, shared with `AcpClient` for the idle reaper.
+    // 0 = none yet.
+    last_notification_at: Arc<AtomicI64>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
     R: futures_util::AsyncRead + Send + 'static,
@@ -380,6 +385,7 @@ pub(super) async fn run_connection_task<W, R>(
     let prompt_in_flight =
         external_prompt_in_flight.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let last_event_at_for_notif = last_event_at.clone();
+    let last_notification_at_for_notif = last_notification_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
     let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
     let between_prompt_active_for_notif = between_prompt_active.clone();
@@ -418,6 +424,7 @@ pub(super) async fn run_connection_task<W, R>(
             let suppress = suppress_for_notif.clone();
             let session_label = session_label_for_notif.clone();
             let last_event_at = last_event_at_for_notif.clone();
+            let last_notification_at = last_notification_at_for_notif.clone();
             let first_event_after_attach = first_event_after_attach_for_notif.clone();
             let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
             let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
@@ -437,6 +444,8 @@ pub(super) async fn run_connection_task<W, R>(
             let tool_context_cache = tool_context_cache_for_notif.clone();
             async move {
                 last_event_at.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
+                last_notification_at
+                    .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                 let suppressing = suppress.load(Ordering::Relaxed);
                 // Drop claude-agent-acp's leaked consolidated
                 // agent_message_chunk restatement before it reaches the
@@ -3345,6 +3354,7 @@ mod cancel_fairness_tests {
                 None,
                 None,
                 None,
+                Arc::new(AtomicI64::new(0)),
             ),
         ));
 
