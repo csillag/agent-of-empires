@@ -2349,6 +2349,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                         "drain channel closed (agent connection task ended); evaluating respawn"
                     );
                     if agent_unresponsive {
+                        // The runner deletes its own registry record as it exits,
+                        // and `restart_decision` reads a missing record as
+                        // `aoe acp stop`. Mark this generation restart-pending
+                        // first, so the kill reads as the restart it is whichever
+                        // of this task and the reaper observes it first.
+                        crate::process::worker_registry::mark_restart_pending(
+                            &session_id,
+                            lease.epoch(),
+                        );
                         kill_wedged_runner(&*process_control, &session_id).await;
                     }
                     // Removes this epoch's handle; a no-op if a newer epoch
@@ -4039,12 +4048,26 @@ async fn restart_decision(
     if runner_managed {
         let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
         if registry_gone {
-            debug!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "restart_decision: registry entry gone, treating as user-initiated stop"
-            );
-            return RestartDecision::UserStopped;
+            // A marker for this generation means the daemon killed the runner in
+            // order to restart it (the wedged-agent watchdog), so the missing
+            // record is expected. Consume it and fall through to the respawn.
+            if crate::process::worker_registry::take_restart_marker(
+                session_id,
+                handle.lease.epoch(),
+            ) {
+                debug!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "restart_decision: registry entry gone under this generation's restart marker; respawning"
+                );
+            } else {
+                debug!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "restart_decision: registry entry gone, treating as user-initiated stop"
+                );
+                return RestartDecision::UserStopped;
+            }
         }
     }
     let now = Instant::now();
@@ -5573,7 +5596,7 @@ cursor-acp-bridge = "agent acp"
     /// production code path fires.
     #[tokio::test]
     #[serial_test::serial]
-    async fn restart_decision_returns_user_stopped_when_registry_deleted() {
+    async fn restart_decision_reads_a_missing_registry_entry_by_its_restart_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
@@ -5606,7 +5629,7 @@ cursor-acp-bridge = "agent acp"
             source_profile: None,
             mcp_servers: Vec::new(),
         };
-        {
+        let lease = {
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
             sup.test_install_handle(
                 "s-stop",
@@ -5616,14 +5639,29 @@ cursor-acp-bridge = "agent acp"
                 },
                 None,
             )
-            .await;
-        }
+            .await
+        };
         // No registry entry for "s-stop" — production code reads this
         // as a user-initiated stop signal.
         let decision = restart_decision(&sup.workers, "s-stop").await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+        // A marker for another generation is stale and changes nothing.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
+        let decision = restart_decision(&sup.workers, "s-stop").await;
+        assert!(
+            matches!(decision, RestartDecision::UserStopped),
+            "a stale-generation marker must not authorize a restart, got {decision:?}"
+        );
+        // The wedged-agent watchdog marks this generation before it kills the
+        // runner, so the same missing record now reads as the restart it is.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop").await;
+        assert!(
+            matches!(decision, RestartDecision::Respawn(_)),
+            "this generation's marker must turn a missing record into a respawn, got {decision:?}"
         );
     }
 
