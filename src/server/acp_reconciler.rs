@@ -962,6 +962,17 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight) {
             continue;
         }
+        // A turn the agent opened itself has no prompt behind it, so the probe
+        // above misses it, and the daemon may have closed it early.
+        let store = Arc::clone(&state.acp_event_store);
+        let id_probe = id.clone();
+        let agent_turn_open =
+            tokio::task::spawn_blocking(move || store.has_agent_turn_in_flight(&id_probe))
+                .await
+                .unwrap_or(true);
+        if agent_turn_open {
+            continue;
+        }
         // Mark dormant in-memory so this tick's resume snapshot skips it.
         {
             let mut instances = state.instances.write().await;
