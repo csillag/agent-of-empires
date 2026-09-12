@@ -38,7 +38,7 @@ pub(super) struct SilentOrphanWatchdogConfig {
 /// An open tool call or a future wake always suppresses firing. Fast grace
 /// applies only once `cost_seen` is set and no off-protocol work is pending.
 /// Every other quiet turn waits the floor: silence alone is not evidence the
-/// turn ended.
+/// turn ended. The cost report an injected steer triggers does not count.
 #[derive(Debug, Default)]
 pub(super) struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -48,6 +48,8 @@ pub(super) struct SilentOrphanWatchdog {
     tool_calls_in_flight: HashMap<String, bool>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<Instant>,
+    /// The next `TerminalUsage` closes the generation a steer pre-empted.
+    steer_accounting_pending: bool,
 }
 
 impl SilentOrphanWatchdog {
@@ -55,6 +57,19 @@ impl SilentOrphanWatchdog {
         self.saw_first_progress = true;
         self.last_progress_at = Some(now);
         self.cost_seen = false;
+    }
+
+    /// An injected steer counts as progress. claude-agent-acp then closes the
+    /// pre-empted generation's accounting with a cost report while the turn
+    /// continues, so that next report is not the end-of-turn marker.
+    pub(super) fn apply_steer_injected(
+        &mut self,
+        now: Instant,
+        wall_now: chrono::DateTime<chrono::Utc>,
+        cfg: SilentOrphanWatchdogConfig,
+    ) {
+        self.apply_signal(LifecycleSignal::Progress, now, wall_now, cfg);
+        self.steer_accounting_pending = true;
     }
 
     pub(super) fn apply_signal(
@@ -99,6 +114,8 @@ impl SilentOrphanWatchdog {
                     self.off_protocol_work_seen = kind;
                 }
             }
+            LifecycleSignal::TerminalUsage
+                if std::mem::take(&mut self.steer_accounting_pending) => {}
             LifecycleSignal::TerminalUsage => {
                 self.cost_seen = true;
                 // Fire-and-forget commands and compaction are bounded by the
@@ -581,6 +598,27 @@ mod tests {
         let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))).unwrap();
         w.apply_signal(sig, t0, chrono::Utc::now(), CFG);
         assert!(!w.should_fire(t0 + Duration::from_millis(120_400), CFG));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_accounting_is_not_end_of_turn() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        let steer = t0 + Duration::from_secs(5);
+        w.apply_steer_injected(steer, wall, CFG);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            steer + Duration::from_millis(100),
+            wall,
+            CFG,
+        );
+        assert!(!w.should_fire(steer + Duration::from_secs(60), CFG));
+        let wrapped = steer + Duration::from_secs(90);
+        w.apply_signal(LifecycleSignal::Progress, wrapped, wall, CFG);
+        w.apply_signal(LifecycleSignal::TerminalUsage, wrapped, wall, CFG);
+        assert!(w.should_fire(wrapped + CFG.fast_grace + Duration::from_secs(1), CFG));
     }
 
     #[test]
