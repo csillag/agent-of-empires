@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { fetchAbout } from "../lib/api";
 import { currentWebBuildId, isWebUpdateAvailable } from "../lib/webBuildId";
 
@@ -10,6 +11,8 @@ const CHECK_THROTTLE_MS = 30_000;
 export function DashboardUpdateBanner() {
   const [updateAvailable, setUpdateAvailable] = useState(false);
   const lastCheckRef = useRef(0);
+  const checkRef = useRef<((force: boolean) => Promise<void>) | null>(null);
+  const { pathname } = useLocation();
 
   useEffect(() => {
     const ownId = currentWebBuildId();
@@ -36,17 +39,25 @@ export function DashboardUpdateBanner() {
     // underneath us.
     const onPreloadError = () => void check(true);
 
+    checkRef.current = check;
     void check(true);
     document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("online", onOnline);
     window.addEventListener("vite:preloadError", onPreloadError);
     return () => {
       cancelled = true;
+      checkRef.current = null;
       document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("online", onOnline);
       window.removeEventListener("vite:preloadError", onPreloadError);
     };
   }, []);
+
+  // Throttled like the other triggers; on mount the forced check above has
+  // just run, so this one is a no-op.
+  useEffect(() => {
+    void checkRef.current?.(false);
+  }, [pathname]);
 
   if (!updateAvailable) return null;
 
