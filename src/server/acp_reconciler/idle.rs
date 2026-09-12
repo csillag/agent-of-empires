@@ -203,9 +203,23 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         )
         .await
         .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight)
-            || !set_dormant_in_memory(state, &id, true).await
-        {
+        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight) {
+            continue;
+        }
+        // A turn the agent opened itself has no prompt behind it, so the probe
+        // above misses it, and the daemon may have closed it early.
+        let agent_turn_open = query_store(
+            &state.acp_event_store,
+            &id,
+            "idle-reap agent-turn",
+            |s, id| s.has_agent_turn_in_flight(id),
+        )
+        .await
+        .unwrap_or(true);
+        if agent_turn_open {
+            continue;
+        }
+        if !set_dormant_in_memory(state, &id, true).await {
             continue;
         }
         if !persist_dormant(state, &profile, &id, true).await {
