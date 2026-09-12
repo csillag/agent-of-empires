@@ -2393,65 +2393,79 @@ impl<S: BroadcastSink> Supervisor<S> {
                         drop_handle(&lease).await;
                         return;
                     }
-                    let mut respawn_config: SpawnConfig =
-                        match restart_decision(&workers, &session_id, agent_unresponsive).await {
-                            RestartDecision::Respawn(cfg) => {
-                                info!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    command = %cfg.spec.command,
-                                    stored_id = ?cfg.stored_acp_session_id,
-                                    "respawn approved; sleeping {}ms before restart",
-                                    RESPAWN_BACKOFF.as_millis()
-                                );
-                                *cfg
-                            }
-                            RestartDecision::BudgetBurned => {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    max_respawns = MAX_RESPAWNS_IN_WINDOW,
-                                    window_secs = RESTART_WINDOW.as_secs(),
-                                    "restart budget burned; parking session"
-                                );
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
-                                    &session_id,
-                                    seq,
-                                    &Event::AgentStartupError {
-                                        message: format!(
-                                            "ACP agent crashed more than {} times in {}s; \
+                    let mut respawn_config: SpawnConfig = match restart_decision(
+                        &workers,
+                        &session_id,
+                        agent_unresponsive,
+                    )
+                    .await
+                    {
+                        RestartDecision::Respawn(cfg) => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                command = %cfg.spec.command,
+                                stored_id = ?cfg.stored_acp_session_id,
+                                "respawn approved; sleeping {}ms before restart",
+                                RESPAWN_BACKOFF.as_millis()
+                            );
+                            *cfg
+                        }
+                        RestartDecision::BudgetBurned => {
+                            warn!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                max_respawns = MAX_RESPAWNS_IN_WINDOW,
+                                window_secs = RESTART_WINDOW.as_secs(),
+                                "restart budget burned; parking session"
+                            );
+                            let seq = next_seq(&next_seqs, &session_id);
+                            sink.publish(
+                                &session_id,
+                                seq,
+                                &Event::AgentStartupError {
+                                    message: format!(
+                                        "ACP agent crashed more than {} times in {}s; \
                                      not respawning. Use the web dashboard to retry.",
-                                            MAX_RESPAWNS_IN_WINDOW,
-                                            RESTART_WINDOW.as_secs()
-                                        ),
-                                    },
-                                );
-                                drop_handle(&lease).await;
-                                return;
-                            }
-                            RestartDecision::Gone => {
-                                return;
-                            }
-                            RestartDecision::UserStopped => {
-                                info!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    "worker registry deleted by user (`aoe acp stop|kill`); \
-                                     dropping WorkerHandle without respawn"
-                                );
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
-                                    &session_id,
-                                    seq,
-                                    &Event::Stopped {
-                                        reason: "user_stopped".into(),
-                                    },
-                                );
-                                drop_handle(&lease).await;
-                                return;
-                            }
-                        };
+                                        MAX_RESPAWNS_IN_WINDOW,
+                                        RESTART_WINDOW.as_secs()
+                                    ),
+                                },
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                        RestartDecision::Gone => {
+                            return;
+                        }
+                        RestartDecision::DaemonRestart => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "daemon-ordered restart; dropping the handle for the resume pass"
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                        RestartDecision::UserStopped => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "worker registry deleted by user (`aoe acp stop|kill`); \
+                                 dropping WorkerHandle without respawn"
+                            );
+                            let seq = next_seq(&next_seqs, &session_id);
+                            sink.publish(
+                                &session_id,
+                                seq,
+                                &Event::Stopped {
+                                    reason: "user_stopped".into(),
+                                },
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                    };
 
                     // The respawn runs under its own epoch: a shutdown that
                     // lands from here on is recorded as a cancel against it
@@ -4003,6 +4017,11 @@ enum RestartDecision {
     // respawn flow.
     Respawn(Box<SpawnConfig>),
     BudgetBurned,
+    /// The daemon ordered this restart (a drained build-stale respawn,
+    /// `aoe acp restart`): a restart marker names this generation. The
+    /// reaper and the resume pass own it, so the drain task only drops its
+    /// handle, with no crash banner and no stop.
+    DaemonRestart,
     /// The worker entry was removed (e.g. shutdown).
     Gone,
     /// The on-disk worker registry entry for this session was deleted
@@ -4046,13 +4065,25 @@ async fn restart_decision(
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
+    // Checked before the registry: the runner may not have removed its
+    // record yet, and a restart the daemon ordered is never a crash.
+    if runner_managed
+        && !killed_as_unresponsive
+        && crate::process::worker_registry::peek_restart_marker(session_id)
+            == Some(handle.lease.epoch())
+    {
+        debug!(
+            target: "acp.supervisor",
+            session = %session_id,
+            "restart_decision: the daemon ordered this restart; leaving it to the resume pass"
+        );
+        return RestartDecision::DaemonRestart;
+    }
     if runner_managed {
         let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
         if registry_gone {
             // After the wedged-agent kill, this generation's marker says the
-            // missing record is that kill: consume it and respawn. Any other
-            // marker (a drained build-stale respawn, `aoe acp restart`) belongs
-            // to the reaper and the resume pass, so leave it and stop here.
+            // missing record is that kill: consume it and respawn.
             if killed_as_unresponsive
                 && crate::process::worker_registry::take_restart_marker(
                     session_id,
@@ -5660,13 +5691,13 @@ cursor-acp-bridge = "agent acp"
             "a stale-generation marker must not authorize a restart, got {decision:?}"
         );
         // A marker the daemon wrote for its own respawn of a drained
-        // build-stale worker is the reaper's: a stop here, marker left alone.
-        // Consuming it sent a reattached worker to BudgetBurned, a false
-        // "crashed more than 3 times" report.
+        // build-stale worker is the resume pass's: no crash, no stop, marker
+        // left alone. Reading it as a crash showed a false "crashed more than
+        // 3 times" banner.
         crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
         let decision = restart_decision(&sup.workers, "s-stop", false).await;
         assert!(
-            matches!(decision, RestartDecision::UserStopped),
+            matches!(decision, RestartDecision::DaemonRestart),
             "a restart the daemon ordered must not be read as a crash, got {decision:?}"
         );
         assert!(
