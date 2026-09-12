@@ -961,6 +961,19 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
             .flatten()
             .and_then(|rec| i64::try_from(rec.started_at).ok())
             .map(|secs| secs.saturating_mul(1000));
+        // A worker blocked on the owner's answer is waiting, not idle:
+        // stopping it kills the question, and the card's answer then 404s.
+        let store = Arc::clone(&state.acp_event_store);
+        let id_probe = id.clone();
+        let awaiting_owner = tokio::task::spawn_blocking(move || {
+            !store.unresolved_elicitation_nonces(&id_probe).is_empty()
+                || !store.unresolved_approval_nonces(&id_probe).is_empty()
+        })
+        .await
+        .unwrap_or(true);
+        if awaiting_owner {
+            continue;
+        }
         // Re-check mid-turn right before stopping: a turn may have started
         // since the snapshot. spawn_blocking matches the SQLite-on-tokio
         // pattern used by the resume pass above.
