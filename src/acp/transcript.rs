@@ -86,8 +86,8 @@ pub struct TranscriptRow {
 /// `ActivityRow["kind"]` union with one deliberate omission: there is no
 /// `thinking` row for the *phase*: that is control-state, tracked on
 /// `AcpState.thinking` and rendered as a spinner. `Thinking` rows here carry
-/// reasoning-summary TEXT from `AgentThoughtChunk`, which is a different
-/// thing: words the agent produced that would otherwise be dropped.
+/// the TEXT of `AgentThoughtChunk`, which is a different thing: with thinking
+/// on, the model's between-tool narration arrives as thinking updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptRowKind {
@@ -96,9 +96,8 @@ pub enum TranscriptRowKind {
     ToolError,
     ToolStopped,
     Message,
-    /// Reasoning-summary text (see the note above). Renders muted and
-    /// de-emphasised: it is the agent's own account of its reasoning, not a
-    /// message it addressed to the user.
+    /// Thinking-update text (see the note above). Clients render it as a
+    /// message under an update tag: it is text the agent addressed to the user.
     Thinking,
     UserPrompt,
     UserDiffComments,

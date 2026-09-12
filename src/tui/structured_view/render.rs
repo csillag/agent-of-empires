@@ -1291,6 +1291,21 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Thinking-update body: the agent's between-tool narration, which Claude Code
+/// requests as thinking "updates". Rendered like a reply, under a small dimmed
+/// tag.
+fn agent_thought_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "↳ update",
+        Style::default().fg(theme.dimmed),
+    ))];
+    lines.extend(render_agent_message_lines(text));
+    lines
+}
+
 /// Render an agent message as markdown-styled transcript lines.
 ///
 /// We parse the message with the shared native TUI Markdown renderer. This strips the
@@ -1300,29 +1315,6 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
 /// body text with no speaker label, the way a native agent prints its
 /// response; the user's turns are what stand out through their chevron gutter, not the
 /// agent's. Empty or marker-only input falls back to a bare `…`.
-/// Reasoning-summary body: dimmed throughout and prefixed so it never reads as
-/// a message the agent addressed to the user. Rendered as plain wrapped text
-/// rather than markdown; a summary is prose, and styling it like an answer is
-/// exactly the confusion this row exists to prevent.
-fn agent_thought_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
-    let body = text.trim();
-    if body.is_empty() {
-        return Vec::new();
-    }
-    body.lines()
-        .enumerate()
-        .map(|(index, line)| {
-            Line::from(vec![
-                Span::styled(
-                    if index == 0 { "· " } else { "  " },
-                    Style::default().fg(theme.dimmed),
-                ),
-                Span::styled(line.to_string(), Style::default().fg(theme.dimmed)),
-            ])
-        })
-        .collect()
-}
-
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     if text.trim().is_empty() {
         return vec![Line::from("…".to_string())];
@@ -1382,9 +1374,8 @@ fn transcript_lines(
                 continue;
             }
             TranscriptRowKind::Thinking => {
-                // Same run-coalescing as `Message`, but rendered dimmed and
-                // marked so it never reads as something the agent said to the
-                // user. See `TranscriptRowKind::Thinking`.
+                // Same run-coalescing as `Message`, rendered under an update
+                // tag. See `TranscriptRowKind::Thinking`.
                 let group = &row.group_id;
                 let mut text = String::new();
                 while i < rows.len()

@@ -546,11 +546,9 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
       );
     } else if (row.kind === "thinking") {
-      // Reasoning-summary text. The thinking *phase* is still the global
-      // rattle spinner; this is the agent's own account of its reasoning,
-      // which recent models use for what reads as narration instead of
-      // emitting a text block. Rendering it keeps a turn of bare tool calls
-      // from looking like the agent said nothing at all.
+      // A thinking update: the agent's between-tool narration, which Claude
+      // Code requests as `display: "updates"` instead of text blocks. The
+      // thinking *phase* is still the global rattle spinner.
       currentAssistant.appendThought(row.text);
     } else if (row.kind === "empty_output") {
       // Synthesised when the agent finished a turn without emitting any
@@ -606,14 +604,10 @@ type DraftPart =
       isError?: boolean;
     };
 
-/** A reasoning summary as a quoted block under a thinking marker. */
-function quoteThought(raw: string): string {
-  const quoted = raw
-    .trim()
-    .split("\n")
-    .map((line) => `> ${line}`)
-    .join("\n");
-  return `> 💭 *thinking*\n>\n${quoted}`;
+/** A thinking update as plain message text under a small tag. It is text the
+ *  agent addressed to the user, so it reads like a message. */
+function formatUpdate(raw: string): string {
+  return `*↳ update*\n\n${raw.trim()}`;
 }
 
 /** Mutable builder for an assistant message under construction. */
@@ -621,10 +615,10 @@ class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
-  /** Whether the trailing part is an open reasoning-summary block that the
-   *  next thought row should extend rather than restart. */
+  /** Whether the trailing part is an open update that the next thought row
+   *  should extend rather than restart. */
   private thoughtRunOpen = false;
-  /** Verbatim text of the open reasoning-summary block, as streamed. */
+  /** Verbatim text of the open update, as streamed. */
   private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
@@ -634,9 +628,8 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
-    // A trailing reasoning-summary block is a text part too, so merging into
-    // it would splice the summary onto the answer and make the two
-    // indistinguishable. Start a fresh part instead.
+    // A trailing update is a text part too; merging into it would put the
+    // answer under the update tag. Start a fresh part instead.
     const afterThought = this.thoughtRunOpen;
     this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
@@ -647,26 +640,23 @@ class AssistantBuilder {
     }
   }
 
-  /** Append reasoning-summary text as its own quoted block. Consecutive
-   *  thought rows extend the open block; anything else closes it, so a
-   *  summary never merges into an adjacent assistant message and cannot be
-   *  mistaken for something the agent addressed to the user.
+  /** Append update text as its own tagged part. Consecutive thought rows
+   *  extend the open update; anything else closes it.
    *
    *  Rows are streamed token fragments that routinely split mid-word
-   *  ("met" + "adata"), so they are joined verbatim and the whole block is
-   *  re-quoted. Quoting each fragment on its own line turned every fragment
-   *  boundary into a rendered space. */
+   *  ("met" + "adata"), so they are joined verbatim and the whole part is
+   *  re-rendered. */
   appendThought(text: string) {
     if (!text) return;
     const last = this.parts[this.parts.length - 1];
     if (this.thoughtRunOpen && last && last.type === "text") {
       this.thoughtRaw += text;
-      last.text = quoteThought(this.thoughtRaw);
+      last.text = formatUpdate(this.thoughtRaw);
       return;
     }
     if (!text.trim()) return;
     this.thoughtRaw = text;
-    this.parts.push({ type: "text", text: quoteThought(this.thoughtRaw) });
+    this.parts.push({ type: "text", text: formatUpdate(this.thoughtRaw) });
     this.thoughtRunOpen = true;
   }
 
