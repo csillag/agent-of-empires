@@ -2394,7 +2394,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         return;
                     }
                     let mut respawn_config: SpawnConfig =
-                        match restart_decision(&workers, &session_id).await {
+                        match restart_decision(&workers, &session_id, agent_unresponsive).await {
                             RestartDecision::Respawn(cfg) => {
                                 info!(
                                     target: "acp.supervisor",
@@ -4017,6 +4017,7 @@ enum RestartDecision {
 async fn restart_decision(
     workers: &Arc<Mutex<HashMap<String, WorkerHandle>>>,
     session_id: &str,
+    killed_as_unresponsive: bool,
 ) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
@@ -4048,13 +4049,16 @@ async fn restart_decision(
     if runner_managed {
         let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
         if registry_gone {
-            // A marker for this generation means the daemon killed the runner in
-            // order to restart it (the wedged-agent watchdog), so the missing
-            // record is expected. Consume it and fall through to the respawn.
-            if crate::process::worker_registry::take_restart_marker(
-                session_id,
-                handle.lease.epoch(),
-            ) {
+            // After the wedged-agent kill, this generation's marker says the
+            // missing record is that kill: consume it and respawn. Any other
+            // marker (a drained build-stale respawn, `aoe acp restart`) belongs
+            // to the reaper and the resume pass, so leave it and stop here.
+            if killed_as_unresponsive
+                && crate::process::worker_registry::take_restart_marker(
+                    session_id,
+                    handle.lease.epoch(),
+                )
+            {
                 debug!(
                     target: "acp.supervisor",
                     session = %session_id,
@@ -5570,14 +5574,14 @@ cursor-acp-bridge = "agent acp"
         }
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-1").await;
+            let decision = restart_decision(&sup.workers, "s-1", false).await;
             assert!(
                 matches!(decision, RestartDecision::Respawn(_)),
                 "decision #{i} should be Respawn",
             );
         }
         // One more push past the threshold should burn the budget.
-        let decision = restart_decision(&sup.workers, "s-1").await;
+        let decision = restart_decision(&sup.workers, "s-1", false).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
@@ -5643,22 +5647,36 @@ cursor-acp-bridge = "agent acp"
         };
         // No registry entry for "s-stop" — production code reads this
         // as a user-initiated stop signal.
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
         );
         // A marker for another generation is stale and changes nothing.
         crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "a stale-generation marker must not authorize a restart, got {decision:?}"
         );
+        // A marker the daemon wrote for its own respawn of a drained
+        // build-stale worker is the reaper's: a stop here, marker left alone.
+        // Consuming it sent a reattached worker to BudgetBurned, a false
+        // "crashed more than 3 times" report.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", false).await;
+        assert!(
+            matches!(decision, RestartDecision::UserStopped),
+            "a restart the daemon ordered must not be read as a crash, got {decision:?}"
+        );
+        assert!(
+            crate::process::worker_registry::take_restart_marker("s-stop", lease.epoch()),
+            "the marker must be left for the reaper"
+        );
         // The wedged-agent watchdog marks this generation before it kills the
         // runner, so the same missing record now reads as the restart it is.
         crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::Respawn(_)),
             "this generation's marker must turn a missing record into a respawn, got {decision:?}"
