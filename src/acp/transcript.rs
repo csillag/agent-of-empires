@@ -47,9 +47,9 @@ pub enum TranscriptRowKind {
     ToolError,
     ToolStopped,
     Message,
-    /// Reasoning-summary text from `AgentThoughtChunk`, not the thinking
-    /// phase (`AcpState.thinking`, a spinner). Renders muted: the agent's
-    /// account of its reasoning, not a message it addressed to the user.
+    /// Between-tool narration from `AgentThoughtChunk` (Claude Code thinking
+    /// "updates"), not the thinking phase (`AcpState.thinking`, a spinner).
+    /// Clients render it as a message under an update tag.
     Thinking,
     UserPrompt,
     UserDiffComments,

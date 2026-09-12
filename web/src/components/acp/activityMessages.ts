@@ -124,9 +124,8 @@ export function activityToThreadMessages(
       // A turn with no output (interactive-only slash commands) gets a muted note.
       currentAssistant.appendText(`_${row.text}_`);
     } else if (row.kind === "thinking") {
-      // Reasoning-summary text. The thinking phase is still the spinner; this is
-      // the agent's own account of its reasoning, which recent models use instead
-      // of a text block. It must not look like an answer addressed to the user.
+      // A thinking update: between-tool narration Claude Code requests as
+      // display "updates". The thinking phase is still the spinner.
       currentAssistant.appendThought(row.text);
     } else {
       currentAssistant.appendText(row.text);
@@ -156,23 +155,18 @@ type DraftPart =
     };
 type ToolPart = Extract<DraftPart, { type: "tool-call" }>;
 
-/** A reasoning summary as a quoted block under a thinking marker. */
-function quoteThought(raw: string): string {
-  const quoted = raw
-    .trim()
-    .split("\n")
-    .map((line) => `> ${line}`)
-    .join("\n");
-  return `> 💭 *thinking*\n>\n${quoted}`;
+/** A thinking update as plain message text under a small tag. */
+function formatUpdate(raw: string): string {
+  return `*↳ update*\n\n${raw.trim()}`;
 }
 
 class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
-  /** The trailing part is an open reasoning-summary block the next thought row extends. */
+  /** The trailing part is an open update the next thought row extends. */
   private thoughtRunOpen = false;
-  /** Verbatim text of the open reasoning-summary block, as streamed. */
+  /** Verbatim text of the open update, as streamed. */
   private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
@@ -182,8 +176,8 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
-    // A trailing summary is a text part too. Merging into it would splice the
-    // summary onto the answer.
+    // A trailing update is a text part too. Merging into it would put the
+    // answer under the update tag.
     const afterThought = this.thoughtRunOpen;
     this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
@@ -191,20 +185,20 @@ class AssistantBuilder {
     else this.parts.push({ type: "text", text });
   }
 
-  /** Quoted reasoning-summary block. Consecutive thought rows extend it.
-   *  Fragments are joined verbatim and the whole block is re-quoted: quoting
-   *  each fragment on its own line turned every mid-word split into a space. */
+  /** Append update text as its own tagged part. Consecutive thought rows
+   *  extend it. Fragments are joined verbatim and the whole part is re-rendered,
+   *  because they split mid-word. */
   appendThought(text: string) {
     if (!text) return;
     const last = this.parts[this.parts.length - 1];
     if (this.thoughtRunOpen && last && last.type === "text") {
       this.thoughtRaw += text;
-      last.text = quoteThought(this.thoughtRaw);
+      last.text = formatUpdate(this.thoughtRaw);
       return;
     }
     if (!text.trim()) return;
     this.thoughtRaw = text;
-    this.parts.push({ type: "text", text: quoteThought(this.thoughtRaw) });
+    this.parts.push({ type: "text", text: formatUpdate(this.thoughtRaw) });
     this.thoughtRunOpen = true;
   }
 
