@@ -138,7 +138,7 @@ impl<S: BroadcastSink> Drain<S> {
                 self.drop_handle(&lease).await;
                 return;
             }
-            let Some(config) = self.approve_respawn(&lease).await else {
+            let Some(config) = self.approve_respawn(&lease, end.agent_unresponsive).await else {
                 return;
             };
             match self.respawn(&lease, config).await {
@@ -304,9 +304,9 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
-    async fn approve_respawn(&self, lease: &Lease) -> Option<SpawnConfig> {
+    async fn approve_respawn(&self, lease: &Lease, killed_as_unresponsive: bool) -> Option<SpawnConfig> {
         let session_id = &self.session_id;
-        match restart_decision(&self.workers, session_id).await {
+        match restart_decision(&self.workers, session_id, killed_as_unresponsive).await {
             RestartDecision::Respawn(config) => {
                 info!(
                     target: "acp.supervisor",
@@ -627,7 +627,11 @@ impl<S: BroadcastSink> Drain<S> {
     }
 }
 
-async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecision {
+async fn restart_decision(
+    workers: &Workers,
+    session_id: &str,
+    killed_as_unresponsive: bool,
+) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
         debug!(
@@ -644,7 +648,9 @@ async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecisio
     if runner_managed && matches!(worker_registry::load(session_id), Ok(None)) {
         // A marker for this generation means the daemon killed the runner in
         // order to restart it. Consume it and fall through to the respawn.
-        if worker_registry::take_restart_marker(session_id, handle.lease.epoch()) {
+        if killed_as_unresponsive
+            && worker_registry::take_restart_marker(session_id, handle.lease.epoch())
+        {
             debug!(
                 target: "acp.supervisor",
                 session = %session_id,
@@ -746,29 +752,39 @@ mod tests {
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
             assert!(
                 matches!(
-                    restart_decision(&sup.workers, "s-1").await,
+                    restart_decision(&sup.workers, "s-1", false).await,
                     RestartDecision::Respawn(_)
                 ),
                 "decision #{i} should be Respawn",
             );
         }
         assert!(matches!(
-            restart_decision(&sup.workers, "s-1").await,
+            restart_decision(&sup.workers, "s-1", false).await,
             RestartDecision::BudgetBurned
         ));
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "no registry entry means a user stop, got {decision:?}"
         );
         worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "a stale-generation marker must not authorize a restart, got {decision:?}"
         );
         worker_registry::mark_restart_pending("s-stop", lease.epoch());
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", false).await;
+        assert!(
+            matches!(decision, RestartDecision::UserStopped),
+            "a restart the daemon ordered must not be read as a crash, got {decision:?}"
+        );
+        assert!(
+            worker_registry::take_restart_marker("s-stop", lease.epoch()),
+            "the marker must be left for the reaper"
+        );
+        worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::Respawn(_)),
             "this generation's marker must turn a missing record into a respawn, got {decision:?}"
