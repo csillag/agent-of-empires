@@ -91,6 +91,10 @@ enum RestartDecision {
     /// banner nobody may be watching, so the handle is dropped and a startup
     /// failure recorded for the reconciler to fresh-spawn from.
     LeaveToReconciler,
+    /// The daemon ordered this restart (a drained build-stale respawn,
+    /// `aoe acp restart`). The resume pass owns it. Drop the handle, with
+    /// no crash banner and no stop.
+    DaemonRestart,
     /// The handle was removed (shutdown or delete).
     Gone,
     /// The registry entry was deleted under a live handle (`aoe acp stop|kill`).
@@ -342,6 +346,13 @@ impl<S: BroadcastSink> Drain<S> {
                     "attached worker connection died; leaving the fresh spawn to the reconciler"
                 );
                 lock_recover(&self.startup_failures).insert(session_id.clone());
+            }
+            RestartDecision::DaemonRestart => {
+                info!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "daemon-ordered restart; dropping the handle for the resume pass"
+                );
             }
             RestartDecision::Gone => return None,
             RestartDecision::UserStopped => {
@@ -645,6 +656,17 @@ async fn restart_decision(
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
+    if runner_managed
+        && !killed_as_unresponsive
+        && worker_registry::peek_restart_marker(session_id) == Some(handle.lease.epoch())
+    {
+        debug!(
+            target: "acp.supervisor",
+            session = %session_id,
+            "restart_decision: the daemon ordered this restart; leaving it to the resume pass"
+        );
+        return RestartDecision::DaemonRestart;
+    }
     if runner_managed && matches!(worker_registry::load(session_id), Ok(None)) {
         // A marker for this generation means the daemon killed the runner in
         // order to restart it. Consume it and fall through to the respawn.
@@ -776,7 +798,7 @@ mod tests {
         worker_registry::mark_restart_pending("s-stop", lease.epoch());
         let decision = restart_decision(&sup.workers, "s-stop", false).await;
         assert!(
-            matches!(decision, RestartDecision::UserStopped),
+            matches!(decision, RestartDecision::DaemonRestart),
             "a restart the daemon ordered must not be read as a crash, got {decision:?}"
         );
         assert!(
