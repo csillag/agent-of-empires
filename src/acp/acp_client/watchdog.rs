@@ -26,6 +26,10 @@ const SILENT_ORPHAN_FAST_GRACE_DEFAULT: Duration = Duration::from_secs(20);
 
 const SILENT_ORPHAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
+/// The pre-empted generation's accounting lands within about 1.5s of the
+/// steer. A later report is the steered reply's own wrap-up.
+pub(super) const STEER_ACCOUNTING_WINDOW: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SilentOrphanWatchdogConfig {
     pub(super) base_grace: Duration,
@@ -38,7 +42,8 @@ pub(super) struct SilentOrphanWatchdogConfig {
 /// An open tool call or a future wake always suppresses firing. Fast grace
 /// applies only once `cost_seen` is set and no off-protocol work is pending.
 /// Every other quiet turn waits the floor: silence alone is not evidence the
-/// turn ended. The cost report an injected steer triggers does not count.
+/// turn ended. A cost report within `STEER_ACCOUNTING_WINDOW` of an injected
+/// steer does not count; one after it does.
 #[derive(Debug, Default)]
 pub(super) struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -48,8 +53,9 @@ pub(super) struct SilentOrphanWatchdog {
     tool_calls_in_flight: HashMap<String, bool>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<Instant>,
-    /// The next `TerminalUsage` closes the generation a steer pre-empted.
-    steer_accounting_pending: bool,
+    /// Cost reports at or before this instant close the generation a steer
+    /// pre-empted. A later report is the real wrap-up.
+    steer_accounting_until: Option<Instant>,
 }
 
 impl SilentOrphanWatchdog {
@@ -61,7 +67,8 @@ impl SilentOrphanWatchdog {
 
     /// An injected steer counts as progress. claude-agent-acp then closes the
     /// pre-empted generation's accounting with a cost report while the turn
-    /// continues, so that next report is not the end-of-turn marker.
+    /// continues, so a report within `STEER_ACCOUNTING_WINDOW` is not the
+    /// end-of-turn marker.
     pub(super) fn apply_steer_injected(
         &mut self,
         now: Instant,
@@ -69,7 +76,7 @@ impl SilentOrphanWatchdog {
         cfg: SilentOrphanWatchdogConfig,
     ) {
         self.apply_signal(LifecycleSignal::Progress, now, wall_now, cfg);
-        self.steer_accounting_pending = true;
+        self.steer_accounting_until = Some(now + STEER_ACCOUNTING_WINDOW);
     }
 
     pub(super) fn apply_signal(
@@ -114,9 +121,17 @@ impl SilentOrphanWatchdog {
                     self.off_protocol_work_seen = kind;
                 }
             }
-            LifecycleSignal::TerminalUsage
-                if std::mem::take(&mut self.steer_accounting_pending) => {}
             LifecycleSignal::TerminalUsage => {
+                // A report inside the window is the pre-empted generation's
+                // accounting. One after it is the real wrap-up, and clears
+                // the deadline either way.
+                let swallowed = self
+                    .steer_accounting_until
+                    .take()
+                    .is_some_and(|deadline| now <= deadline);
+                if swallowed {
+                    return;
+                }
                 self.cost_seen = true;
                 // Fire-and-forget commands and compaction are bounded by the
                 // turn; async agents and wakes legitimately outlive it.
@@ -619,6 +634,27 @@ mod tests {
         w.apply_signal(LifecycleSignal::Progress, wrapped, wall, CFG);
         w.apply_signal(LifecycleSignal::TerminalUsage, wrapped, wall, CFG);
         assert!(w.should_fire(wrapped + CFG.fast_grace + Duration::from_secs(1), CFG));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_accounting_window_expires_before_the_real_report() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + Duration::from_secs(1),
+            wall,
+            CFG,
+        );
+        let steer = t0 + Duration::from_secs(5);
+        w.apply_steer_injected(steer, wall, CFG);
+        let real = steer + Duration::from_secs(21);
+        w.apply_signal(LifecycleSignal::Progress, real, wall, CFG);
+        w.apply_signal(LifecycleSignal::TerminalUsage, real, wall, CFG);
+        assert!(!w.should_fire(real + CFG.fast_grace - Duration::from_secs(1), CFG));
+        assert!(w.should_fire(real + CFG.fast_grace + Duration::from_secs(1), CFG));
     }
 
     #[test]
