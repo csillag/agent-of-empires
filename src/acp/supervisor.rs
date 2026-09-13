@@ -2447,6 +2447,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                             drop_handle(&lease).await;
                             return;
                         }
+                        RestartDecision::NoSpawnConfig => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "attached worker ended; re-armed for the reconciler's resume pass, not a crash"
+                            );
+                            // Unpins it from the reconciler's `attempted` set;
+                            // otherwise nothing ever respawns it.
+                            lock_recover(&startup_failures).insert(session_id.clone());
+                            drop_handle(&lease).await;
+                            return;
+                        }
                         RestartDecision::UserStopped => {
                             info!(
                                 target: "acp.supervisor",
@@ -4031,6 +4043,9 @@ enum RestartDecision {
     /// and emits a soft `Stopped` event instead of burning the restart
     /// budget with respawns of an agent the user just terminated.
     UserStopped,
+    /// An attached worker ended: no spawn config, so the reconciler
+    /// respawns it. Not a crash.
+    NoSpawnConfig,
 }
 
 async fn restart_decision(
@@ -4126,11 +4141,10 @@ async fn restart_decision(
     }
     match &handle.kind {
         WorkerKind::Runner { spawn_config } => RestartDecision::Respawn(spawn_config.clone()),
-        // Attached: the previous daemon owned the runner and we have
-        // no spawn config to respawn from. The reconciler will pick
-        // this session back up on the next tick if it's still
-        // `structured_view = true`.
-        WorkerKind::Attached => RestartDecision::BudgetBurned,
+        // Attached: this daemon only reattached to a runner another daemon
+        // started, so there is no spawn config to respawn from; the drain
+        // task re-arms the session for the reconciler's resume pass instead.
+        WorkerKind::Attached => RestartDecision::NoSpawnConfig,
         // Stdio: in-proc test fixture with no subprocess to respawn.
         #[cfg(test)]
         WorkerKind::Stdio => RestartDecision::BudgetBurned,
@@ -5711,6 +5725,108 @@ cursor-acp-bridge = "agent acp"
         assert!(
             matches!(decision, RestartDecision::Respawn(_)),
             "this generation's marker must turn a missing record into a respawn, got {decision:?}"
+        );
+    }
+
+    /// An attached worker's end is not a budget burn until the window is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_decision_treats_an_attached_worker_end_as_no_spawn_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; the fixture pattern above.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sup = Supervisor::new(VecSink::new());
+        // A live registry record, as an attached runner has: the drain
+        // task reaches the kind match instead of reading a stop signal.
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-attached".into(),
+            std::process::id(),
+            tmp.path().join("attached.sock"),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-attached".into()));
+        sup.test_install_handle("s-attached", client, WorkerKind::Attached, None)
+            .await;
+
+        for i in 0..MAX_RESPAWNS_IN_WINDOW {
+            let decision = restart_decision(&sup.workers, "s-attached", true).await;
+            assert!(
+                matches!(decision, RestartDecision::NoSpawnConfig),
+                "decision #{i} should be NoSpawnConfig, got {decision:?}"
+            );
+        }
+        // Past the threshold, a real budget burn still wins.
+        let decision = restart_decision(&sup.workers, "s-attached", true).await;
+        assert!(matches!(decision, RestartDecision::BudgetBurned));
+    }
+
+    /// The drain task re-arms an attached worker's session and shows no
+    /// crash banner.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_re_arms_an_attached_worker_end_as_a_startup_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; the fixture pattern above.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-attached-drain".into(),
+            std::process::id(),
+            tmp.path().join("attached.sock"),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let (client, _client_tx) =
+            AcpClient::fake_for_test(AcpSessionId("s-attached-drain".into()));
+        let lease = sup
+            .test_install_handle("s-attached-drain", client, WorkerKind::Attached, None)
+            .await;
+        let drain = sup.start_drain_task("s-attached-drain".into(), lease, inbound_rx);
+
+        drop(inbound_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("drain task should exit within 2s of inbound close");
+
+        assert!(
+            !sup.workers.lock().await.contains_key("s-attached-drain"),
+            "the handle must be dropped"
+        );
+        assert_eq!(
+            sup.take_startup_failures(),
+            vec!["s-attached-drain".to_string()],
+            "an attached worker's end must be re-armed like a startup failure"
+        );
+        let frames = sink.frames.lock().unwrap();
+        assert!(
+            !frames.iter().any(|(_, _, ev)| matches!(
+                ev,
+                Event::AgentStartupError { message } if message.contains("crashed more than")
+            )),
+            "no crash banner for a reattached worker ending"
         );
     }
 
