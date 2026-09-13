@@ -29,6 +29,10 @@ pub(super) const SILENT_ORPHAN_FAST_GRACE_DEFAULT: std::time::Duration =
 pub(super) const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// The pre-empted generation's accounting lands within about 1.5s of the
+/// steer; a later report is the steered reply's own wrap-up.
+pub(super) const STEER_ACCOUNTING_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runtime configuration handed to `SilentOrphanWatchdog::should_fire`
 /// and `apply_signal`. Decoupled from `AcpConfig` and the env-var
 /// overrides so unit tests can drive synthetic graces deterministically
@@ -49,8 +53,9 @@ pub(super) struct SilentOrphanWatchdogConfig {
 /// - a future wake suppresses the watchdog;
 /// - `cost_seen` without off-protocol work switches to the fast grace; any
 ///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
-///   `WakeupPending` clears it. The cost report an injected steer triggers
-///   does not count. Everything else waits the floor.
+///   `WakeupPending` clears it. A cost report within `STEER_ACCOUNTING_WINDOW`
+///   of an injected steer does not count; one after it does. Everything else
+///   waits the floor.
 #[derive(Debug, Default)]
 pub(super) struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -59,7 +64,7 @@ pub(super) struct SilentOrphanWatchdog {
     tool_calls_in_flight: std::collections::HashMap<String, ToolMetadata>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<tokio::time::Instant>,
-    steer_accounting_pending: bool,
+    steer_accounting_until: Option<tokio::time::Instant>,
 }
 
 impl SilentOrphanWatchdog {
@@ -70,7 +75,8 @@ impl SilentOrphanWatchdog {
     /// An injected steer counts as progress. It also pre-empts the running
     /// generation, and claude-agent-acp closes that generation's accounting
     /// with a cost-populated usage while the turn goes on with the steered
-    /// message, so the next cost report is not the end-of-turn marker.
+    /// message, so a cost report within `STEER_ACCOUNTING_WINDOW` is not the
+    /// end-of-turn marker.
     pub(super) fn apply_steer_injected(
         &mut self,
         now: tokio::time::Instant,
@@ -78,7 +84,7 @@ impl SilentOrphanWatchdog {
         cfg: SilentOrphanWatchdogConfig,
     ) {
         self.apply_signal(LifecycleSignal::Progress, now, wall_now, cfg);
-        self.steer_accounting_pending = true;
+        self.steer_accounting_until = Some(now + STEER_ACCOUNTING_WINDOW);
     }
 
     /// Fold a lifecycle signal into the state machine. Called once per
@@ -174,9 +180,18 @@ impl SilentOrphanWatchdog {
                     self.off_protocol_work_seen = Some(kind);
                 }
             }
-            LifecycleSignal::TerminalUsage
-                if std::mem::take(&mut self.steer_accounting_pending) => {}
             LifecycleSignal::TerminalUsage => {
+                // Take the deadline in either case: a report inside the
+                // window is the pre-empted generation's own accounting and
+                // is swallowed; one after it is the real end-of-turn marker
+                // and clears the deadline like any other TerminalUsage would.
+                let swallowed_as_steer_accounting = self
+                    .steer_accounting_until
+                    .take()
+                    .is_some_and(|deadline| now <= deadline);
+                if swallowed_as_steer_accounting {
+                    return;
+                }
                 self.cost_seen = true;
                 // A cost-resolved UsageUpdate is the end-of-turn marker
                 // (mid-turn usages carry `cost: null`, see #1360). A
@@ -1041,6 +1056,41 @@ mod tests {
         w.apply_signal(LifecycleSignal::TerminalUsage, wrapped, wall, cfg);
         assert!(w.should_fire(
             wrapped + cfg.fast_grace + std::time::Duration::from_secs(1),
+            cfg
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_accounting_window_expires_before_the_real_report() {
+        // Incident 07b0811133434ef1, 2026-09-12: the owner steered, the
+        // pre-empted generation emitted no cost report inside the window,
+        // and the steered reply's own wrap-up landed only 21s later. The
+        // swallow must not eat that report, or a lost PromptResponse then
+        // waits the 30-minute floor instead of the fast grace.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        let steer = t0 + std::time::Duration::from_secs(5);
+        w.apply_steer_injected(steer, wall, cfg);
+        // Nothing arrives inside STEER_ACCOUNTING_WINDOW; the real wrap-up
+        // lands well after it, with the agent still visibly replying.
+        let real = steer + std::time::Duration::from_secs(21);
+        w.apply_signal(LifecycleSignal::Progress, real, wall, cfg);
+        w.apply_signal(LifecycleSignal::TerminalUsage, real, wall, cfg);
+        assert!(!w.should_fire(
+            real + cfg.fast_grace - std::time::Duration::from_secs(1),
+            cfg
+        ));
+        assert!(w.should_fire(
+            real + cfg.fast_grace + std::time::Duration::from_secs(1),
             cfg
         ));
     }
