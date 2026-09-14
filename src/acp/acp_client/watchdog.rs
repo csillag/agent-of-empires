@@ -33,6 +33,11 @@ pub(super) const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration =
 /// steer; a later report is the steered reply's own wrap-up.
 pub(super) const STEER_ACCOUNTING_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Tools already in flight when a steer pre-empts the generation almost
+/// never complete (20 of 21 observed cases); the one that did finished
+/// within 1.4s. Drop them as orphaned this long after the steer.
+pub(super) const STEER_ORPHAN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Runtime configuration handed to `SilentOrphanWatchdog::should_fire`
 /// and `apply_signal`. Decoupled from `AcpConfig` and the env-var
 /// overrides so unit tests can drive synthetic graces deterministically
@@ -49,7 +54,9 @@ pub(super) struct SilentOrphanWatchdogConfig {
 ///
 /// Invariants:
 ///
-/// - `tool_calls_in_flight` non-empty → watchdog is always suppressed.
+/// - `tool_calls_in_flight` non-empty → watchdog is always suppressed,
+///   except tools already in flight at a steer, dropped as orphaned
+///   `STEER_ORPHAN_AFTER` later.
 /// - a future wake suppresses the watchdog;
 /// - `cost_seen` without off-protocol work switches to the fast grace; any
 ///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
@@ -65,6 +72,8 @@ pub(super) struct SilentOrphanWatchdog {
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<tokio::time::Instant>,
     steer_accounting_until: Option<tokio::time::Instant>,
+    steer_suspects: std::collections::HashSet<String>,
+    steer_suspect_deadline: Option<tokio::time::Instant>,
 }
 
 impl SilentOrphanWatchdog {
@@ -76,7 +85,10 @@ impl SilentOrphanWatchdog {
     /// generation, and claude-agent-acp closes that generation's accounting
     /// with a cost-populated usage while the turn goes on with the steered
     /// message, so a cost report within `STEER_ACCOUNTING_WINDOW` is not the
-    /// end-of-turn marker.
+    /// end-of-turn marker. Tools already in flight at this moment almost
+    /// never belong to the steered turn (see `STEER_ORPHAN_AFTER`), so they
+    /// are snapshotted as suspects; a second steer before the deadline
+    /// merges in the tools still in flight then and extends the deadline.
     pub(super) fn apply_steer_injected(
         &mut self,
         now: tokio::time::Instant,
@@ -85,6 +97,13 @@ impl SilentOrphanWatchdog {
     ) {
         self.apply_signal(LifecycleSignal::Progress, now, wall_now, cfg);
         self.steer_accounting_until = Some(now + STEER_ACCOUNTING_WINDOW);
+        self.steer_suspects
+            .extend(self.tool_calls_in_flight.keys().cloned());
+        let deadline = now + STEER_ORPHAN_AFTER;
+        self.steer_suspect_deadline = Some(
+            self.steer_suspect_deadline
+                .map_or(deadline, |existing| existing.max(deadline)),
+        );
     }
 
     /// Fold a lifecycle signal into the state machine. Called once per
@@ -157,6 +176,9 @@ impl SilentOrphanWatchdog {
                     .remove(&id)
                     .map(|m| m.is_background_task)
                     .unwrap_or(false);
+                // It completed, so it was never an orphan: drop the
+                // steer suspicion regardless of the deadline.
+                self.steer_suspects.remove(&id);
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
@@ -281,13 +303,23 @@ impl SilentOrphanWatchdog {
     }
 
     /// Returns `true` iff the watchdog must fire now. Also clears any
-    /// expired `wakeup_suppress_until` deadline as a side effect so
-    /// subsequent ticks don't re-evaluate stale state.
+    /// expired `wakeup_suppress_until` deadline, and drops any steer
+    /// suspects past `STEER_ORPHAN_AFTER`, as a side effect so subsequent
+    /// ticks don't re-evaluate stale state.
     pub(super) fn should_fire(
         &mut self,
         now: tokio::time::Instant,
         cfg: SilentOrphanWatchdogConfig,
     ) -> bool {
+        if self
+            .steer_suspect_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            for id in self.steer_suspects.drain() {
+                self.tool_calls_in_flight.remove(&id);
+            }
+            self.steer_suspect_deadline = None;
+        }
         if self
             .wakeup_suppress_until
             .is_some_and(|deadline| now >= deadline)
@@ -1091,6 +1123,163 @@ mod tests {
         ));
         assert!(w.should_fire(
             real + cfg.fast_grace + std::time::Duration::from_secs(1),
+            cfg
+        ));
+    }
+
+    // Steer-orphan suspects (STEER_ORPHAN_AFTER). Evidence: over 4 days, 95
+    // cost-populated reports arrived while a tool was in flight outside any
+    // steer window, and 83 of those tools completed afterward (median 1.6s,
+    // max 596s) -- so a cost report alone is never proof a tool is done and
+    // the plain TerminalUsage arm must not clear tool_calls_in_flight (see
+    // watchdog_tool_in_flight_suppresses_even_after_terminal_usage below,
+    // unmodified). But of 14 steers with 21 tools in flight at the moment of
+    // the steer, only 1 later completed (in 1.4s); the other 20 never did.
+    // So, scoped to steers only: snapshot tools in flight as suspects and
+    // drop them if they outlive STEER_ORPHAN_AFTER.
+    //
+    // | test | shape | should_fire before | after |
+    // |---|---|---|---|
+    // | (a) incident | tool starts, steer swallows its own accounting, tool never completes, real report 27 min later | false (before fast grace) | true (after fast grace) |
+    // | (b) resolved suspect | suspect completes 1.4s after the steer; an unrelated later tool still suppresses | n/a | still suppressed past the floor |
+    // | (c) not a suspect | tool started after the steer | n/a | still suppressed past STEER_ORPHAN_AFTER |
+    // | (e) before deadline | suspect not yet 60s old | still suppressed | n/a |
+
+    #[tokio::test]
+    async fn watchdog_steer_orphaned_tool_dropped_after_steer_orphan_after() {
+        // (a) The incident shape: an Edit-like tool starts, a steer 3s later
+        // pre-empts the generation and its own accounting is swallowed, the
+        // tool never produces a ToolCompleted, and the turn's real cost
+        // report lands 27 minutes on. Without dropping the stale suspect,
+        // tool_calls_in_flight stays non-empty forever.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-edit-orphan".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        let steer = t0 + std::time::Duration::from_secs(4);
+        w.apply_steer_injected(steer, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            steer + std::time::Duration::from_millis(50),
+            wall,
+            cfg,
+        );
+        let real = steer + std::time::Duration::from_secs(27 * 60);
+        w.apply_signal(LifecycleSignal::Progress, real, wall, cfg);
+        w.apply_signal(LifecycleSignal::TerminalUsage, real, wall, cfg);
+        assert!(!w.should_fire(
+            real + cfg.fast_grace - std::time::Duration::from_secs(1),
+            cfg
+        ));
+        assert!(w.should_fire(
+            real + cfg.fast_grace + std::time::Duration::from_secs(1),
+            cfg
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_suspect_completion_has_no_lasting_effect() {
+        // (b) A suspect that completes shortly after the steer (the 1-of-21
+        // observed case) must not leave any residue: an unrelated, later
+        // in-flight tool still suppresses normally.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-suspect".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        let steer = t0 + std::time::Duration::from_secs(2);
+        w.apply_steer_injected(steer, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-suspect".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            steer + std::time::Duration::from_millis(1400),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-unrelated".into(),
+                is_background_task: false,
+            },
+            steer + std::time::Duration::from_secs(5),
+            wall,
+            cfg,
+        );
+        assert!(!w.should_fire(t0 + FLOOR + std::time::Duration::from_secs(60), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_tool_started_after_steer_is_not_a_suspect() {
+        // (c) A tool started after the steer was never in flight at the
+        // moment of the steer, so it is not a suspect and keeps suppressing
+        // past STEER_ORPHAN_AFTER, unlike a genuine steer suspect.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        let steer = t0 + std::time::Duration::from_secs(1);
+        w.apply_steer_injected(steer, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-late".into(),
+                is_background_task: false,
+            },
+            steer + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(!w.should_fire(
+            steer + STEER_ORPHAN_AFTER + std::time::Duration::from_secs(60),
+            cfg
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_suspect_still_suppresses_before_the_deadline() {
+        // (e) Inside STEER_ORPHAN_AFTER, a suspect must keep suppressing:
+        // the deadline has not passed, so it has not yet been proven an
+        // orphan.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-not-yet".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        let steer = t0 + std::time::Duration::from_secs(2);
+        w.apply_steer_injected(steer, wall, cfg);
+        assert!(!w.should_fire(
+            steer + STEER_ORPHAN_AFTER - std::time::Duration::from_secs(1),
             cfg
         ));
     }
