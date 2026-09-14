@@ -3,7 +3,7 @@
 
 use crate::acp::agent_profiles;
 use agent_client_protocol::schema::v1::SessionUpdate;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -30,6 +30,10 @@ const SILENT_ORPHAN_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// steer. A later report is the steered reply's own wrap-up.
 pub(super) const STEER_ACCOUNTING_WINDOW: Duration = Duration::from_secs(2);
 
+/// Tools already in flight when a steer pre-empts the generation almost never
+/// complete. Drop them as orphaned this long after the steer.
+pub(super) const STEER_ORPHAN_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SilentOrphanWatchdogConfig {
     pub(super) base_grace: Duration,
@@ -39,7 +43,9 @@ pub(super) struct SilentOrphanWatchdogConfig {
 
 /// Per-prompt silent-orphan state machine. Time is injected for tests.
 ///
-/// An open tool call or a future wake always suppresses firing. Fast grace
+/// An open tool call or a future wake always suppresses firing, except tools
+/// already in flight at a steer, which are dropped `STEER_ORPHAN_AFTER` later.
+/// Fast grace
 /// applies only once `cost_seen` is set and no off-protocol work is pending.
 /// Every other quiet turn waits the floor: silence alone is not evidence the
 /// turn ended. A cost report within `STEER_ACCOUNTING_WINDOW` of an injected
@@ -56,6 +62,9 @@ pub(super) struct SilentOrphanWatchdog {
     /// Cost reports at or before this instant close the generation a steer
     /// pre-empted. A later report is the real wrap-up.
     steer_accounting_until: Option<Instant>,
+    /// Tool ids in flight when a steer landed. Dropped if they never complete.
+    steer_suspects: HashSet<String>,
+    steer_suspect_deadline: Option<Instant>,
 }
 
 impl SilentOrphanWatchdog {
@@ -77,6 +86,13 @@ impl SilentOrphanWatchdog {
     ) {
         self.apply_signal(LifecycleSignal::Progress, now, wall_now, cfg);
         self.steer_accounting_until = Some(now + STEER_ACCOUNTING_WINDOW);
+        self.steer_suspects
+            .extend(self.tool_calls_in_flight.keys().cloned());
+        let deadline = now + STEER_ORPHAN_AFTER;
+        self.steer_suspect_deadline = Some(
+            self.steer_suspect_deadline
+                .map_or(deadline, |existing| existing.max(deadline)),
+        );
     }
 
     pub(super) fn apply_signal(
@@ -112,6 +128,7 @@ impl SilentOrphanWatchdog {
                 off_protocol_work,
             } => {
                 let started_as_background = self.tool_calls_in_flight.remove(&id).unwrap_or(false);
+                self.steer_suspects.remove(&id);
                 self.refresh(now);
                 // The raw_input flag only counts on success: a failed launch
                 // leaves nothing running.
@@ -175,8 +192,15 @@ impl SilentOrphanWatchdog {
         }
     }
 
-    /// Clears an expired wake deadline as a side effect.
+    /// Clears an expired wake deadline, and drops steer suspects past
+    /// `STEER_ORPHAN_AFTER`, as a side effect.
     pub(super) fn should_fire(&mut self, now: Instant, cfg: SilentOrphanWatchdogConfig) -> bool {
+        if self.steer_suspect_deadline.is_some_and(|d| now >= d) {
+            for id in self.steer_suspects.drain() {
+                self.tool_calls_in_flight.remove(&id);
+            }
+            self.steer_suspect_deadline = None;
+        }
         if self.wakeup_suppress_until.is_some_and(|d| now >= d) {
             self.wakeup_suppress_until = None;
         }
@@ -655,6 +679,74 @@ mod tests {
         w.apply_signal(LifecycleSignal::TerminalUsage, real, wall, CFG);
         assert!(!w.should_fire(real + CFG.fast_grace - Duration::from_secs(1), CFG));
         assert!(w.should_fire(real + CFG.fast_grace + Duration::from_secs(1), CFG));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_orphaned_tool_dropped_after_deadline() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        w.apply_signal(start("tc-edit", false), t0 + Duration::from_secs(1), wall, CFG);
+        let steer = t0 + Duration::from_secs(4);
+        w.apply_steer_injected(steer, wall, CFG);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            steer + Duration::from_millis(50),
+            wall,
+            CFG,
+        );
+        let real = steer + Duration::from_secs(27 * 60);
+        w.apply_signal(LifecycleSignal::Progress, real, wall, CFG);
+        w.apply_signal(LifecycleSignal::TerminalUsage, real, wall, CFG);
+        assert!(!w.should_fire(real + CFG.fast_grace - Duration::from_secs(1), CFG));
+        assert!(w.should_fire(real + CFG.fast_grace + Duration::from_secs(1), CFG));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_suspect_completion_leaves_later_tools() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        w.apply_signal(start("tc-suspect", false), t0 + Duration::from_secs(1), wall, CFG);
+        let steer = t0 + Duration::from_secs(2);
+        w.apply_steer_injected(steer, wall, CFG);
+        w.apply_signal(
+            done("tc-suspect", true, None),
+            steer + Duration::from_millis(1400),
+            wall,
+            CFG,
+        );
+        w.apply_signal(start("tc-unrelated", false), steer + Duration::from_secs(5), wall, CFG);
+        assert!(!w.should_fire(
+            t0 + OFF_PROTOCOL_WORK_GRACE_FLOOR + Duration::from_secs(60),
+            CFG
+        ));
+    }
+
+    #[tokio::test]
+    async fn watchdog_tool_started_after_steer_is_not_a_suspect() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        let steer = t0 + Duration::from_secs(1);
+        w.apply_steer_injected(steer, wall, CFG);
+        w.apply_signal(start("tc-late", false), steer + Duration::from_secs(2), wall, CFG);
+        assert!(!w.should_fire(steer + STEER_ORPHAN_AFTER + Duration::from_secs(60), CFG));
+    }
+
+    #[tokio::test]
+    async fn watchdog_steer_suspect_suppresses_before_the_deadline() {
+        let t0 = Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::default();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
+        w.apply_signal(start("tc-not-yet", false), t0 + Duration::from_secs(1), wall, CFG);
+        let steer = t0 + Duration::from_secs(2);
+        w.apply_steer_injected(steer, wall, CFG);
+        assert!(!w.should_fire(steer + STEER_ORPHAN_AFTER - Duration::from_secs(1), CFG));
     }
 
     #[test]
