@@ -105,6 +105,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let was_pending = lock_recover(&self.respawn_pending)
             .remove(session_id)
             .is_some();
+        lock_recover(&self.respawn_since).remove(session_id);
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
         match decision {
             StopDecision::TearDown { lease, identity } => {
@@ -246,11 +247,40 @@ impl<S: BroadcastSink> Supervisor<S> {
         let StopDecision::TearDown { lease, identity } =
             lock_recover(&self.lifecycle).begin_stop(session_id, "restart_pending")
         else {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         };
         let handle = workers.remove(session_id);
         drop(workers);
+        // `aoe acp stop` may have removed the record while the connection
+        // closed. Checked before the signal: a runner removes its own record
+        // as it exits. A restart marker for this runner stays a restart.
+        let generation = identity.map_or(0, |runner| runner.generation);
+        let stopped_meanwhile = registry_disowns(session_id, identity)
+            && !worker_registry::take_restart_marker(session_id, generation)
+            && {
+                let _workers = self.workers.lock().await;
+                lock_recover(&self.respawn_pending)
+                    .remove(session_id)
+                    .is_some()
+            };
         worker_registry::clear_restart_marker(session_id);
+        lock_recover(&self.respawn_since).remove(session_id);
+        if stopped_meanwhile {
+            self.publish_next(
+                session_id,
+                &Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            );
+            if let Some(handle) = handle {
+                let _ = handle.client.shutdown().await;
+                handle.drain_task.abort();
+            }
+            self.settle(&lease, Settlement::Proven);
+            return false;
+        }
         self.publish_next(
             session_id,
             &Event::Stopped {

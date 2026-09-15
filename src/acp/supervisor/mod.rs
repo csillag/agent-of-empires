@@ -166,6 +166,10 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_waits: tokio::sync::broadcast::Sender<String>,
     /// Build-stale sessions draining a turn before the reconciler retires them.
     respawn_pending: Arc<std::sync::Mutex<HashMap<String, PendingRespawn>>>,
+    /// When each session's stale runner, by generation, was first flagged.
+    /// Outlives a broken connection, so re-adopting the same runner does not
+    /// restart the deferral caps.
+    respawn_since: Arc<std::sync::Mutex<HashMap<String, (u64, i64)>>>,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
     incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Sessions the reconciler must fresh-spawn next tick, bypassing its `attempted` guard.
@@ -271,6 +275,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
             respawn_pending: Arc::default(),
+            respawn_since: Arc::default(),
             incompatible_binaries: Arc::default(),
             force_respawn: Arc::default(),
             startup_failures: Arc::default(),
@@ -283,14 +288,28 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Flag the running worker of a session adopted on a stale build. The flag
     /// belongs to that worker: a stop or a replacement ends it.
     pub fn mark_build_respawn_pending(&self, session_id: &str, now_ms: i64) {
-        let Some((lease, _)) = lock_recover(&self.lifecycle).running(session_id) else {
+        let Some((lease, identity)) = lock_recover(&self.lifecycle).running(session_id) else {
             return;
+        };
+        // Re-adopting the same runner keeps the time it was first flagged.
+        let since_ms = match identity {
+            Some(runner) => {
+                let mut since = lock_recover(&self.respawn_since);
+                let first = since
+                    .entry(session_id.to_string())
+                    .or_insert((runner.generation, now_ms));
+                if first.0 != runner.generation {
+                    *first = (runner.generation, now_ms);
+                }
+                first.1
+            }
+            None => now_ms,
         };
         lock_recover(&self.respawn_pending).insert(
             session_id.to_string(),
             PendingRespawn {
                 epoch: lease.epoch(),
-                since_ms: now_ms,
+                since_ms,
             },
         );
     }
