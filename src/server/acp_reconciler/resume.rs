@@ -482,18 +482,20 @@ pub(crate) async fn trigger_resume_background(
 /// Quiet time after the agent's last proof of idle before a drained worker
 /// is retired, so a follow-up turn already queued can show itself.
 const DRAIN_SETTLE_MS: i64 = 15_000;
-/// How long an idle the agent cannot prove keeps the old binary.
+/// How long an unproven idle, or a live background sub-agent, keeps the old binary.
 const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
 
 struct DrainProbe {
     turn_open: bool,
     idle_since: Option<i64>,
+    /// A background sub-agent that has not completed.
+    holds_background: bool,
 }
 
 /// An open turn always waits. Otherwise the agent must have been quiet for
-/// `DRAIN_SETTLE_MS` and have proven itself idle. Past `DRAIN_DEFERRAL_CAP_MS`,
-/// an idle it cannot prove no longer holds the worker. The live notification
-/// clock that also feeds this window lives on `fix/idle-reap-live-activity`.
+/// `DRAIN_SETTLE_MS`, have proven itself idle, and hold no live sub-agent.
+/// Past `DRAIN_DEFERRAL_CAP_MS`, neither an unproven idle nor that sub-agent
+/// holds the worker.
 fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     if probe.turn_open {
         return false;
@@ -504,7 +506,8 @@ fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     {
         return false;
     }
-    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+    (probe.idle_since.is_some() && !probe.holds_background)
+        || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
 }
 
 /// Retires adopted build-stale workers once `drain_ready` lets them go.
@@ -517,14 +520,16 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<
             &id,
             "draining stale worker",
             |s, id| DrainProbe {
-                turn_open: s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id),
+                turn_open: s.has_agent_turn_in_flight(id),
                 idle_since: s.agent_idle_since(id),
+                holds_background: !s.unresolved_background_agent_ids(id).is_empty(),
             },
         )
         .await
         .unwrap_or(DrainProbe {
             turn_open: true,
             idle_since: None,
+            holds_background: true,
         });
         if !drain_ready(now_ms, pending_since_ms, &probe) {
             continue;
