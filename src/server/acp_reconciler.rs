@@ -1141,38 +1141,71 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
 /// few seconds a queued follow-up turn takes to emit its first event.
 const DRAIN_SETTLE_MS: i64 = 15_000;
 
-/// How long an idle the agent cannot prove keeps a drained build-stale
-/// worker on its old binary, so a wedged one is still replaced.
+/// How long an idle the agent cannot prove, or live background work, keeps
+/// a drained build-stale worker on its old binary (owner decision), so a
+/// wedged one is still replaced and a deploy is not held back for good.
 const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
 
 /// What decides whether a drained build-stale worker may be retired.
 #[derive(Debug, Clone, Copy)]
 struct DrainProbe {
-    /// A prompt with no terminator, a live async sub-agent, or a turn the
-    /// agent opened itself.
+    /// `EventStore::has_agent_turn_in_flight`: a turn under way, prompted or
+    /// started by the agent itself.
     turn_open: bool,
     /// `EventStore::agent_idle_since`.
     idle_since: Option<i64>,
+    /// Live background work that holds the worker (`holds_drain`).
+    holds_background: bool,
     /// When the live connection last heard from the agent.
     last_notification_ms: Option<i64>,
 }
 
 impl DrainProbe {
-    /// The event store's part of the probe.
-    fn read(store: &crate::acp::event_store::EventStore, id: &str) -> Self {
+    /// The event store's part of the probe at `now`, for a hold that ends at
+    /// `hold_until`.
+    fn read(
+        store: &crate::acp::event_store::EventStore,
+        id: &str,
+        now: chrono::DateTime<chrono::Utc>,
+        hold_until: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         Self {
-            turn_open: store.has_in_flight_turn(id) || store.has_agent_turn_in_flight(id),
+            turn_open: store.has_agent_turn_in_flight(id),
             idle_since: store.agent_idle_since(id),
+            holds_background: store
+                .background_items(id, now)
+                .iter()
+                .any(|item| holds_drain(item, hold_until)),
             last_notification_ms: None,
         }
     }
 }
 
+/// Whether a live background item holds a drained build-stale worker on its
+/// old binary until `hold_until`. Shells, workflows and sub-agents are work
+/// that ends on its own. A wakeup holds only if it fires by then, since
+/// waiting cannot save one that fires later. A monitor never holds: it can
+/// run forever, and the wake note re-arms it.
+fn holds_drain(
+    item: &crate::acp::state::BackgroundItem,
+    hold_until: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    use crate::acp::state::BackgroundKind;
+    item.is_live()
+        && match item.kind {
+            BackgroundKind::Shell | BackgroundKind::Workflow | BackgroundKind::Subagent => true,
+            BackgroundKind::Wakeup => item.expires_at.is_some_and(|at| at <= hold_until),
+            BackgroundKind::Monitor => false,
+        }
+}
+
 /// Whether a build-stale worker flagged at `pending_since_ms` may be retired
 /// at `now_ms`. An open turn always waits. Otherwise the agent must have been
 /// quiet for `DRAIN_SETTLE_MS`, so a follow-up turn already queued shows up
-/// first, and must have proven itself idle; once `DRAIN_DEFERRAL_CAP_MS` has
-/// passed, an idle it cannot prove no longer holds the worker.
+/// first, must have proven itself idle, and must hold no background work.
+/// Once `DRAIN_DEFERRAL_CAP_MS` has passed, neither an unproven idle nor
+/// background work holds the worker: the retire loses the items to
+/// `NewBuild`, which queues the wake note.
 fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     if probe.turn_open {
         return false;
@@ -1181,15 +1214,28 @@ fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     if quiet_since.is_some_and(|at| now_ms.saturating_sub(at) < DRAIN_SETTLE_MS) {
         return false;
     }
-    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+    (probe.idle_since.is_some() && !probe.holds_background)
+        || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
 }
 
-/// Read a session's `DrainProbe`. Fails closed: a probe that cannot answer
-/// reports an open turn, retried next tick.
-async fn drain_probe(state: &Arc<AppState>, id: &str) -> DrainProbe {
+/// Read a session's `DrainProbe` at `now_ms`, for a worker flagged at
+/// `pending_since_ms`. Fails closed: a probe that cannot answer reports an
+/// open turn, retried next tick.
+async fn drain_probe(
+    state: &Arc<AppState>,
+    id: &str,
+    now_ms: i64,
+    pending_since_ms: i64,
+) -> DrainProbe {
     let store = Arc::clone(&state.acp_event_store);
     let id_probe = id.to_string();
-    let probe = match tokio::task::spawn_blocking(move || DrainProbe::read(&store, &id_probe)).await
+    let at = |ms: i64| chrono::DateTime::from_timestamp_millis(ms).unwrap_or_default();
+    let now = at(now_ms);
+    let hold_until = at(pending_since_ms.saturating_add(DRAIN_DEFERRAL_CAP_MS));
+    let probe = match tokio::task::spawn_blocking(move || {
+        DrainProbe::read(&store, &id_probe, now, hold_until)
+    })
+    .await
     {
         Ok(probe) => probe,
         Err(e) => {
@@ -1202,6 +1248,7 @@ async fn drain_probe(state: &Arc<AppState>, id: &str) -> DrainProbe {
             DrainProbe {
                 turn_open: true,
                 idle_since: None,
+                holds_background: true,
                 last_notification_ms: None,
             }
         }
@@ -1218,7 +1265,7 @@ async fn drain_probe(state: &Arc<AppState>, id: &str) -> DrainProbe {
 async fn respawn_drained_stale_workers(state: &Arc<AppState>, now_ms: i64) -> Vec<String> {
     let mut retired = Vec::new();
     for (id, pending_since_ms) in state.acp_supervisor.respawn_pending() {
-        let probe = drain_probe(state, &id).await;
+        let probe = drain_probe(state, &id, now_ms, pending_since_ms).await;
         if !drain_ready(now_ms, pending_since_ms, &probe) {
             continue;
         }
@@ -1227,6 +1274,7 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>, now_ms: i64) -> Ve
             session = %id,
             reason = "build_stale",
             idle_since = ?probe.idle_since,
+            holds_background = probe.holds_background,
             pending_ms = now_ms.saturating_sub(pending_since_ms),
             "stale structured view worker drained; respawning"
         );
@@ -1788,7 +1836,11 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 && !crate::process::worker_registry::is_build_current(r) =>
         {
             let now_ms = chrono::Utc::now().timestamp_millis();
-            !drain_ready(now_ms, now_ms, &drain_probe(&state, &id).await)
+            !drain_ready(
+                now_ms,
+                now_ms,
+                &drain_probe(&state, &id, now_ms, now_ms).await,
+            )
         }
         _ => false,
     };
@@ -2531,7 +2583,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, background_holds, drain_ready, publish_orphaned_turn_stop,
+        adopt_decision, background_holds, drain_ready, holds_drain, publish_orphaned_turn_stop,
         rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
         should_readopt_orphan_runner, AdoptDecision, DrainProbe, DRAIN_DEFERRAL_CAP_MS,
         DRAIN_SETTLE_MS, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
@@ -3464,60 +3516,79 @@ mod tests {
     }
 
     /// `drain_ready` over its inputs: an open turn always waits; otherwise
-    /// the agent must be quiet for the settle window and proven idle, and
-    /// once the cap has passed an unproven idle no longer holds the worker.
+    /// the agent must be quiet for the settle window, proven idle and free of
+    /// background work, and once the cap has passed neither an unproven idle
+    /// nor background work holds the worker.
     #[test]
     fn drain_ready_waits_for_a_settled_proven_idle() {
         const NOW: i64 = 100_000_000;
         let settled = NOW - DRAIN_SETTLE_MS;
         let capped = NOW - DRAIN_DEFERRAL_CAP_MS;
-        let probe = |turn_open, idle_since, last_notification_ms| DrainProbe {
+        let probe = |turn_open, idle_since, holds_background, last_notification_ms| DrainProbe {
             turn_open,
             idle_since,
+            holds_background,
             last_notification_ms,
         };
         // (case, probe, flagged at, want)
         let cases = [
-            ("open turn", probe(true, Some(settled), None), capped, false),
+            (
+                "open turn",
+                probe(true, Some(settled), false, None),
+                capped,
+                false,
+            ),
             (
                 "idle, settled",
-                probe(false, Some(settled), None),
+                probe(false, Some(settled), false, None),
                 NOW,
                 true,
             ),
             (
                 "idle, not settled",
-                probe(false, Some(settled + 1), None),
+                probe(false, Some(settled + 1), false, None),
                 NOW,
                 false,
             ),
             (
                 "idle, agent heard from lately",
-                probe(false, Some(settled), Some(settled + 1)),
+                probe(false, Some(settled), false, Some(settled + 1)),
                 NOW,
                 false,
             ),
             (
                 "idle, not settled, past the cap",
-                probe(false, Some(settled + 1), None),
+                probe(false, Some(settled + 1), false, None),
                 capped,
                 false,
             ),
             (
+                "idle, background work, before the cap",
+                probe(false, Some(settled), true, None),
+                capped + 1,
+                false,
+            ),
+            (
+                "idle, background work, at the cap",
+                probe(false, Some(settled), true, None),
+                capped,
+                true,
+            ),
+            (
                 "unproven, before the cap",
-                probe(false, None, None),
+                probe(false, None, false, None),
                 capped + 1,
                 false,
             ),
             (
                 "unproven, at the cap",
-                probe(false, None, None),
+                probe(false, None, false, None),
                 capped,
                 true,
             ),
             (
                 "unproven, at the cap, agent heard from lately",
-                probe(false, None, Some(settled + 1)),
+                probe(false, None, false, Some(settled + 1)),
                 capped,
                 false,
             ),
@@ -3607,7 +3678,11 @@ mod tests {
         record(45_447, cost_marker(29.8));
         // 20:36:27.795: adopted to drain.
         let flagged_at = origin + 27_795;
-        let busy_at = |now_ms: i64| !drain_ready(now_ms, flagged_at, &DrainProbe::read(&store, id));
+        let busy_at = |now_ms: i64| {
+            let hold_until = at(27_795 + DRAIN_DEFERRAL_CAP_MS);
+            let probe = DrainProbe::read(&store, id, at(now_ms - origin), hold_until);
+            !drain_ready(now_ms, flagged_at, &probe)
+        };
         assert!(busy_at(origin + 45_600), "20:36:45.6");
         // 20:36:45.945, seq 46500: the deploy's notification, enqueued 44.528.
         record(45_945, ended("bo7wski4j", 44_528));
@@ -3630,6 +3705,126 @@ mod tests {
             !busy_at(origin + 158_582 + DRAIN_SETTLE_MS),
             "settled after T2, the drain may go"
         );
+    }
+
+    /// Which live background items hold a drained worker (owner decision):
+    /// work that ends on its own does, a monitor never does, and a wakeup
+    /// only if it fires before the hold ends.
+    #[test]
+    fn holds_drain_follows_the_owners_rule() {
+        use crate::acp::state::{
+            BackgroundEnd, BackgroundEndReason, BackgroundItem, BackgroundKind,
+        };
+        let hold_until = Utc::now() + Duration::minutes(30);
+        let item = |kind, expires_at| BackgroundItem {
+            kind,
+            id: "b1".into(),
+            label: None,
+            started_at: Utc::now(),
+            expires_at,
+            ended: None,
+        };
+        let ended_shell = BackgroundItem {
+            ended: Some(BackgroundEnd {
+                reason: BackgroundEndReason::Finished,
+                cause: None,
+                at: Utc::now(),
+            }),
+            ..item(BackgroundKind::Shell, None)
+        };
+        let cases = [
+            ("shell", item(BackgroundKind::Shell, None), true),
+            ("workflow", item(BackgroundKind::Workflow, None), true),
+            ("sub-agent", item(BackgroundKind::Subagent, None), true),
+            ("monitor", item(BackgroundKind::Monitor, None), false),
+            (
+                "wakeup firing within the hold",
+                item(
+                    BackgroundKind::Wakeup,
+                    Some(hold_until - Duration::minutes(1)),
+                ),
+                true,
+            ),
+            (
+                "wakeup firing after it",
+                item(
+                    BackgroundKind::Wakeup,
+                    Some(hold_until + Duration::minutes(1)),
+                ),
+                false,
+            ),
+            ("ended shell", ended_shell, false),
+        ];
+        for (case, item, want) in cases {
+            assert_eq!(holds_drain(&item, hold_until), want, "{case}");
+        }
+    }
+
+    /// The owner's rule for background work: a live shell holds a drained
+    /// build-stale worker, a live monitor does not, and past the 30-minute
+    /// cap the worker is retired with its items lost to `new_build`.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn live_background_work_holds_a_drained_worker_up_to_the_cap() {
+        use crate::acp::state::{BackgroundEndReason, BackgroundKind, BackgroundLossCause};
+        for (id, kind, after_flag_ms, retired) in [
+            ("s-shell", BackgroundKind::Shell, DRAIN_SETTLE_MS, false),
+            ("s-monitor", BackgroundKind::Monitor, DRAIN_SETTLE_MS, true),
+            (
+                "s-shell-capped",
+                BackgroundKind::Shell,
+                DRAIN_DEFERRAL_CAP_MS,
+                true,
+            ),
+        ] {
+            let (state, _home, _project) = capacity_test_state(id).await;
+            let flagged_at = Utc::now().timestamp_millis() - 60_000;
+            let started = crate::acp::Event::BackgroundItemStarted {
+                kind,
+                id: "bg1".into(),
+                tool_call_id: None,
+                label: None,
+                started_at: Utc::now(),
+                expires_at: None,
+            };
+            let store = &state.acp_event_store;
+            store
+                .record_at(id, 1, &started, flagged_at - 1_000)
+                .unwrap();
+            store
+                .record_at(id, 2, &cost_marker(0.1), flagged_at)
+                .unwrap();
+            state.acp_supervisor.hydrate_seqs([(id.to_string(), 2)]);
+            save_runner_record(id, UNUSED_PID, 4);
+            state
+                .acp_supervisor
+                .test_install_attached(
+                    id,
+                    crate::acp::runner_lifecycle::RunnerIdentity {
+                        pid: UNUSED_PID,
+                        generation: 4,
+                    },
+                )
+                .await;
+            state
+                .acp_supervisor
+                .mark_build_respawn_pending(id, flagged_at);
+
+            let got =
+                super::respawn_drained_stale_workers(&state, flagged_at + after_flag_ms).await;
+            assert_eq!(!got.is_empty(), retired, "{id}");
+            let bg1 = store
+                .background_items(id, Utc::now())
+                .into_iter()
+                .find(|item| item.id == "bg1")
+                .expect("the item stays listed");
+            let lost = bg1.ended.map(|end| (end.reason, end.cause));
+            let want = retired.then_some((
+                BackgroundEndReason::Lost,
+                Some(BackgroundLossCause::NewBuild),
+            ));
+            assert_eq!(lost, want, "{id}");
+        }
     }
 
     /// A worker that failed before establishing a session is re-armed by the
