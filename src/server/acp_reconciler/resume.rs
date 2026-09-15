@@ -476,11 +476,11 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
-/// Respawns adopted build-stale workers once their turn drains (#1754), like
-/// `aoe acp restart`: restart marker, then terminate the stale runner.
-pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
+/// Retires adopted build-stale workers once their turn drains (#1754),
+/// returning the sessions to re-arm. A failed probe counts as busy.
+pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<String> {
+    let mut retired = Vec::new();
     for id in state.acp_supervisor.respawn_pending_ids() {
-        // A failed probe counts as busy so a live turn is never killed.
         let in_flight = query_store(
             &state.acp_event_store,
             &id,
@@ -493,23 +493,11 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
-        let generation = state
-            .acp_supervisor
-            .running_identity(&id)
-            .map(|identity| identity.generation)
-            .or_else(|| {
-                worker_registry::load(&id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.generation)
-            });
-        // With nothing naming the runner, a marker written by the stop that removed the record stands.
-        if let Some(generation) = generation {
-            worker_registry::mark_restart_pending(&id, generation);
+        if state.acp_supervisor.retire_build_stale(&id).await {
+            retired.push(id);
         }
-        worker_registry::terminate_and_wait(&id).await;
-        state.acp_supervisor.clear_respawn_pending(&id);
     }
+    retired
 }
 
 #[cfg(test)]

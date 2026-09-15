@@ -100,6 +100,11 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Same lock order as `begin_resume`, so a resume cannot slip between
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
+        // A deliberate stop ends a pending build-stale retire. Taken under
+        // `workers`, as the retire takes it, so exactly one of them wins.
+        let was_pending = lock_recover(&self.respawn_pending)
+            .remove(session_id)
+            .is_some();
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
         match decision {
             StopDecision::TearDown { lease, identity } => {
@@ -158,7 +163,20 @@ impl<S: BroadcastSink> Supervisor<S> {
                 );
                 Ok(())
             }
-            StopDecision::AlreadyStopping => Ok(()),
+            StopDecision::AlreadyStopping => {
+                drop(workers);
+                // The teardown in flight was going to end in a restart; this stop overrides it.
+                let cancelled_restart = worker_registry::claim_restart_marker(session_id).is_some();
+                if was_pending || cancelled_restart {
+                    self.publish_next(
+                        session_id,
+                        &Event::Stopped {
+                            reason: stop_reason.into(),
+                        },
+                    );
+                }
+                Ok(())
+            }
             StopDecision::NotOwned => {
                 // A runner from a previous daemon may still be on disk.
                 let Some(record) = worker_registry::load(session_id).ok().flatten() else {
@@ -200,6 +218,63 @@ impl<S: BroadcastSink> Supervisor<S> {
             let _ = handle.client.shutdown().await;
             handle.drain_task.abort();
         }
+    }
+
+    /// Retire a drained build-stale worker so the reconciler respawns it on
+    /// the current binary. One `Stopped { restart_pending }`, the connection
+    /// closed before the runner is signalled.
+    ///
+    /// Returns whether the session should be re-armed. False when the flagged
+    /// worker is no longer the running one, when its record was already
+    /// removed (the reaper reports that), or when a stop landed during the
+    /// teardown.
+    pub async fn retire_build_stale(&self, session_id: &str) -> bool {
+        let mut workers = self.workers.lock().await;
+        let flagged = lock_recover(&self.respawn_pending)
+            .get(session_id)
+            .map(|flag| flag.epoch);
+        let running = lock_recover(&self.lifecycle).running(session_id);
+        let Some((_, identity)) = running.filter(|(lease, _)| Some(lease.epoch()) == flagged)
+        else {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            return false;
+        };
+        if registry_disowns(session_id, identity) {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            return false;
+        }
+        let StopDecision::TearDown { lease, identity } =
+            lock_recover(&self.lifecycle).begin_stop(session_id, "restart_pending")
+        else {
+            return false;
+        };
+        let handle = workers.remove(session_id);
+        drop(workers);
+        worker_registry::clear_restart_marker(session_id);
+        self.publish_next(
+            session_id,
+            &Event::Stopped {
+                reason: "restart_pending".into(),
+            },
+        );
+        if let Some(handle) = handle {
+            let _ = handle.client.shutdown().await;
+            handle.drain_task.abort();
+            let _ = handle.drain_task.await;
+        }
+        let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
+        let retired = {
+            let _workers = self.workers.lock().await;
+            self.settle(&lease, settlement);
+            let retired = lock_recover(&self.respawn_pending)
+                .remove(session_id)
+                .is_some();
+            if let (true, Settlement::Unproven(runner)) = (retired, settlement) {
+                worker_registry::mark_restart_pending(session_id, runner.generation);
+            }
+            retired
+        };
+        retired
     }
 
     pub(super) fn settle(&self, lease: &Lease, settlement: Settlement) {

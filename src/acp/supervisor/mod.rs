@@ -58,6 +58,12 @@ type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
 type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 
+/// A build-stale worker flagged to retire once its turn drains. The epoch is
+/// the worker the flag was set under, so a replacement is never retired for it.
+struct PendingRespawn {
+    epoch: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum SupervisorError {
     #[error("session {0:?} not found")]
@@ -156,8 +162,8 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
-    /// Build-stale sessions draining a turn before the reconciler respawns them.
-    respawn_pending: SharedSet,
+    /// Build-stale sessions draining a turn before the reconciler retires them.
+    respawn_pending: Arc<std::sync::Mutex<HashMap<String, PendingRespawn>>>,
     /// Sessions parked on a compatibility rejection, keyed to the failing binary.
     incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
     /// Sessions the reconciler must fresh-spawn next tick, bypassing its `attempted` guard.
@@ -272,16 +278,30 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
     }
 
-    /// Flag a build-stale worker kept alive to finish its turn.
+    /// Flag the running worker of a session adopted on a stale build. The flag
+    /// belongs to that worker: a stop or a replacement ends it.
     pub fn mark_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.respawn_pending).insert(session_id.to_string());
+        let Some((lease, _)) = lock_recover(&self.lifecycle).running(session_id) else {
+            return;
+        };
+        lock_recover(&self.respawn_pending).insert(
+            session_id.to_string(),
+            PendingRespawn {
+                epoch: lease.epoch(),
+            },
+        );
     }
 
+    /// Sessions whose flagged worker is still the running one. Stale flags drop.
     pub fn respawn_pending_ids(&self) -> Vec<String> {
-        lock_recover(&self.respawn_pending)
-            .iter()
-            .cloned()
-            .collect()
+        let table = lock_recover(&self.lifecycle);
+        let mut pending = lock_recover(&self.respawn_pending);
+        pending.retain(|id, flag| {
+            table
+                .running(id)
+                .is_some_and(|(lease, _)| lease.epoch() == flag.epoch)
+        });
+        pending.keys().cloned().collect()
     }
 
     pub fn clear_respawn_pending(&self, session_id: &str) {
