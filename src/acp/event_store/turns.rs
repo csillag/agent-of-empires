@@ -520,10 +520,27 @@ impl EventStore {
              WHERE session_id = ?1 ORDER BY seq DESC",
         )?;
         let mut rows = stmt.query(params![session_id])?;
+        // A refused prompt never reached the agent, so its UserPromptSent is
+        // not work. Paired by text across neutral rows only.
+        let mut refused: Option<String> = None;
         while let Some(row) = rows.next()? {
             let created_at: i64 = row.get(0)?;
             let json: String = row.get(1)?;
-            let role = decode(&json).map_or(TurnRole::Work, |event| TurnRole::of(&event));
+            let role = match decode(&json) {
+                None => TurnRole::Work,
+                Some(Event::PromptRejected { text, .. }) => {
+                    refused = Some(text);
+                    TurnRole::Neutral
+                }
+                Some(Event::UserPromptSent { text, .. }) if refused.as_deref() == Some(text.as_str()) => {
+                    refused = None;
+                    TurnRole::Neutral
+                }
+                Some(event) => TurnRole::of(&event),
+            };
+            if !matches!(role, TurnRole::Neutral) {
+                refused = None;
+            }
             if let Some(decided) = visit(created_at, role) {
                 return Ok(Some(decided));
             }
