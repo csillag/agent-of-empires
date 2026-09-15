@@ -216,13 +216,12 @@ pub async fn reconcile_acp_workers(
     // proven gone; every tick retries, and nothing below resumes it.
     state.acp_supervisor.retry_pending_teardowns().await;
 
-    // Respawn build-stale workers that were adopted to drain an in-flight
-    // turn (see #1754) and have since gone idle. Runs BEFORE
-    // `reap_user_stopped` so the marker + registry-delete this writes is
-    // picked up by the same tick's reaper, which tears down the attached
-    // handle and clears `attempted` so the resume pass below fresh-spawns
-    // on the current binary.
-    respawn_drained_stale_workers(state).await;
+    // Retire build-stale workers that were adopted to drain an in-flight
+    // turn (see #1754) and have since gone idle, re-arming each so the
+    // resume pass below fresh-spawns it on the current binary.
+    for id in respawn_drained_stale_workers(state).await {
+        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+    }
 
     // Detect `aoe acp stop|kill|restart` (a separate process that
     // deletes the registry entry + SIGTERMs the runner) and surface it
@@ -1137,19 +1136,13 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     }
 }
 
-/// Respawn build-stale workers that were adopted mid-turn (flagged via
+/// Retire build-stale workers that were adopted mid-turn (flagged via
 /// `Supervisor::mark_build_respawn_pending` in `resume_one`) once their
-/// in-flight turn has finished. Idle means neither the same
-/// `has_in_flight_turn` probe the resume pass uses nor
-/// `has_agent_turn_in_flight` sees work under way.
-///
-/// For each drained session this mirrors `aoe acp restart`: write the
-/// restart marker so the reaper publishes `restart_pending` (the UI shows
-/// "Restarting…" rather than a stop), then SIGTERM the stale runner group
-/// and delete its registry entry. The caller runs the reaper immediately
-/// after, which tears down the attached handle and clears `attempted`, so
-/// the resume pass fresh-spawns on the current binary. See #1754.
-async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
+/// in-flight turn has finished, returning the sessions to re-arm. Idle
+/// means neither the same `has_in_flight_turn` probe the resume pass uses
+/// nor `has_agent_turn_in_flight` sees work under way. See #1754.
+async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<String> {
+    let mut retired = Vec::new();
     for id in state.acp_supervisor.respawn_pending_ids() {
         let store = Arc::clone(&state.acp_event_store);
         let id_probe = id.clone();
@@ -1180,27 +1173,11 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
             reason = "build_stale",
             "stale structured view worker drained; respawning"
         );
-        let generation = state
-            .acp_supervisor
-            .running_identity(&id)
-            .map(|identity| identity.generation)
-            .or_else(|| {
-                crate::process::worker_registry::load(&id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.generation)
-            });
-        // With neither an identity nor a record, nothing names the runner;
-        // a marker written by the stop that removed the record stands.
-        if let Some(generation) = generation {
-            crate::process::worker_registry::mark_restart_pending(&id, generation);
+        if state.acp_supervisor.retire_build_stale(&id).await {
+            retired.push(id);
         }
-        state
-            .acp_supervisor
-            .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
-        crate::process::worker_registry::terminate_and_wait(&id).await;
-        state.acp_supervisor.clear_respawn_pending(&id);
     }
+    retired
 }
 
 /// Tell an agent which background items it lost with its worker, once per
@@ -3272,9 +3249,80 @@ mod tests {
         );
     }
 
+    /// Beyond any `pid_max`, so a teardown that really signals it reaches
+    /// no process.
+    const UNUSED_PID: u32 = 999_999_999;
+
+    fn save_runner_record(id: &str, pid: u32, generation: u64) {
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            id.into(),
+            pid,
+            crate::process::worker_registry::socket_path_for(id).unwrap(),
+            "claude-agent-acp".into(),
+            "claude".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        )
+        .with_generation(generation);
+        crate::process::worker_registry::save(&record).unwrap();
+    }
+
+    /// A drained build-stale worker is retired by the supervisor as one
+    /// restart: a single `Stopped{restart_pending}`, no transport error from
+    /// the killed runner, and the session handed back for a fresh spawn.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_drained_stale_worker_is_retired_as_one_restart() {
+        let id = "s-drained";
+        let (state, _home, _project) = capacity_test_state(id).await;
+        save_runner_record(id, UNUSED_PID, 4);
+        state
+            .acp_supervisor
+            .test_install_attached(
+                id,
+                crate::acp::runner_lifecycle::RunnerIdentity {
+                    pid: UNUSED_PID,
+                    generation: 4,
+                },
+            )
+            .await;
+        state.acp_supervisor.mark_build_respawn_pending(id);
+
+        assert_eq!(
+            super::respawn_drained_stale_workers(&state).await,
+            vec![id.to_string()]
+        );
+
+        let events = state.acp_event_store.replay_from(id, 0);
+        let stops: Vec<&str> = events
+            .iter()
+            .filter_map(|(_, e)| match e {
+                crate::acp::Event::Stopped { reason } => Some(reason.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stops, vec!["restart_pending"]);
+        assert!(
+            !events
+                .iter()
+                .any(|(_, e)| matches!(e, crate::acp::Event::AgentStartupError { .. })),
+            "the daemon's own kill is not a startup error"
+        );
+        assert_eq!(
+            state.acp_supervisor.worker_state(id).await,
+            crate::daemon::AcpWorkerState::Absent
+        );
+        assert!(crate::process::worker_registry::load(id).unwrap().is_none());
+        assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
+    }
+
     /// `aoe acp restart` of an adopted build-stale runner writes the marker
-    /// for its generation and removes the record; the drain pass must not
-    /// overwrite that marker with a guessed generation.
+    /// for its generation and removes the record; the drain pass leaves that
+    /// restart to the reaper rather than retiring the runner itself.
     #[tokio::test]
     #[serial_test::serial]
     async fn a_drained_stale_respawn_keeps_the_restart_marker_of_its_generation() {
@@ -3284,7 +3332,7 @@ mod tests {
             .test_install_attached(
                 "s-drain",
                 crate::acp::runner_lifecycle::RunnerIdentity {
-                    pid: 4242,
+                    pid: UNUSED_PID,
                     generation: 4,
                 },
             )
@@ -3294,7 +3342,9 @@ mod tests {
             crate::process::worker_registry::mark_restart_pending(id, 4);
         }
 
-        super::respawn_drained_stale_workers(&state).await;
+        assert!(super::respawn_drained_stale_workers(&state)
+            .await
+            .is_empty());
 
         for id in ["s-drain", "s-drain-gone"] {
             assert_eq!(
