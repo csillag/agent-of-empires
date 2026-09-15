@@ -482,8 +482,10 @@ pub(crate) async fn trigger_resume_background(
 /// Quiet time after the agent's last proof of idle before a drained worker
 /// is retired, so a follow-up turn already queued can show itself.
 const DRAIN_SETTLE_MS: i64 = 15_000;
-/// How long an unproven idle, or a live background sub-agent, keeps the old binary.
+/// How long an unproven idle keeps the old binary.
 const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
+/// A live sub-agent holds a drained build-stale worker this long from the flag.
+const DRAIN_SUBAGENT_CAP_MS: i64 = 3 * 60 * 60 * 1000;
 
 struct DrainProbe {
     turn_open: bool,
@@ -494,8 +496,8 @@ struct DrainProbe {
 
 /// An open turn always waits. Otherwise the agent must have been quiet for
 /// `DRAIN_SETTLE_MS`, have proven itself idle, and hold no live sub-agent.
-/// Past `DRAIN_DEFERRAL_CAP_MS`, neither an unproven idle nor that sub-agent
-/// holds the worker.
+/// Past `DRAIN_DEFERRAL_CAP_MS` an unproven idle no longer holds the worker.
+/// A live sub-agent holds it until `DRAIN_SUBAGENT_CAP_MS`.
 fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     if probe.turn_open {
         return false;
@@ -506,8 +508,10 @@ fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
     {
         return false;
     }
-    (probe.idle_since.is_some() && !probe.holds_background)
-        || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+    if probe.holds_background {
+        return now_ms.saturating_sub(pending_since_ms) >= DRAIN_SUBAGENT_CAP_MS;
+    }
+    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
 }
 
 /// Retires adopted build-stale workers once `drain_ready` lets them go.
