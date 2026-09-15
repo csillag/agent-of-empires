@@ -531,6 +531,10 @@ pub struct Supervisor<S: BroadcastSink> {
     /// Build-stale workers draining before the reconciler respawns them on
     /// the current binary. Lock order: after `lifecycle`.
     respawn_pending: Arc<std::sync::Mutex<HashMap<String, PendingRespawn>>>,
+    /// When each session's stale runner, by generation, was first flagged.
+    /// Unlike `respawn_pending` it outlives a broken connection, so
+    /// re-adopting the same runner does not restart its deferral caps.
+    respawn_since: Arc<std::sync::Mutex<HashMap<String, (u64, i64)>>>,
     /// Sessions currently parked on a per-adapter compatibility rejection,
     /// mapped to the binary that failed the check. Populated at every
     /// `IncompatibleAgent` publish site, cleared on a successful (re)spawn.
@@ -906,6 +910,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
             respawn_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            respawn_since: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
             startup_failures: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -929,18 +934,33 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// reconciler retires it at the next idle boundary. The flag belongs to
     /// that worker: a stop or a replacement ends it. See #1754.
     pub fn mark_build_respawn_pending(&self, session_id: &str, now_ms: i64) {
-        let Some((lease, _)) = lock_recover(&self.lifecycle).running(session_id) else {
+        let Some((lease, identity)) = lock_recover(&self.lifecycle).running(session_id) else {
             return;
+        };
+        // Re-adopting the same runner keeps the time it was first flagged.
+        let since_ms = match identity {
+            Some(runner) => {
+                let mut since = lock_recover(&self.respawn_since);
+                let first = since
+                    .entry(session_id.to_string())
+                    .or_insert((runner.generation, now_ms));
+                if first.0 != runner.generation {
+                    *first = (runner.generation, now_ms);
+                }
+                first.1
+            }
+            None => now_ms,
         };
         let flag = PendingRespawn {
             epoch: lease.epoch(),
-            since_ms: now_ms,
+            since_ms,
         };
         lock_recover(&self.respawn_pending).insert(session_id.to_string(), flag);
     }
 
     /// Sessions whose flagged worker is still the running one, each with
-    /// when it was flagged; flags whose worker has gone are dropped.
+    /// when it was flagged; flags whose worker has gone are dropped. Only the
+    /// reconciler tick may call this: the prune is a write.
     pub fn respawn_pending(&self) -> Vec<(String, i64)> {
         let table = lock_recover(&self.lifecycle);
         let mut pending = lock_recover(&self.respawn_pending);
@@ -3313,6 +3333,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let was_pending = lock_recover(&self.respawn_pending)
             .remove(session_id)
             .is_some();
+        lock_recover(&self.respawn_since).remove(session_id);
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
         // Shared by both settle arms below: a stop is always deliberate,
         // never `Respawn`/`WedgeKill`/`NewBuild`.
@@ -3463,11 +3484,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         };
         if registry_disowns(session_id, identity) {
             lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         }
         let StopDecision::TearDown { lease, identity } =
             lock_recover(&self.lifecycle).begin_stop(session_id, "restart_pending")
         else {
+            lock_recover(&self.respawn_pending).remove(session_id);
             return false;
         };
         let handle = workers.remove(session_id);
@@ -3486,6 +3509,22 @@ impl<S: BroadcastSink> Supervisor<S> {
             handle.drain_task.abort();
             let _ = handle.drain_task.await;
         }
+        // `aoe acp stop` may have removed the record while the connection
+        // closed; its stop wins, unless it was `aoe acp restart`, whose marker
+        // names this runner. Checked before the signal, since a runner
+        // removes its own record as it exits.
+        let stopped_meanwhile = registry_disowns(session_id, identity)
+            && !crate::process::worker_registry::take_restart_marker(
+                session_id,
+                restart_marker_key(&lease, identity),
+            )
+            && {
+                let _workers = self.workers.lock().await;
+                let took_flag = lock_recover(&self.respawn_pending)
+                    .remove(session_id)
+                    .is_some();
+                took_flag
+            };
         let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
         // Settled and decided under `workers`: a stop either lands during the
         // teardown, takes the flag and publishes itself, or comes after the
@@ -3505,6 +3544,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             retired
         };
+        lock_recover(&self.respawn_since).remove(session_id);
         self.cancel_dead_requests(session_id);
         self.mark_background_lost(
             session_id,
@@ -3514,6 +3554,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 crate::acp::state::BackgroundLossCause::UserStop
             },
         );
+        if stopped_meanwhile {
+            self.publish_next(
+                session_id,
+                &Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            );
+        }
         retired
     }
 
@@ -8863,41 +8911,155 @@ cursor-acp-bridge = "agent acp"
         assert!(sup.respawn_pending().is_empty());
     }
 
-    /// A drained runner that survives SIGKILL keeps its session owned; the
-    /// restart stands and re-arms the session once a retry proves it gone.
+    /// A drained runner that survives SIGKILL keeps its session owned. Its
+    /// restart stands and re-arms the session once a retry proves it gone,
+    /// unless a stop lands meanwhile: that claims the marker and publishes
+    /// itself.
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
     async fn retire_build_stale_rearms_an_unkillable_runner_once_it_exits() {
         let _home = isolate_home();
-        let control = Arc::new(FakeProcessControl::default());
-        control.immortal(4301);
-        let sup = Supervisor::new(VecSink::new()).with_process_control(control.clone());
-        let identity = RunnerIdentity {
-            pid: 4301,
-            generation: 6,
-        };
-        flag_attached(&sup, "s-imm-retire", identity).await;
+        for (id, stop_meanwhile) in [("s-imm-retire", false), ("s-imm-stopped", true)] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.immortal(4301);
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+            let identity = RunnerIdentity {
+                pid: 4301,
+                generation: 6,
+            };
+            flag_attached(&sup, id, identity).await;
 
-        assert!(sup.retire_build_stale("s-imm-retire").await);
-        assert_eq!(
-            sup.worker_state("s-imm-retire").await,
-            AcpWorkerState::Stopping
-        );
-        assert_eq!(
-            crate::process::worker_registry::peek_restart_marker("s-imm-retire"),
-            Some(6)
-        );
+            assert!(sup.retire_build_stale(id).await, "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Stopping);
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(id),
+                Some(6),
+                "{id}"
+            );
+            if stop_meanwhile {
+                sup.shutdown(id)
+                    .await
+                    .expect("a stop of a teardown in flight is accepted");
+            }
 
-        control.exit(4301);
-        sup.retry_pending_teardowns().await;
-        assert_eq!(
-            sup.worker_state("s-imm-retire").await,
-            AcpWorkerState::Absent
-        );
-        assert!(
-            sup.take_late_restart_marker("s-imm-retire"),
-            "the restart stands once the runner is gone"
-        );
+            control.exit(4301);
+            sup.retry_pending_teardowns().await;
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+            let want: &[&str] = if stop_meanwhile {
+                &["restart_pending", "user_stopped"]
+            } else {
+                &["restart_pending"]
+            };
+            assert_eq!(stopped_reasons(&sink, id), want, "{id}");
+            assert_eq!(
+                sup.take_late_restart_marker(id),
+                !stop_meanwhile,
+                "{id}: the restart stands unless the stop claimed its marker"
+            );
+        }
+    }
+
+    /// `aoe acp stop` removing the record while the retire closes the
+    /// connection still wins: the retire checks the record again right before
+    /// it signals. `aoe acp restart` leaves its marker and stays a restart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retire_build_stale_rechecks_the_record_before_signalling() {
+        use crate::acp::state::BackgroundLossCause::{NewBuild, UserStop};
+        struct OnDrop<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for OnDrop<F> {
+            fn drop(&mut self) {
+                (self.0)()
+            }
+        }
+        let _home = isolate_home();
+        for (id, restart, want_reasons, want_loss) in [
+            (
+                "s-cli-stop-mid",
+                false,
+                &["restart_pending", "user_stopped"][..],
+                UserStop,
+            ),
+            (
+                "s-cli-restart-mid",
+                true,
+                &["restart_pending"][..],
+                NewBuild,
+            ),
+        ] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.alive(4401);
+            let sink = VecSink::with_live_background(vec![live_item("sh1")]);
+            let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+            let identity = RunnerIdentity {
+                pid: 4401,
+                generation: 7,
+            };
+            flag_attached(&sup, id, identity).await;
+            // The CLI acts while the retire awaits the aborted drain task.
+            let cli = OnDrop(move || {
+                if restart {
+                    crate::process::worker_registry::mark_restart_pending(id, 7);
+                }
+                let _ = crate::process::worker_registry::delete(id);
+            });
+            let drain = tokio::spawn(async move {
+                let _cli = cli;
+                std::future::pending::<()>().await
+            });
+            sup.workers
+                .lock()
+                .await
+                .get_mut(id)
+                .expect("installed")
+                .drain_task = drain;
+
+            assert_eq!(sup.retire_build_stale(id).await, restart, "{id}");
+            assert_eq!(stopped_reasons(&sink, id), want_reasons, "{id}");
+            assert_eq!(
+                lost_ids(&sink),
+                vec![("sh1".into(), Some(want_loss))],
+                "{id}"
+            );
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(id),
+                None,
+                "{id}"
+            );
+        }
+    }
+
+    /// Re-adopting the same stale runner after its connection broke keeps
+    /// the time it was first flagged, so its caps do not restart; a new
+    /// runner generation starts fresh.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reflag_of_the_same_stale_runner_keeps_its_first_flag_time() {
+        let _home = isolate_home();
+        let sup = Supervisor::new(VecSink::new());
+        let id = "s-reflag";
+        for (generation, flagged_at, want) in
+            [(5, 1_000, 1_000), (5, 2_000, 1_000), (6, 3_000, 3_000)]
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+            let runner = RunnerIdentity {
+                pid: 999_999_999,
+                generation,
+            };
+            sup.test_install_handle(id, client, WorkerKind::Attached, Some(runner))
+                .await;
+            sup.mark_build_respawn_pending(id, flagged_at);
+            assert_eq!(
+                sup.respawn_pending(),
+                vec![(id.to_string(), want)],
+                "generation {generation} flagged at {flagged_at}"
+            );
+            // The connection breaks and the drain task drops the handle.
+            sup.test_remove_worker(id).await;
+            assert!(sup.respawn_pending().is_empty());
+        }
     }
 
     /// A stop asked of a resume that then fails before install (a dead
