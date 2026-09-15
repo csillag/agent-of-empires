@@ -465,6 +465,8 @@ impl<S: BroadcastSink> SessionPublisher<S> {
 #[derive(Debug, Clone, Copy)]
 struct PendingRespawn {
     epoch: u64,
+    /// Wall-clock ms of the flag; the drain's deferral caps run from it.
+    since_ms: i64,
 }
 
 impl From<WorkerPhase> for AcpWorkerState {
@@ -926,19 +928,20 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Flag the running worker of a session adopted on a stale build; the
     /// reconciler retires it at the next idle boundary. The flag belongs to
     /// that worker: a stop or a replacement ends it. See #1754.
-    pub fn mark_build_respawn_pending(&self, session_id: &str) {
+    pub fn mark_build_respawn_pending(&self, session_id: &str, now_ms: i64) {
         let Some((lease, _)) = lock_recover(&self.lifecycle).running(session_id) else {
             return;
         };
         let flag = PendingRespawn {
             epoch: lease.epoch(),
+            since_ms: now_ms,
         };
         lock_recover(&self.respawn_pending).insert(session_id.to_string(), flag);
     }
 
-    /// Sessions whose flagged worker is still the running one; flags whose
-    /// worker has gone are dropped.
-    pub fn respawn_pending_ids(&self) -> Vec<String> {
+    /// Sessions whose flagged worker is still the running one, each with
+    /// when it was flagged; flags whose worker has gone are dropped.
+    pub fn respawn_pending(&self) -> Vec<(String, i64)> {
         let table = lock_recover(&self.lifecycle);
         let mut pending = lock_recover(&self.respawn_pending);
         pending.retain(|id, flag| {
@@ -946,7 +949,10 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .running(id)
                 .is_some_and(|(lease, _)| lease.epoch() == flag.epoch)
         });
-        pending.keys().cloned().collect()
+        pending
+            .iter()
+            .map(|(id, flag)| (id.clone(), flag.since_ms))
+            .collect()
     }
 
     /// Record that a session is parked on a compatibility rejection for
@@ -8747,7 +8753,7 @@ cursor-acp-bridge = "agent acp"
         let lease = sup
             .test_install_handle(id, client, WorkerKind::Attached, Some(identity))
             .await;
-        sup.mark_build_respawn_pending(id);
+        sup.mark_build_respawn_pending(id, chrono::Utc::now().timestamp_millis());
         lease
     }
 
@@ -8798,7 +8804,7 @@ cursor-acp-bridge = "agent acp"
         assert!(crate::process::worker_registry::load("s-retire")
             .unwrap()
             .is_none());
-        assert!(sup.respawn_pending_ids().is_empty());
+        assert!(sup.respawn_pending().is_empty());
     }
 
     /// A stop wins over a build-stale retire: one that lands during the
@@ -8854,7 +8860,7 @@ cursor-acp-bridge = "agent acp"
             "the reaper classifies a stop it did not order"
         );
         assert!(stopped_reasons(&sink, "s-cli-stop").is_empty());
-        assert!(sup.respawn_pending_ids().is_empty());
+        assert!(sup.respawn_pending().is_empty());
     }
 
     /// A drained runner that survives SIGKILL keeps its session owned; the

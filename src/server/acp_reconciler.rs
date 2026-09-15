@@ -219,7 +219,7 @@ pub async fn reconcile_acp_workers(
     // Retire build-stale workers that were adopted to drain an in-flight
     // turn (see #1754) and have since gone idle, re-arming each so the
     // resume pass below fresh-spawns it on the current binary.
-    for id in respawn_drained_stale_workers(state).await {
+    for id in respawn_drained_stale_workers(state, chrono::Utc::now().timestamp_millis()).await {
         forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
     }
 
@@ -1136,41 +1136,98 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     }
 }
 
-/// Retire build-stale workers that were adopted mid-turn (flagged via
-/// `Supervisor::mark_build_respawn_pending` in `resume_one`) once their
-/// in-flight turn has finished, returning the sessions to re-arm. Idle
-/// means neither the same `has_in_flight_turn` probe the resume pass uses
-/// nor `has_agent_turn_in_flight` sees work under way. See #1754.
-async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<String> {
-    let mut retired = Vec::new();
-    for id in state.acp_supervisor.respawn_pending_ids() {
-        let store = Arc::clone(&state.acp_event_store);
-        let id_probe = id.clone();
-        let in_flight = match tokio::task::spawn_blocking(move || {
-            store.has_in_flight_turn(&id_probe) || store.has_agent_turn_in_flight(&id_probe)
-        })
-        .await
-        {
-            Ok(v) => v,
-            // Probe failed: assume still busy so a transient error
-            // never hard-kills a possibly-live turn. Retried next tick.
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    error = %e,
-                    "in-flight probe failed for draining stale worker; deferring respawn"
-                );
-                true
+/// Quiet time after the agent's last sign of life before a drained worker
+/// is retired. It covers the task-notification follower's 2 s poll plus the
+/// few seconds a queued follow-up turn takes to emit its first event.
+const DRAIN_SETTLE_MS: i64 = 15_000;
+
+/// How long an idle the agent cannot prove keeps a drained build-stale
+/// worker on its old binary, so a wedged one is still replaced.
+const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
+
+/// What decides whether a drained build-stale worker may be retired.
+#[derive(Debug, Clone, Copy)]
+struct DrainProbe {
+    /// A prompt with no terminator, a live async sub-agent, or a turn the
+    /// agent opened itself.
+    turn_open: bool,
+    /// `EventStore::agent_idle_since`.
+    idle_since: Option<i64>,
+    /// When the live connection last heard from the agent.
+    last_notification_ms: Option<i64>,
+}
+
+impl DrainProbe {
+    /// The event store's part of the probe.
+    fn read(store: &crate::acp::event_store::EventStore, id: &str) -> Self {
+        Self {
+            turn_open: store.has_in_flight_turn(id) || store.has_agent_turn_in_flight(id),
+            idle_since: store.agent_idle_since(id),
+            last_notification_ms: None,
+        }
+    }
+}
+
+/// Whether a build-stale worker flagged at `pending_since_ms` may be retired
+/// at `now_ms`. An open turn always waits. Otherwise the agent must have been
+/// quiet for `DRAIN_SETTLE_MS`, so a follow-up turn already queued shows up
+/// first, and must have proven itself idle; once `DRAIN_DEFERRAL_CAP_MS` has
+/// passed, an idle it cannot prove no longer holds the worker.
+fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
+    if probe.turn_open {
+        return false;
+    }
+    let quiet_since = probe.idle_since.max(probe.last_notification_ms);
+    if quiet_since.is_some_and(|at| now_ms.saturating_sub(at) < DRAIN_SETTLE_MS) {
+        return false;
+    }
+    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+}
+
+/// Read a session's `DrainProbe`. Fails closed: a probe that cannot answer
+/// reports an open turn, retried next tick.
+async fn drain_probe(state: &Arc<AppState>, id: &str) -> DrainProbe {
+    let store = Arc::clone(&state.acp_event_store);
+    let id_probe = id.to_string();
+    let probe = match tokio::task::spawn_blocking(move || DrainProbe::read(&store, &id_probe)).await
+    {
+        Ok(probe) => probe,
+        Err(e) => {
+            tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                error = %e,
+                "drain probe failed; treating the turn as open"
+            );
+            DrainProbe {
+                turn_open: true,
+                idle_since: None,
+                last_notification_ms: None,
             }
-        };
-        if in_flight {
+        }
+    };
+    DrainProbe {
+        last_notification_ms: state.acp_supervisor.last_notification_ms(id).await,
+        ..probe
+    }
+}
+
+/// Retire build-stale workers that were adopted mid-turn (flagged via
+/// `Supervisor::mark_build_respawn_pending` in `resume_one`) once
+/// `drain_ready` lets them go, returning the sessions to re-arm. See #1754.
+async fn respawn_drained_stale_workers(state: &Arc<AppState>, now_ms: i64) -> Vec<String> {
+    let mut retired = Vec::new();
+    for (id, pending_since_ms) in state.acp_supervisor.respawn_pending() {
+        let probe = drain_probe(state, &id).await;
+        if !drain_ready(now_ms, pending_since_ms, &probe) {
             continue;
         }
         tracing::info!(
             target: "acp.supervisor",
             session = %id,
             reason = "build_stale",
+            idle_since = ?probe.idle_since,
+            pending_ms = now_ms.saturating_sub(pending_since_ms),
             "stale structured view worker drained; respawning"
         );
         if state.acp_supervisor.retire_build_stale(&id).await {
@@ -1722,6 +1779,19 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
     // against this lease and honored; it can no longer complete ahead of a
     // stale attempt that only reaches admission after its preparation.
     let record = crate::process::worker_registry::load(&id).ok().flatten();
+    // A live build-stale runner is replaced at once only when the drain pass
+    // would retire it now; otherwise it is adopted to drain.
+    let drain_busy = match &record {
+        Some(r)
+            if crate::process::worker_registry::is_record_live(r)
+                && crate::process::worker_registry::is_runner_current(r)
+                && !crate::process::worker_registry::is_build_current(r) =>
+        {
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            !drain_ready(now_ms, now_ms, &drain_probe(&state, &id).await)
+        }
+        _ => false,
+    };
     let decision = record.as_ref().map_or(AdoptDecision::FreshSpawn, |r| {
         adopt_decision(
             crate::process::worker_registry::is_record_live(r),
@@ -1729,7 +1799,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
             crate::process::worker_registry::is_runner_current(r),
             // A turn the agent started itself is just as busy as a prompted one:
             // treating it as idle SIGTERMs the worker mid-command.
-            in_flight_turn || target.agent_turn_open,
+            in_flight_turn || target.agent_turn_open || drain_busy,
         )
     });
     let kind = match decision {
@@ -1851,7 +1921,10 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                         // failed attach falls through to a fresh spawn on the
                         // current binary, which has nothing to drain.
                         if decision == AdoptDecision::AdoptStaleForDrain {
-                            state.acp_supervisor.mark_build_respawn_pending(&id);
+                            state.acp_supervisor.mark_build_respawn_pending(
+                                &id,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
                         }
                         tracing::info!(
                             target: "acp.supervisor",
@@ -2458,9 +2531,10 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, background_holds, publish_orphaned_turn_stop, rate_limit_resume_at,
-        rate_limit_unknown_reset_retry_at, should_auto_stop, should_readopt_orphan_runner,
-        AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
+        adopt_decision, background_holds, drain_ready, publish_orphaned_turn_stop,
+        rate_limit_resume_at, rate_limit_unknown_reset_retry_at, should_auto_stop,
+        should_readopt_orphan_runner, AdoptDecision, DrainProbe, DRAIN_DEFERRAL_CAP_MS,
+        DRAIN_SETTLE_MS, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
         RATE_LIMIT_EXHAUSTED_RETRIES_REASON, RATE_LIMIT_MIN_PARK_SECS,
         RATE_LIMIT_UNKNOWN_RESET_RETRY_SECS,
     };
@@ -3271,14 +3345,34 @@ mod tests {
         crate::process::worker_registry::save(&record).unwrap();
     }
 
-    /// A drained build-stale worker is retired by the supervisor as one
-    /// restart: a single `Stopped{restart_pending}`, no transport error from
-    /// the killed runner, and the session handed back for a fresh spawn.
+    fn cost_marker(amount: f64) -> crate::acp::Event {
+        crate::acp::Event::UsageUpdated {
+            usage: crate::acp::state::SessionUsage {
+                used: 1,
+                size: 2,
+                cost: Some(crate::acp::state::UsageCost {
+                    amount,
+                    currency: "USD".into(),
+                }),
+            },
+        }
+    }
+
+    /// A drained build-stale worker waits out the settle window after the
+    /// agent's end of turn, then is retired by the supervisor as one restart:
+    /// a single `Stopped{restart_pending}`, no transport error from the
+    /// killed runner, and the session handed back for a fresh spawn.
     #[tokio::test]
     #[serial_test::serial]
-    async fn a_drained_stale_worker_is_retired_as_one_restart() {
+    async fn a_drained_stale_worker_settles_then_is_retired_as_one_restart() {
         let id = "s-drained";
         let (state, _home, _project) = capacity_test_state(id).await;
+        let ended_at = Utc::now().timestamp_millis() - 60_000;
+        state
+            .acp_event_store
+            .record_at(id, 1, &cost_marker(0.1), ended_at)
+            .unwrap();
+        state.acp_supervisor.hydrate_seqs([(id.to_string(), 1)]);
         save_runner_record(id, UNUSED_PID, 4);
         state
             .acp_supervisor
@@ -3290,10 +3384,22 @@ mod tests {
                 },
             )
             .await;
-        state.acp_supervisor.mark_build_respawn_pending(id);
+        state
+            .acp_supervisor
+            .mark_build_respawn_pending(id, ended_at);
 
+        assert!(
+            super::respawn_drained_stale_workers(&state, ended_at + DRAIN_SETTLE_MS - 1)
+                .await
+                .is_empty(),
+            "the settle window holds it"
+        );
         assert_eq!(
-            super::respawn_drained_stale_workers(&state).await,
+            state.acp_supervisor.worker_state(id).await,
+            crate::daemon::AcpWorkerState::Running
+        );
+        assert_eq!(
+            super::respawn_drained_stale_workers(&state, ended_at + DRAIN_SETTLE_MS).await,
             vec![id.to_string()]
         );
 
@@ -3317,7 +3423,7 @@ mod tests {
             crate::daemon::AcpWorkerState::Absent
         );
         assert!(crate::process::worker_registry::load(id).unwrap().is_none());
-        assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
+        assert!(state.acp_supervisor.respawn_pending().is_empty());
     }
 
     /// `aoe acp restart` of an adopted build-stale runner writes the marker
@@ -3337,12 +3443,13 @@ mod tests {
                 },
             )
             .await;
+        let now_ms = Utc::now().timestamp_millis();
         for id in ["s-drain", "s-drain-gone"] {
-            state.acp_supervisor.mark_build_respawn_pending(id);
+            state.acp_supervisor.mark_build_respawn_pending(id, now_ms);
             crate::process::worker_registry::mark_restart_pending(id, 4);
         }
 
-        assert!(super::respawn_drained_stale_workers(&state)
+        assert!(super::respawn_drained_stale_workers(&state, now_ms)
             .await
             .is_empty());
 
@@ -3353,7 +3460,176 @@ mod tests {
                 "{id}: the restart keeps the generation it stopped"
             );
         }
-        assert!(state.acp_supervisor.respawn_pending_ids().is_empty());
+        assert!(state.acp_supervisor.respawn_pending().is_empty());
+    }
+
+    /// `drain_ready` over its inputs: an open turn always waits; otherwise
+    /// the agent must be quiet for the settle window and proven idle, and
+    /// once the cap has passed an unproven idle no longer holds the worker.
+    #[test]
+    fn drain_ready_waits_for_a_settled_proven_idle() {
+        const NOW: i64 = 100_000_000;
+        let settled = NOW - DRAIN_SETTLE_MS;
+        let capped = NOW - DRAIN_DEFERRAL_CAP_MS;
+        let probe = |turn_open, idle_since, last_notification_ms| DrainProbe {
+            turn_open,
+            idle_since,
+            last_notification_ms,
+        };
+        // (case, probe, flagged at, want)
+        let cases = [
+            ("open turn", probe(true, Some(settled), None), capped, false),
+            (
+                "idle, settled",
+                probe(false, Some(settled), None),
+                NOW,
+                true,
+            ),
+            (
+                "idle, not settled",
+                probe(false, Some(settled + 1), None),
+                NOW,
+                false,
+            ),
+            (
+                "idle, agent heard from lately",
+                probe(false, Some(settled), Some(settled + 1)),
+                NOW,
+                false,
+            ),
+            (
+                "idle, not settled, past the cap",
+                probe(false, Some(settled + 1), None),
+                capped,
+                false,
+            ),
+            (
+                "unproven, before the cap",
+                probe(false, None, None),
+                capped + 1,
+                false,
+            ),
+            (
+                "unproven, at the cap",
+                probe(false, None, None),
+                capped,
+                true,
+            ),
+            (
+                "unproven, at the cap, agent heard from lately",
+                probe(false, None, Some(settled + 1)),
+                capped,
+                false,
+            ),
+        ];
+        for (case, probe, flagged_at, want) in cases {
+            assert_eq!(drain_ready(NOW, flagged_at, &probe), want, "{case}");
+        }
+    }
+
+    /// The 2026-09-14 deploy drain of session d7282b53f1ed43c2, replayed with
+    /// its timings shifted to now: every instant at which a drain could have
+    /// fired reads as busy. At 20:36:45.6 the store held only T1's end of
+    /// turn, 0.15 s old, while Claude Code had already started T2 from a
+    /// queued task notification; at 20:38:40.47 T2's end of turn was 1.9 s
+    /// old.
+    #[test]
+    fn the_incident_drain_instants_read_as_busy() {
+        use crate::acp::state::{BackgroundEndReason, BackgroundKind};
+        use crate::acp::Event;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            crate::acp::event_store::EventStore::open(&tmp.path().join("acp.db"), 1000).unwrap();
+        let id = "d7282b53f1ed43c2";
+        // 20:36:00.000 of the incident, ten minutes ago; offsets in ms.
+        let origin = Utc::now().timestamp_millis() - 10 * 60_000;
+        let at = |ms: i64| chrono::DateTime::from_timestamp_millis(origin + ms).unwrap();
+        let tool = |name: &str| Event::ToolCallStarted {
+            tool_call: crate::acp::state::ToolCall {
+                id: name.into(),
+                name: name.into(),
+                kind: "execute".into(),
+                args_preview: String::new(),
+                started_at: Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+        };
+        let usage = || Event::UsageUpdated {
+            usage: crate::acp::state::SessionUsage {
+                used: 1,
+                size: 2,
+                cost: None,
+            },
+        };
+        let ended = |shell: &str, at_ms: i64| Event::BackgroundItemEnded {
+            id: shell.into(),
+            reason: BackgroundEndReason::Finished,
+            cause: None,
+            at: at(at_ms),
+        };
+        let mut seq = 0;
+        let mut record = |ms: i64, event: Event| {
+            seq += 1;
+            store.record_at(id, seq, &event, origin + ms).unwrap();
+        };
+        // 20:05:37.666, seq 46411: the last stop before the incident.
+        record(
+            -1_822_334,
+            Event::Stopped {
+                reason: "agent_idle".into(),
+            },
+        );
+        // 20:29:57 to 20:36:20: T1, woken by a shell, launches the deploy.
+        record(-363_000, ended("bnzkmyu8d", -364_000));
+        record(-349_000, usage());
+        record(
+            -322_000,
+            Event::AgentMessageChunk {
+                text: "deploy?".into(),
+            },
+        );
+        record(-60_000, tool("deploy"));
+        record(
+            -59_900,
+            Event::BackgroundItemStarted {
+                kind: BackgroundKind::Shell,
+                id: "bo7wski4j".into(),
+                tool_call_id: None,
+                label: None,
+                started_at: at(-59_900),
+                expires_at: None,
+            },
+        );
+        record(20_425, usage());
+        // 20:36:45.447, seq 46499: T1's end of turn.
+        record(45_447, cost_marker(29.8));
+        // 20:36:27.795: adopted to drain.
+        let flagged_at = origin + 27_795;
+        let busy_at = |now_ms: i64| !drain_ready(now_ms, flagged_at, &DrainProbe::read(&store, id));
+        assert!(busy_at(origin + 45_600), "20:36:45.6");
+        // 20:36:45.945, seq 46500: the deploy's notification, enqueued 44.528.
+        record(45_945, ended("bo7wski4j", 44_528));
+        assert!(
+            busy_at(origin + 48_000),
+            "20:36:48, before T2 reaches the store"
+        );
+        // 20:36:49.037 to 20:38:38.582, seq 46664: T2.
+        record(49_037, usage());
+        record(147_690, tool("report"));
+        record(
+            158_000,
+            Event::AgentMessageChunk {
+                text: "report".into(),
+            },
+        );
+        record(158_582, cost_marker(30.36));
+        assert!(busy_at(origin + 160_470), "20:38:40.47");
+        assert!(
+            !busy_at(origin + 158_582 + DRAIN_SETTLE_MS),
+            "settled after T2, the drain may go"
+        );
     }
 
     /// A worker that failed before establishing a session is re-armed by the
