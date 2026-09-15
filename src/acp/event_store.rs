@@ -2085,11 +2085,30 @@ impl EventStore {
         );
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(params![session_id])?;
+        // A prompt refused as `agent_busy` never reached the agent, so its
+        // `UserPromptSent` is no work. Paired by text across neutral rows
+        // only, so a refusal inside a busy turn leaves that turn open.
+        let mut refused: Option<String> = None;
         while let Some(row) = rows.next()? {
             let created_at: i64 = row.get(0)?;
             let json: String = row.get(1)?;
-            let role = serde_json::from_str::<Event>(&json)
-                .map_or(TurnRole::Work, |event| TurnRole::of(&event));
+            let role = match serde_json::from_str::<Event>(&json) {
+                Err(_) => TurnRole::Work,
+                Ok(Event::PromptRejected { text, .. }) => {
+                    refused = Some(text);
+                    TurnRole::Neutral
+                }
+                Ok(Event::UserPromptSent { text, .. })
+                    if refused.as_deref() == Some(text.as_str()) =>
+                {
+                    refused = None;
+                    TurnRole::Neutral
+                }
+                Ok(event) => TurnRole::of(&event),
+            };
+            if !matches!(role, TurnRole::Neutral | TurnRole::Woken { .. }) {
+                refused = None;
+            }
             if let Some(decided) = visit(created_at, role) {
                 return Ok(Some(decided));
             }
@@ -3790,6 +3809,15 @@ mod tests {
                 at: Utc::now() - chrono::Duration::hours(1),
             },
         ];
+        let prompt = |text: &str| Event::UserPromptSent {
+            text: text.into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        let refused = |text: &str| Event::PromptRejected {
+            reason: "agent_busy".into(),
+            text: text.into(),
+        };
         let cases: Vec<(&str, Vec<Event>, bool)> = vec![
             ("s-empty", vec![], false),
             ("s-idle", vec![stopped()], false),
@@ -3812,6 +3840,18 @@ mod tests {
                 ]
                 .concat(),
                 false,
+            ),
+            // A reset refused between prompts never reached the agent.
+            (
+                "s-refused-reset",
+                vec![usage(Some(0.1)), prompt("/clear"), refused("/clear")],
+                false,
+            ),
+            // A prompt refused during a busy turn leaves that turn open.
+            (
+                "s-refused-busy",
+                vec![prompt("go"), tool(), prompt("more"), refused("more")],
+                true,
             ),
         ];
         for (sid, events, want) in cases {
@@ -3875,6 +3915,10 @@ mod tests {
         let mode = || Event::ModeChanged {
             mode: crate::acp::state::SessionMode::Default,
         };
+        let refused = || Event::PromptRejected {
+            reason: "agent_busy".into(),
+            text: "go".into(),
+        };
         use BackgroundEndReason::{Finished, Lost};
         // (session, rows as (ms after `base`, event), want)
         let cases = vec![
@@ -3921,6 +3965,16 @@ mod tests {
             (
                 "s-open-prompt",
                 vec![(0, marker()), (1_000, prompt())],
+                None,
+            ),
+            (
+                "s-refused-prompt",
+                vec![(0, marker()), (1_000, prompt()), (1_100, refused())],
+                Some(base),
+            ),
+            (
+                "s-refused-in-a-busy-turn",
+                vec![(0, tool_result()), (1_000, prompt()), (1_100, refused())],
                 None,
             ),
             ("s-no-work", vec![(0, config())], Some(0)),
