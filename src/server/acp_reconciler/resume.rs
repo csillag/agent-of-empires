@@ -194,7 +194,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     Ok(Ok(())) => {
                         // Flagged only once attached: a failed attach respawns on the current binary.
                         if decision == AdoptDecision::AdoptStaleForDrain {
-                            state.acp_supervisor.mark_build_respawn_pending(&id);
+                            state.acp_supervisor.mark_build_respawn_pending(
+                                &id,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
                         }
                         tracing::info!(
                             target: "acp.supervisor",
@@ -476,20 +479,54 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
-/// Retires adopted build-stale workers once their turn drains (#1754),
-/// returning the sessions to re-arm. A failed probe counts as busy.
+/// Quiet time after the agent's last proof of idle before a drained worker
+/// is retired, so a follow-up turn already queued can show itself.
+const DRAIN_SETTLE_MS: i64 = 15_000;
+/// How long an idle the agent cannot prove keeps the old binary.
+const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
+
+struct DrainProbe {
+    turn_open: bool,
+    idle_since: Option<i64>,
+}
+
+/// An open turn always waits. Otherwise the agent must have been quiet for
+/// `DRAIN_SETTLE_MS` and have proven itself idle. Past `DRAIN_DEFERRAL_CAP_MS`,
+/// an idle it cannot prove no longer holds the worker. The live notification
+/// clock that also feeds this window lives on `fix/idle-reap-live-activity`.
+fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
+    if probe.turn_open {
+        return false;
+    }
+    if probe
+        .idle_since
+        .is_some_and(|at| now_ms.saturating_sub(at) < DRAIN_SETTLE_MS)
+    {
+        return false;
+    }
+    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+}
+
+/// Retires adopted build-stale workers once `drain_ready` lets them go.
 pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
     let mut retired = Vec::new();
-    for id in state.acp_supervisor.respawn_pending_ids() {
-        let in_flight = query_store(
+    for (id, pending_since_ms) in state.acp_supervisor.respawn_pending() {
+        let probe = query_store(
             &state.acp_event_store,
             &id,
-            "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id),
+            "draining stale worker",
+            |s, id| DrainProbe {
+                turn_open: s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id),
+                idle_since: s.agent_idle_since(id),
+            },
         )
         .await
-        .unwrap_or(true);
-        if in_flight {
+        .unwrap_or(DrainProbe {
+            turn_open: true,
+            idle_since: None,
+        });
+        if !drain_ready(now_ms, pending_since_ms, &probe) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
@@ -620,7 +657,9 @@ mod tests {
             .test_install_attached("s-drain", identity)
             .await;
         for id in ["s-drain", "s-drain-gone"] {
-            state.acp_supervisor.mark_build_respawn_pending(id);
+            state
+                .acp_supervisor
+                .mark_build_respawn_pending(id, chrono::Utc::now().timestamp_millis());
             worker_registry::mark_restart_pending(id, 4);
         }
 

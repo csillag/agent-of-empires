@@ -62,6 +62,8 @@ type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
 /// the worker the flag was set under, so a replacement is never retired for it.
 struct PendingRespawn {
     epoch: u64,
+    /// Wall-clock ms of the flag. The drain's deferral cap runs from it.
+    since_ms: i64,
 }
 
 #[derive(Debug, Error)]
@@ -280,7 +282,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Flag the running worker of a session adopted on a stale build. The flag
     /// belongs to that worker: a stop or a replacement ends it.
-    pub fn mark_build_respawn_pending(&self, session_id: &str) {
+    pub fn mark_build_respawn_pending(&self, session_id: &str, now_ms: i64) {
         let Some((lease, _)) = lock_recover(&self.lifecycle).running(session_id) else {
             return;
         };
@@ -288,12 +290,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id.to_string(),
             PendingRespawn {
                 epoch: lease.epoch(),
+                since_ms: now_ms,
             },
         );
     }
 
-    /// Sessions whose flagged worker is still the running one. Stale flags drop.
-    pub fn respawn_pending_ids(&self) -> Vec<String> {
+    /// Sessions whose flagged worker is still the running one, with when they
+    /// were flagged. Stale flags drop.
+    pub fn respawn_pending(&self) -> Vec<(String, i64)> {
         let table = lock_recover(&self.lifecycle);
         let mut pending = lock_recover(&self.respawn_pending);
         pending.retain(|id, flag| {
@@ -301,7 +305,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 .running(id)
                 .is_some_and(|(lease, _)| lease.epoch() == flag.epoch)
         });
-        pending.keys().cloned().collect()
+        pending
+            .iter()
+            .map(|(id, flag)| (id.clone(), flag.since_ms))
+            .collect()
+    }
+
+    pub fn respawn_pending_ids(&self) -> Vec<String> {
+        self.respawn_pending().into_iter().map(|(id, _)| id).collect()
     }
 
     pub fn clear_respawn_pending(&self, session_id: &str) {

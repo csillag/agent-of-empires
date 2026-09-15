@@ -7,6 +7,7 @@ use rusqlite::{params, OptionalExtension};
 use super::{decode, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS};
 use crate::acp::approvals::{Approval, Nonce};
 use crate::acp::state::{Event, Plan};
+use tracing::warn;
 use crate::events;
 
 /// A background agent silent this long without completing no longer holds a turn open.
@@ -466,6 +467,143 @@ impl EventStore {
             session_id,
         )
         .is_none_or(|open| open.is_some())
+    }
+
+    /// True while the newest turn-bearing event is the agent's own work, including
+    /// a turn it opened with no `UserPromptSent` behind it. Bookkeeping is skipped.
+    /// Work older than two hours does not count. Fails closed.
+    pub fn has_agent_turn_in_flight(&self, session_id: &str) -> bool {
+        const STALE_AFTER_MS: i64 = 2 * 60 * 60 * 1000;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let found = self.scan_turn_roles(session_id, |created_at, role| match role {
+            TurnRole::Work => Some(now_ms.saturating_sub(created_at) <= STALE_AFTER_MS),
+            TurnRole::End | TurnRole::Stop => Some(false),
+            TurnRole::Neutral => None,
+        });
+        match found {
+            Ok(open) => open.unwrap_or(false),
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_agent_turn_in_flight for {session_id}: {e}");
+                true
+            }
+        }
+    }
+
+    /// When the agent last proved itself idle, in ms. `None` when turn work
+    /// follows that proof, or the latest turn was closed only by a stop the
+    /// daemon synthesized. A log with no turn work is idle since 0. Fails closed.
+    pub fn agent_idle_since(&self, session_id: &str) -> Option<i64> {
+        let found = self.scan_turn_roles(session_id, |created_at, role| match role {
+            TurnRole::End => Some(Some(created_at)),
+            TurnRole::Work => Some(None),
+            TurnRole::Stop | TurnRole::Neutral => None,
+        });
+        match found {
+            Ok(Some(idle_since)) => idle_since,
+            Ok(None) => Some(0),
+            Err(e) => {
+                warn!(target: "acp.event_store", "agent_idle_since for {session_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Newest first, until `visit` decides. A row that fails to decode is turn work.
+    fn scan_turn_roles<T>(
+        &self,
+        session_id: &str,
+        mut visit: impl FnMut(i64, TurnRole) -> Option<T>,
+    ) -> rusqlite::Result<Option<T>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT created_at, event_json FROM acp_events
+             WHERE session_id = ?1 ORDER BY seq DESC",
+        )?;
+        let mut rows = stmt.query(params![session_id])?;
+        while let Some(row) = rows.next()? {
+            let created_at: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            let role = decode(&json).map_or(TurnRole::Work, |event| TurnRole::of(&event));
+            if let Some(decided) = visit(created_at, role) {
+                return Ok(Some(decided));
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// Adapter stop reasons that prove the agent ended its own turn.
+const END_OF_TURN_STOP_REASONS: &[&str] = &[
+    "prompt_complete",
+    "cancelled",
+    "max_tokens",
+    "refusal",
+    "max_turn_requests",
+];
+
+/// How one logged event bears on whether the agent is in a turn.
+enum TurnRole {
+    End,
+    Stop,
+    Work,
+    Neutral,
+}
+
+impl TurnRole {
+    fn of(event: &Event) -> Self {
+        match event {
+            Event::UsageUpdated { usage } if usage.cost.is_some() => Self::End,
+            Event::Stopped { reason } if END_OF_TURN_STOP_REASONS.contains(&reason.as_str()) => {
+                Self::End
+            }
+            Event::Stopped { .. }
+            | Event::AgentStartupError { .. }
+            | Event::IncompatibleAgent { .. }
+            | Event::PromptRuntimeError { .. } => Self::Stop,
+            Event::UsageUpdated { .. }
+            | Event::PlanUpdated { .. }
+            | Event::TodoListUpdated { .. }
+            | Event::ToolCallStarted { .. }
+            | Event::ToolCallCompleted { .. }
+            | Event::ToolCallContent { .. }
+            | Event::ToolCallUpdated { .. }
+            | Event::ApprovalRequested { .. }
+            | Event::ElicitationRequested { .. }
+            | Event::DiffEmitted { .. }
+            | Event::ThinkingStarted
+            | Event::ThinkingEnded
+            | Event::AgentMessageChunk { .. }
+            | Event::CancelRequested { .. }
+            | Event::UserPromptSent { .. }
+            | Event::UserDiffCommentsPrompt { .. }
+            | Event::ConversationCompactionStarted
+            | Event::ConversationCompacted
+            | Event::RawAgentUpdate { .. } => Self::Work,
+            Event::SessionTitleSuggested { .. }
+            | Event::ApprovalResolved { .. }
+            | Event::ElicitationResolved { .. }
+            | Event::RateLimit { .. }
+            | Event::RateLimitAutoResumed { .. }
+            | Event::ModeChanged { .. }
+            | Event::ModesAvailable { .. }
+            | Event::CurrentModeChanged { .. }
+            | Event::ModeSwitchFailed { .. }
+            | Event::AvailableCommandsUpdated { .. }
+            | Event::ConfigOptionsUpdated { .. }
+            | Event::ConfigOptionSwitchFailed { .. }
+            | Event::BackgroundAgentLaunched { .. }
+            | Event::BackgroundAgentProgress { .. }
+            | Event::BackgroundAgentCompleted { .. }
+            | Event::PromptCapabilities { .. }
+            | Event::PromptRejected { .. }
+            | Event::AcpSessionAssigned { .. }
+            | Event::SessionContextReset { .. }
+            | Event::WakeupScheduled { .. }
+            | Event::MonitorArmed { .. }
+            | Event::SessionCleared
+            | Event::AgentSwitched { .. }
+            | Event::ConversationSummary { .. } => Self::Neutral,
+        }
     }
 }
 
