@@ -38,6 +38,7 @@ import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { promptRepinDecision } from "../../lib/promptRepin";
+import { nextStick } from "../../lib/stickToBottom";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -388,17 +389,20 @@ function AcpChrome({
   // scrolled up. Without the viewport resize observer, typing multi-line prompts
   // slides the visible bottom up by the composer's growth. See #1104.
   //
-  // We sample "is the viewport pinned to the bottom?" on every scroll
-  // event into a ref. By the time the ResizeObserver fires the layout
-  // has already settled at the smaller viewport height, so reading
-  // pinned-ness after the fact would always be false for the very
-  // case we want to catch (composer grew, scroll content now overflows
-  // the shrunk viewport by exactly the grow amount). The scroll-time
-  // sample captures the pre-resize state; the RO callback consumes it.
+  // Scroll events update the stick intent in a ref that the observers consume:
+  // by the time a ResizeObserver fires, layout has settled and pinned-ness can
+  // no longer be read from it.
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  // Every programmatic scroll goes through `setScrollTop`, so a scroll event
+  // can tell our own downward repin from a reader moving up. See stickToBottom.ts.
+  const lastScrollTopRef = useRef(0);
+  const setScrollTop = useCallback((vp: HTMLElement, top: number) => {
+    vp.scrollTop = top;
+    lastScrollTopRef.current = vp.scrollTop;
+  }, []);
   // Timestamp (ms) of the last sample that saw us pinned to the bottom. Used by
   // the keyboard-transition re-pin below: opening the soft keyboard resizes the
   // viewport and iOS fires an interim scroll that flips `wasAtBottomRef` to
@@ -418,14 +422,18 @@ function AcpChrome({
   const { keyboardOpen } = useMobileKeyboard();
   /** An explicit "stick again": set the pinned intent directly and re-pin. The
    *  programmatic scroll fires no gesture, so the sampler would not pick it up. */
-  const pinToBottom = useCallback((behavior: ScrollBehavior) => {
-    const vp = viewportRef.current;
-    if (!vp) return;
-    wasAtBottomRef.current = true;
-    lastAtBottomAtRef.current = performance.now();
-    setAtBottom(true);
-    vp.scrollTo({ top: vp.scrollHeight, behavior });
-  }, []);
+  const pinToBottom = useCallback(
+    (behavior: ScrollBehavior) => {
+      const vp = viewportRef.current;
+      if (!vp) return;
+      wasAtBottomRef.current = true;
+      lastAtBottomAtRef.current = performance.now();
+      setAtBottom(true);
+      if (behavior === "smooth") vp.scrollTo({ top: vp.scrollHeight, behavior });
+      else setScrollTop(vp, vp.scrollHeight);
+    },
+    [setScrollTop],
+  );
   /** Tapping the mobile jump-to-bottom button: a smooth re-pin. */
   const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
   // A new prompt re-engages stick-to-bottom, as the CLI does: on a fine pointer
@@ -515,19 +523,11 @@ function AcpChrome({
     const below = belowViewportRef.current;
     const content = messagesContentRef.current;
     if (!vp || !below) return;
-    // Treat "within 16px of the bottom" as pinned. Sub-pixel rounding and
-    // momentary content reflows otherwise drop the pinned state for one frame.
-    // Stick-to-bottom intent (`wasAtBottomRef`) must change ONLY on a real user
-    // scroll gesture. On a coarse-pointer device the browser also fires "scroll"
-    // for programmatic scrolls and, critically, for the interim scroll it emits
-    // while the viewport resizes (soft keyboard opening, the composer growing as
-    // you type, chrome collapsing). Reading those as "the user scrolled up" is
-    // what made the composer creep over the transcript instead of the transcript
-    // staying pinned above it. So on coarse pointers we only re-sample the pinned
-    // intent while a touch/wheel gesture is active; the resize/content observers
-    // below re-pin whenever we are still stuck. Fine pointers keep the simpler
-    // always-sample behavior (scrollbar drag has no wheel event to gate on, and
-    // there is no soft keyboard to fire interim scrolls).
+    // Only a reader scrolling up may un-stick. On coarse pointers the browser
+    // also emits interim scrolls while the viewport resizes (soft keyboard,
+    // composer growth), so there an upward scroll counts only during a touch or
+    // wheel gesture. Fine pointers cannot gate on gestures: a scrollbar drag,
+    // keyboard scrolling, or a selection drag fires no wheel or touch event.
     let gestureActive = false;
     let gestureClearTimer = 0;
     const scheduleGestureClear = () => {
@@ -541,28 +541,23 @@ function AcpChrome({
       scheduleGestureClear();
     };
     const sample = (force = false) => {
-      if (force || !isCoarse || gestureActive) {
-        const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
-        const prevStuck = wasAtBottomRef.current;
-        wasAtBottomRef.current = pinned;
-        if (pinned) lastAtBottomAtRef.current = performance.now();
-        setAtBottom((prev) => (prev === pinned ? prev : pinned));
-        // Persist the stick intent the moment it flips (user scrolled off / back
-        // to the bottom), so a PWA reopen restores it even if `pagehide` never
-        // fires. The offset save on hide/unmount refines the exact position.
-        // Gate on the restore having run: the forced mount `sample(true)` below
-        // fires before the restore block, and with a tall transcript scrollTop
-        // is still 0 there, which reads as "not pinned". Saving that would
-        // clobber the persisted intent with `stuck:false, top:0`, and the
-        // restore block would then read it back and strand the reopen at the
-        // top. See the restore block and #3386.
-        if (pinned !== prevStuck && didRestoreScrollRef.current) {
-          saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
-        }
-        // Momentum after a flick keeps firing `scroll` with no fresh touchmove;
-        // keep the gesture alive so those frames still count as the user's.
-        if (gestureActive) scheduleGestureClear();
+      const prevStuck = wasAtBottomRef.current;
+      const next = force
+        ? { stuck: isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight), lastTop: vp.scrollTop }
+        : nextStick({ stuck: prevStuck, lastTop: lastScrollTopRef.current }, vp, !isCoarse || gestureActive);
+      const pinned = next.stuck;
+      wasAtBottomRef.current = pinned;
+      lastScrollTopRef.current = next.lastTop;
+      if (pinned) lastAtBottomAtRef.current = performance.now();
+      setAtBottom((prev) => (prev === pinned ? prev : pinned));
+      // Persist the intent when it flips, in case `pagehide` never fires. Not
+      // before the restore has run: the forced mount sample sees scrollTop 0 and
+      // would clobber the saved intent (#3386).
+      if (pinned !== prevStuck && didRestoreScrollRef.current) {
+        saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
       }
+      // Momentum after a flick keeps firing `scroll` with no fresh touchmove.
+      if (gestureActive) scheduleGestureClear();
       // Decision (overflow gate, arm, cooldown) lives in a pure helper so
       // it's unit-tested away from the DOM. See historyScroll.ts / #2236.
       const decision = autoLoadDecision({
@@ -590,7 +585,7 @@ function AcpChrome({
     // when we are stuck to the bottom; a scrolled-up reader is left alone.
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     const onVvResize = () => {
-      if (wasAtBottomRef.current) vp.scrollTop = vp.scrollHeight;
+      if (wasAtBottomRef.current) setScrollTop(vp, vp.scrollHeight);
     };
     vv?.addEventListener("resize", onVvResize);
 
@@ -608,7 +603,7 @@ function AcpChrome({
       setAtBottom(stick);
       const applyStart = () => {
         const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
-        if (top != null) vp.scrollTop = top;
+        if (top != null) setScrollTop(vp, top);
       };
       // Pin the rendered transcript before paint. Later passes catch markdown,
       // tool cards, and images that lay out afterward, but applyStart rechecks
@@ -633,9 +628,7 @@ function AcpChrome({
     // strips) and the viewport itself, because chrome *outside* this view can
     // resize it too (the App's header collapse).
     const wasAtBottom = () => wasAtBottomRef.current;
-    const repin = () => {
-      vp.scrollTop = vp.scrollHeight;
-    };
+    const repin = () => setScrollTop(vp, vp.scrollHeight);
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
     // Content-height changes split two ways:
@@ -652,13 +645,11 @@ function AcpChrome({
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
-        if (delta > 0) vp.scrollTop += delta;
+        if (delta > 0) setScrollTop(vp, vp.scrollTop + delta);
         pendingScrollAnchorRef.current = null;
         return;
       }
-      if (wasAtBottomRef.current) {
-        vp.scrollTop = vp.scrollHeight;
-      }
+      if (wasAtBottomRef.current) repin();
     });
     if (content) contentRo.observe(content);
     return () => {
@@ -674,7 +665,7 @@ function AcpChrome({
       saveScroll();
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
-  }, [requestEarlierHistory, isCoarse, sessionId]);
+  }, [requestEarlierHistory, isCoarse, sessionId, setScrollTop]);
 
   // Hold the bottom pin across a chrome transition that resizes the viewport:
   // the soft keyboard opening/closing, and the composer ("hide text input")
@@ -708,12 +699,12 @@ function AcpChrome({
     let raf = 0;
     const start = performance.now();
     const pin = () => {
-      vp.scrollTop = vp.scrollHeight;
+      setScrollTop(vp, vp.scrollHeight);
       if (performance.now() - start < 500) raf = requestAnimationFrame(pin);
     };
     raf = requestAnimationFrame(pin);
     return () => cancelAnimationFrame(raf);
-  }, [keyboardOpen, composerCollapsed]);
+  }, [keyboardOpen, composerCollapsed, setScrollTop]);
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so

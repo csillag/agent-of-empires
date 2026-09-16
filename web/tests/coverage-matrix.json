@@ -719,13 +719,15 @@
       "specs": [
         "tests/acp-mobile-chrome-collapse.spec.ts",
         "src/components/__tests__/CollapsibleChrome.test.tsx",
-        "src/lib/repinOnResize.test.ts"
+        "src/lib/repinOnResize.test.ts",
+        "src/lib/stickToBottom.test.ts"
       ],
       "components": [
         "web/src/components/CollapsibleChrome.tsx",
         "web/src/App.tsx",
         "web/src/components/acp/StructuredView.tsx",
-        "web/src/lib/repinOnResize.ts"
+        "web/src/lib/repinOnResize.ts",
+        "web/src/lib/stickToBottom.ts"
       ]
     },
     {
