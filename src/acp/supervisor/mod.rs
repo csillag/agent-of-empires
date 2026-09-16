@@ -435,7 +435,8 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).phase(session_id).into()
     }
 
-    /// Drop per-session bookkeeping for a deleted session.
+    /// Drop per-session bookkeeping for a deleted session. An in-flight
+    /// publisher still holds the old counter and keeps that numbering.
     pub fn forget_session(&self, session_id: &str) {
         self.publisher.forget(session_id);
         lock_recover(&self.lifecycle).forget(session_id);
@@ -495,12 +496,17 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
+/// Recover a poisoned mutex and clear the poison. A panic under one of these
+/// locks leaves the data consistent (a map edit, or a seq counter whose
+/// publish panicked in the sink). Clearing keeps that one panic from warning
+/// on every later lock.
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| {
         warn!(
             target: "acp.supervisor",
             "recovered poisoned supervisor lock"
         );
+        m.clear_poison();
         e.into_inner()
     })
 }

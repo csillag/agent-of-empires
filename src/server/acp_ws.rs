@@ -517,13 +517,6 @@ async fn send_transcript_delta(
     }
 }
 
-/// Helper used by the worker supervisor (and integration tests) to publish a frame.
-pub fn publish(state: &AppState, frame: AcpBroadcastFrame) {
-    // Discard the receiver count; broadcast::Sender::send is best-effort
-    // and ignores send-with-no-receivers.
-    let _ = state.acp_events_tx.send(frame);
-}
-
 /// Push-notification trigger for "agent needs your approval." Called by the worker
 /// supervisor when it observes an `ApprovalRequested` structured view event.
 pub async fn trigger_approval_push(
@@ -1016,15 +1009,12 @@ mod tests {
             1
         );
         receive_kind(&mut socket, "transcript_snapshot").await;
-        publish(
-            &state,
-            AcpBroadcastFrame {
-                session_id: "s-1".into(),
-                seq: 7,
-                event: Arc::new(event),
-                worker_generation: None,
-            },
-        );
+        let _ = state.acp_events_tx.send(AcpBroadcastFrame {
+            session_id: "s-1".into(),
+            seq: 7,
+            event: Arc::new(event),
+            worker_generation: None,
+        });
         let repeated = receive_kind(&mut socket, "reduced_state").await;
         assert_eq!(repeated["seq"], 7);
         assert_eq!(
@@ -1062,15 +1052,12 @@ mod tests {
                 Event::ThinkingEnded
             };
             state.acp_event_store.record("s-1", seq, &event).unwrap();
-            publish(
-                &state,
-                AcpBroadcastFrame {
-                    session_id: "s-1".into(),
-                    seq,
-                    event: Arc::new(event),
-                    worker_generation: None,
-                },
-            );
+            let _ = state.acp_events_tx.send(AcpBroadcastFrame {
+                session_id: "s-1".into(),
+                seq,
+                event: Arc::new(event),
+                worker_generation: None,
+            });
         }
         let gap = receive_kind(&mut socket, "lagged").await;
         assert_eq!(gap["skipped"], 8);
@@ -1155,33 +1142,6 @@ mod tests {
         assert_eq!(notify["kind"], "notify");
         assert_eq!(notify["tag"], "acp-question-s1");
         assert_eq!(notify["seq"], 3);
-    }
-
-    #[tokio::test]
-    async fn publish_with_no_receivers_does_not_panic() {
-        let state = crate::server::test_support::build_test_app_state(Vec::new());
-        let frame = AcpBroadcastFrame {
-            session_id: "s".into(),
-            seq: 1,
-            event: Arc::new(Event::ThinkingStarted),
-            worker_generation: None,
-        };
-        publish(&state, frame);
-        let mut receiver = state.acp_events_tx.subscribe();
-        publish(
-            &state,
-            AcpBroadcastFrame {
-                session_id: "s".into(),
-                seq: 2,
-                event: Arc::new(Event::ThinkingEnded),
-                worker_generation: None,
-            },
-        );
-        let delivered = receiver
-            .try_recv()
-            .expect("publisher remains usable after a disconnected publish");
-        assert_eq!(delivered.seq, 2);
-        assert!(matches!(*delivered.event, Event::ThinkingEnded));
     }
 
     /// The keepalive has to survive one missed round-trip and still tick well inside
