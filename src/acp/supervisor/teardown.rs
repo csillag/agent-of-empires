@@ -238,10 +238,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         let Some((_, identity)) = running.filter(|(lease, _)| Some(lease.epoch()) == flagged)
         else {
             lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         };
         if registry_disowns(session_id, identity) {
             lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         }
         let StopDecision::TearDown { lease, identity } =
