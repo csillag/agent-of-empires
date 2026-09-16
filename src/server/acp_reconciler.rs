@@ -3756,6 +3756,12 @@ mod tests {
                 true,
             ),
             (
+                "shell at exactly 30 min",
+                item(BackgroundKind::Shell, None),
+                30,
+                false,
+            ),
+            (
                 "shell at 31 min",
                 item(BackgroundKind::Shell, None),
                 31,

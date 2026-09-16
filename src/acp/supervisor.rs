@@ -3480,6 +3480,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let Some((_, identity)) = running.filter(|(lease, _)| Some(lease.epoch()) == flagged)
         else {
             lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         };
         if registry_disowns(session_id, identity) {
@@ -3491,6 +3492,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             lock_recover(&self.lifecycle).begin_stop(session_id, "restart_pending")
         else {
             lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
             return false;
         };
         let handle = workers.remove(session_id);
