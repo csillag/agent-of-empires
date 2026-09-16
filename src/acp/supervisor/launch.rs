@@ -398,7 +398,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // resume send is a real await, so it runs after `workers` is dropped.
         self.cancel_orphaned_requests(session_id);
         let resumable = if matches!(kind, WorkerKind::Attached) {
-            collect_resumable_background_agent_launches(&*self.sink, &self.next_seqs, session_id)
+            collect_resumable_background_agent_launches(&self.publisher, session_id)
         } else {
             self.detach_orphaned_background_agents(session_id);
             Vec::new()

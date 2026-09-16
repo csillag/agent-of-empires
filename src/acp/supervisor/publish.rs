@@ -2,7 +2,7 @@
 
 use tracing::info;
 
-use super::{next_seq, BroadcastSink, PromptDisposition, SeqMap, Supervisor, WorkerKind};
+use super::{BroadcastSink, PromptDisposition, SessionPublisher, Supervisor, WorkerKind};
 use crate::acp::approvals::ApprovalDecision;
 use crate::acp::elicitations::ElicitationOutcome;
 use crate::acp::event_store::{AttachmentBlob, UnresolvedBackgroundAgentLaunch};
@@ -10,9 +10,7 @@ use crate::acp::state::{BackgroundAgentStatus, Event};
 
 impl<S: BroadcastSink> Supervisor<S> {
     pub(super) fn publish_next(&self, session_id: &str, event: &Event) -> u64 {
-        let seq = next_seq(&self.next_seqs, session_id);
-        self.sink.publish(session_id, seq, event);
-        seq
+        self.publisher.publish(session_id, event)
     }
 
     /// Publish an `AgentStartupError` for a session whose worker never came online.
@@ -29,24 +27,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         reason: &str,
         expected_seq: u64,
     ) -> bool {
-        let seq = {
-            let mut guard = super::lock_recover(&self.next_seqs);
-            let current = guard.get(session_id).copied().unwrap_or(0);
-            if current != expected_seq {
-                return false;
-            }
-            let seq = current.saturating_add(1);
-            guard.insert(session_id.to_string(), seq);
-            seq
-        };
-        self.sink.publish(
+        self.publisher.publish_if_last(
             session_id,
-            seq,
+            expected_seq,
             &Event::Stopped {
                 reason: reason.to_string(),
             },
-        );
-        true
+        )
     }
 
     pub fn publish_agent_switched(
@@ -129,30 +116,34 @@ impl<S: BroadcastSink> Supervisor<S> {
         } else {
             PromptDisposition::Forward
         };
-        let seq = next_seq(&self.next_seqs, session_id);
-        let mut refs = Vec::with_capacity(attachments.len());
-        for blob in attachments {
-            if !self.sink.record_attachment(session_id, seq, blob) {
-                self.sink.delete_attachments_for_seq(session_id, seq);
-                return disposition;
+        let persisted = self.publisher.with_next_seq(session_id, |sink, seq| {
+            let mut refs = Vec::with_capacity(attachments.len());
+            for blob in attachments {
+                if !sink.record_attachment(session_id, seq, blob) {
+                    sink.delete_attachments_for_seq(session_id, seq);
+                    return false;
+                }
+                refs.push(crate::daemon::PromptAttachmentRef {
+                    id: blob.id.clone(),
+                    kind: blob.kind,
+                    mime_type: blob.mime_type.clone(),
+                    name: blob.name.clone(),
+                    size: blob.data.len() as u64,
+                });
             }
-            refs.push(crate::daemon::PromptAttachmentRef {
-                id: blob.id.clone(),
-                kind: blob.kind,
-                mime_type: blob.mime_type.clone(),
-                name: blob.name.clone(),
-                size: blob.data.len() as u64,
-            });
-        }
-        let event = Event::UserPromptSent {
-            text,
-            attachments: refs,
-            prompt_id,
-            synthesized,
-        };
-        if !self.sink.publish_persisted(session_id, seq, &event) {
-            // Roll back so refs never point at blobs that were not published.
-            self.sink.delete_attachments_for_seq(session_id, seq);
+            let event = Event::UserPromptSent {
+                text: text.clone(),
+                attachments: refs,
+                prompt_id: prompt_id.clone(),
+                synthesized,
+            };
+            if !sink.publish_persisted(session_id, seq, &event) {
+                sink.delete_attachments_for_seq(session_id, seq);
+                return false;
+            }
+            true
+        });
+        if !persisted {
             return disposition;
         }
         if is_clear && disposition == PromptDisposition::Forward {
@@ -198,15 +189,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub(super) fn cancel_orphaned_requests(&self, session_id: &str) {
-        cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
+        cancel_orphaned_requests_on(&self.publisher, session_id);
     }
 
     /// Detach background sub-agents the previous daemon left outstanding.
     /// See [`detach_orphaned_background_agents_on`].
     pub(super) fn detach_orphaned_background_agents(&self, session_id: &str) {
         detach_orphaned_background_agents_on(
-            &*self.sink,
-            &self.next_seqs,
+            &self.publisher,
             session_id,
             WORKER_REPLACED_DETACH_WARNING,
         );
@@ -224,12 +214,11 @@ pub(super) const WORKER_REPLACED_DETACH_WARNING: &str =
 /// sites differ in why tracking stopped. `attach` instead resumes what it can;
 /// see [`collect_resumable_background_agent_launches`].
 pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
-    sink: &S,
-    next_seqs: &SeqMap,
+    publisher: &SessionPublisher<S>,
     session_id: &str,
     warning: &str,
 ) {
-    let stale_ids = sink.unresolved_background_agent_ids(session_id);
+    let stale_ids = publisher.sink().unresolved_background_agent_ids(session_id);
     if stale_ids.is_empty() {
         return;
     }
@@ -240,20 +229,18 @@ pub(super) fn detach_orphaned_background_agents_on<S: BroadcastSink>(
         "detaching background sub-agents orphaned by daemon restart"
     );
     for agent_id in stale_ids {
-        publish_background_agent_detached(sink, next_seqs, session_id, agent_id, warning);
+        publish_background_agent_detached(publisher, session_id, agent_id, warning);
     }
 }
 
 fn publish_background_agent_detached<S: BroadcastSink>(
-    sink: &S,
-    next_seqs: &SeqMap,
+    publisher: &SessionPublisher<S>,
     session_id: &str,
     agent_id: String,
     warning: &str,
 ) {
-    sink.publish(
+    publisher.publish(
         session_id,
-        next_seq(next_seqs, session_id),
         &Event::BackgroundAgentCompleted {
             agent_id,
             status: BackgroundAgentStatus::Detached,
@@ -272,18 +259,17 @@ fn publish_background_agent_detached<S: BroadcastSink>(
 /// Sync so the query and those publishes can run before the drain starts,
 /// while the resume send stays an await outside the caller's lock.
 pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
-    sink: &S,
-    next_seqs: &SeqMap,
+    publisher: &SessionPublisher<S>,
     session_id: &str,
 ) -> Vec<UnresolvedBackgroundAgentLaunch> {
-    let (resumable, untrackable): (Vec<_>, Vec<_>) = sink
+    let (resumable, untrackable): (Vec<_>, Vec<_>) = publisher
+        .sink()
         .unresolved_background_agent_launches(session_id)
         .into_iter()
         .partition(|l| !l.output_file.is_empty());
     for launch in untrackable {
         publish_background_agent_detached(
-            sink,
-            next_seqs,
+            publisher,
             session_id,
             launch.agent_id,
             "session reattached before this sub-agent finished; tracking stopped",
@@ -295,11 +281,10 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
 /// Cancel approvals and elicitations a dead worker left unresolved in the log:
 /// their responders died with it, so the cards would fail on submit.
 pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
-    sink: &S,
-    next_seqs: &SeqMap,
+    publisher: &SessionPublisher<S>,
     session_id: &str,
 ) {
-    let publish = |event: Event| sink.publish(session_id, next_seq(next_seqs, session_id), &event);
+    let sink = publisher.sink();
     let approvals = sink.unresolved_approval_nonces(session_id);
     if !approvals.is_empty() {
         info!(
@@ -309,16 +294,22 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
             "cancelling approvals orphaned by daemon restart"
         );
         for nonce in approvals {
-            publish(Event::ApprovalResolved {
-                nonce,
-                decision: ApprovalDecision::Cancelled,
-            });
+            publisher.publish(
+                session_id,
+                &Event::ApprovalResolved {
+                    nonce,
+                    decision: ApprovalDecision::Cancelled,
+                },
+            );
         }
-        publish(Event::Stopped {
-            reason: "approval_cancelled_on_restart".to_string(),
-        });
+        publisher.publish(
+            session_id,
+            &Event::Stopped {
+                reason: "approval_cancelled_on_restart".to_string(),
+            },
+        );
     }
-    let elicitations = sink.unresolved_elicitation_nonces(session_id);
+    let elicitations = publisher.sink().unresolved_elicitation_nonces(session_id);
     if !elicitations.is_empty() {
         info!(
             target: "acp.supervisor",
@@ -327,11 +318,14 @@ pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
             "cancelling elicitations orphaned by daemon restart"
         );
         for nonce in elicitations {
-            publish(Event::ElicitationResolved {
-                nonce,
-                outcome: ElicitationOutcome::Cancelled,
-                answers: Vec::new(),
-            });
+            publisher.publish(
+                session_id,
+                &Event::ElicitationResolved {
+                    nonce,
+                    outcome: ElicitationOutcome::Cancelled,
+                    answers: Vec::new(),
+                },
+            );
         }
     }
 }
@@ -356,11 +350,6 @@ mod tests {
             sup.publish_rate_limit_auto_resumed("s-1", resets_at, false),
             3
         );
-        assert_eq!(
-            next_seq(&sup.next_seqs, "s-2"),
-            1,
-            "sessions count separately"
-        );
         sup.publish_user_prompt("s-hydrated", "after restart".into())
             .await;
 
@@ -381,9 +370,19 @@ mod tests {
             &frames[2].2,
             Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
+        assert_eq!(
+            sup.publisher
+                .publish("s-2", &Event::AgentStartupError { message: "probe".into() }),
+            1,
+            "sessions count separately"
+        );
 
         sup.forget_session("s-1");
-        assert_eq!(next_seq(&sup.next_seqs, "s-1"), 1);
+        assert_eq!(
+            sup.publisher
+                .publish("s-1", &Event::AgentStartupError { message: "again".into() }),
+            1
+        );
     }
 
     #[tokio::test]

@@ -704,7 +704,7 @@ mod tests {
             )
             .unwrap();
         let sup = Supervisor::new(sink);
-        // That seq=1 went straight to the store, so next_seqs needs the same
+        // That seq=1 went straight to the store, so the publisher needs the same
         // hydrate a real daemon restart performs; otherwise teardown's publish
         // collides with it and is dropped by INSERT OR IGNORE.
         sup.hydrate_seqs(store.all_session_seqs());

@@ -27,7 +27,7 @@ pub use super::runner_lifecycle::ResumeKind;
 use super::runner_lifecycle::{
     Lease, LifecycleTable, ProcessControl, RunnerIdentity, SystemProcessControl, WorkerPhase,
 };
-use super::state::AcpSessionId;
+use super::state::{AcpSessionId, Event};
 use crate::daemon::AcpWorkerState;
 use crate::session::SandboxInfo;
 
@@ -54,9 +54,96 @@ pub(crate) type Launcher = Arc<
 >;
 
 type Workers = Arc<Mutex<HashMap<String, WorkerHandle>>>;
-/// Per-session seq counter; outlives workers so every publisher shares one sequence.
-type SeqMap = std::sync::Mutex<HashMap<String, u64>>;
 type SharedSet = Arc<std::sync::Mutex<HashSet<String>>>;
+
+/// The only allocator of a session seq. The per-session lock is held from
+/// allocation through the store append and the broadcast send, so broadcast
+/// order equals seq order. Consumers drop a seq at or below the last one they
+/// applied, and a lower seq sent late is lost for good.
+///
+/// Lock order: supervisor locks may be held while publishing, then this
+/// counter, then the sink. A publish closure must only call the sink.
+pub(super) struct SessionPublisher<S: BroadcastSink> {
+    sink: Arc<S>,
+    counters: std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<u64>>>>,
+}
+
+impl<S: BroadcastSink> SessionPublisher<S> {
+    pub(super) fn sink(&self) -> &S {
+        &self.sink
+    }
+
+    pub(super) fn new(sink: Arc<S>) -> Self {
+        Self {
+            sink,
+            counters: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub(super) fn with_counter<R>(&self, session_id: &str, f: impl FnOnce(&S, &mut u64) -> R) -> R {
+        let counter = Arc::clone(
+            lock_recover(&self.counters)
+                .entry(session_id.to_string())
+                .or_default(),
+        );
+        block_in_place_if_multi_thread(|| f(&self.sink, &mut lock_recover(&counter)))
+    }
+
+    pub(super) fn with_next_seq<R>(
+        &self,
+        session_id: &str,
+        publish: impl FnOnce(&S, u64) -> R,
+    ) -> R {
+        self.with_counter(session_id, |sink, last| {
+            *last = last.saturating_add(1);
+            publish(sink, *last)
+        })
+    }
+
+    pub(super) fn publish(&self, session_id: &str, event: &Event) -> u64 {
+        self.with_next_seq(session_id, |sink, seq| {
+            sink.publish(session_id, seq, event);
+            seq
+        })
+    }
+
+    pub(super) fn publish_from_worker(&self, session_id: &str, event: &Event, generation: u64) {
+        self.with_next_seq(session_id, |sink, seq| {
+            sink.publish_from_worker(session_id, seq, event, generation);
+        });
+    }
+
+    pub(super) fn publish_if_last(
+        &self,
+        session_id: &str,
+        expected_seq: u64,
+        event: &Event,
+    ) -> bool {
+        self.with_counter(session_id, |sink, last| {
+            if *last != expected_seq {
+                return false;
+            }
+            *last = last.saturating_add(1);
+            sink.publish(session_id, *last, event);
+            true
+        })
+    }
+
+    pub(super) fn set_last(&self, session_id: &str, seq: u64) {
+        self.with_counter(session_id, |_, last| *last = seq);
+    }
+
+    pub(super) fn forget(&self, session_id: &str) {
+        lock_recover(&self.counters).remove(session_id);
+    }
+}
+
+fn block_in_place_if_multi_thread<R>(f: impl FnOnce() -> R) -> R {
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(f),
+        _ => f(),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum SupervisorError {
@@ -143,7 +230,7 @@ pub struct Supervisor<S: BroadcastSink> {
     sink: Arc<S>,
     registry: Arc<Mutex<AgentRegistry>>,
     workers: Workers,
-    next_seqs: Arc<SeqMap>,
+    publisher: Arc<SessionPublisher<S>>,
     /// Owner of every runner epoch. Lock order: `workers` before `lifecycle`.
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     process_control: Arc<dyn ProcessControl>,
@@ -251,7 +338,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             sink,
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::default(),
-            next_seqs: Arc::default(),
+            publisher: Arc::new(SessionPublisher::new(Arc::clone(&sink))),
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
@@ -350,9 +437,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Drop per-session bookkeeping for a deleted session.
     pub fn forget_session(&self, session_id: &str) {
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.remove(session_id);
-        }
+        self.publisher.forget(session_id);
         lock_recover(&self.lifecycle).forget(session_id);
         lock_recover(&self.startup_failures).remove(session_id);
         lock_recover(&self.respawned_in_place).remove(session_id);
@@ -360,8 +445,8 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Seed seq counters from the event store's stored maxima.
     pub fn hydrate_seqs(&self, pairs: impl IntoIterator<Item = (String, u64)>) {
-        if let Ok(mut guard) = self.next_seqs.lock() {
-            guard.extend(pairs);
+        for (id, seq) in pairs {
+            self.publisher.set_last(&id, seq);
         }
     }
 
@@ -408,13 +493,6 @@ impl<S: BroadcastSink> Supervisor<S> {
     pub async fn count(&self) -> usize {
         self.workers.lock().await.len()
     }
-}
-
-fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
-    let mut guard = next_seqs.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = guard.entry(session_id.to_string()).or_insert(0);
-    *entry = entry.saturating_add(1);
-    *entry
 }
 
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
