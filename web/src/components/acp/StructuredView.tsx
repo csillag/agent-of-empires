@@ -396,8 +396,10 @@ function AcpChrome({
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
-  // Every programmatic scroll goes through `setScrollTop`, so a scroll event
-  // can tell our own downward repin from a reader moving up. See stickToBottom.ts.
+  // Every instant programmatic scroll goes through `setScrollTop`, so a scroll
+  // event can tell our own repin from a reader moving up. The jump-to-bottom
+  // smooth scroll bypasses it; it only moves down, which never un-sticks.
+  // See stickToBottom.ts.
   const lastScrollTopRef = useRef(0);
   const setScrollTop = useCallback((vp: HTMLElement, top: number) => {
     vp.scrollTop = top;
