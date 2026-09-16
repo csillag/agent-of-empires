@@ -18,7 +18,7 @@
 //! - **Snapshot endpoint.** `GET /acp/replay?since=N` reads the
 //!   same data path, used by the React reducer when it sees a `lagged`
 //!   notice from the WS to catch up missed frames.
-//! - **Startup hydration.** On boot, `next_seqs` is rehydrated from
+//! - **Startup hydration.** On boot, the supervisor seq counters are rehydrated from
 //!   `MAX(seq) + 1` per session so post-restart writes don't collide
 //!   with pre-restart rows via `INSERT OR IGNORE`.
 //!
@@ -83,7 +83,7 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
 /// `substantive` decides: it is the newest event that is not ambient
 /// bookkeeping, and its `substantive_at_ms` is what the grace is measured
 /// against. `latest_seq` is the newest seq in the log of ANY kind, which is
-/// what the compare-and-publish must expect: `Supervisor::next_seqs` counts
+/// what the compare-and-publish must expect: the supervisor seq counter counts
 /// every allocation, ambient events included, so expecting the substantive
 /// seq would make the repair refuse forever on any session where a resume
 /// replay appended an `AcpSessionAssigned` after the end-of-turn marker.
@@ -1089,7 +1089,7 @@ impl EventStore {
     }
 
     /// Return the highest seq stored for `session_id`, or 0 if none.
-    /// Used at startup to re-seed the in-memory `next_seqs` counter so
+    /// Used at startup to re-seed the in-memory seq counter so
     /// fresh publishes don't collide with restored history.
     pub fn highest_seq(&self, session_id: &str) -> u64 {
         let conn = match self.conn.lock() {
@@ -1127,7 +1127,7 @@ impl EventStore {
     }
 
     /// Return every session_id that has at least one event stored, with
-    /// its highest seq. Used at startup to pre-seed `next_seqs` in one
+    /// its highest seq. Used at startup to pre-seed the seq counters in one
     /// query rather than racing per-session lookups.
     pub fn all_session_seqs(&self) -> Vec<(String, u64)> {
         let conn = match self.conn.lock() {
