@@ -387,7 +387,7 @@ impl<S: BroadcastSink> SessionPublisher<S> {
         }
     }
 
-    /// Run `f` on the session's counter under its order lock. A contended
+    /// Run `f` on the session's counter under its counter lock. A contended
     /// wait spans another publisher's store append, so on the multi-thread
     /// runtime the wait runs in `block_in_place`.
     fn with_counter<R>(&self, session_id: &str, f: impl FnOnce(&S, &mut u64) -> R) -> R {
@@ -1643,7 +1643,9 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Drop per-session bookkeeping (replay seq counter). Called when
     /// the session is deleted or its view is switched away from
     /// structured view, so the next acp_enable starts a fresh conversation
-    /// from seq=1 with a clean replay buffer.
+    /// from seq=1 with a clean replay buffer. A publisher already holding or
+    /// waiting on the old counter still publishes on the old numbering; both
+    /// callers shut the worker down first.
     pub fn forget_session(&self, session_id: &str) {
         self.publisher.forget(session_id);
         lock_recover(&self.lifecycle).forget(session_id);
@@ -4203,17 +4205,18 @@ fn block_in_place_if_multi_thread<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// Take a `std::sync::Mutex` guard, recovering the inner data if
-/// the lock is poisoned. The supervisor maps wrapped in `std::sync::Mutex`
-/// only ever hold short, panic-free critical sections (HashMap inserts
-/// or removes), so a poisoned lock from an unrelated panic on the same
-/// state is recoverable rather than fatal.
+/// Take a `std::sync::Mutex` guard, recovering and clearing poison. The data
+/// under these locks stays consistent across a panic: map inserts and removes,
+/// or a session seq counter whose publish panicked inside the sink, which at
+/// worst leaves a gap. Clearing keeps one panic from warning on every later
+/// lock.
 fn lock_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| {
         warn!(
             target: "acp.supervisor",
             "recovered poisoned supervisor lock"
         );
+        m.clear_poison();
         e.into_inner()
     })
 }
@@ -4350,7 +4353,7 @@ impl ChannelSink {
         // reload to recover via the `/acp/replay` endpoint.
         //
         // The write stays synchronous: the caller holds the session's
-        // publish order until this returns (`SessionPublisher`).
+        // counter lock until this returns (`SessionPublisher`).
         let event_to_publish: Event;
         let record_result =
             block_in_place_if_multi_thread(|| self.event_store.record(session_id, seq, event));
