@@ -23,6 +23,7 @@ export function WorkingSpinner({
   cancelling,
   cancelEscalatesAt,
   compacting,
+  waitingOnBackground = null,
   lastActivityRef,
   onForceEndTurn,
 }: {
@@ -31,6 +32,8 @@ export function WorkingSpinner({
   cancelling: boolean;
   cancelEscalatesAt: string | null;
   compacting: boolean;
+  /** Live sub-agents, workflows or shell commands, e.g. "1 sub-agent". */
+  waitingOnBackground?: string | null;
   lastActivityRef: React.RefObject<number>;
   onForceEndTurn: () => Promise<void>;
 }) {
@@ -94,7 +97,9 @@ export function WorkingSpinner({
     : compacting
       ? `Compaction in progress… ${formatElapsed(stalledSecs)}`
       : showStalled
-        ? `Waiting on ${toolInFlight ? "tool" : "model"}… ${formatElapsed(stalledSecs)}`
+        ? waitingOnBackground
+          ? `Waiting on background work (${waitingOnBackground})… ${formatElapsed(stalledSecs)}`
+          : `Waiting on ${toolInFlight ? "tool" : "model"}… ${formatElapsed(stalledSecs)}`
         : chooseVerb(deriveSpinnerState(thinking, tool), seed, tool);
   // Force stop shows even with a tool in flight (a runaway loop is one). Force
   // end turn never does (long Task gaps are normal) and never during a
@@ -105,7 +110,7 @@ export function WorkingSpinner({
         title:
           "The agent is ignoring the stop request. Force stop restarts the agent now (it resumes from the saved transcript; partial in-flight tool output is lost).",
       }
-    : !compacting && showStalled && !toolInFlight
+    : !compacting && !waitingOnBackground && showStalled && !toolInFlight
       ? {
           text: "Force end turn",
           title: `No streaming activity for ${stalledSecs}s. Clears the spinner and sends a best-effort cancel to the agent.`,

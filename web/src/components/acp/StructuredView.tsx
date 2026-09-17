@@ -11,6 +11,7 @@ import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
+import { waitingOn } from "../../lib/background";
 import type { BackgroundSummary } from "../../lib/types";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
@@ -303,6 +304,7 @@ function AcpChrome({
                       cancelling={state.cancelling}
                       cancelEscalatesAt={state.cancelEscalatesAt}
                       compacting={state.compacting}
+                      waitingOnBackground={view.background ? waitingOn(view.background) : null}
                       lastActivityRef={ctx.lastActivityRef}
                       onForceEndTurn={ctx.forceEndTurn}
                     />
