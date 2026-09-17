@@ -37,6 +37,8 @@ function renderSpinner(opts: {
   cancelEscalatesAt?: string | null;
   /** True between the two `/compact` markers (#3219). */
   compacting?: boolean;
+  /** Live background work holding the turn open, e.g. "1 sub-agent". */
+  waitingOnBackground?: string | null;
 }) {
   const now = Date.now();
   const ref = makeRef(now - opts.stalledSecs * 1000);
@@ -48,6 +50,7 @@ function renderSpinner(opts: {
       cancelling={opts.cancelling ?? false}
       cancelEscalatesAt={opts.cancelEscalatesAt ?? null}
       compacting={opts.compacting ?? false}
+      waitingOnBackground={opts.waitingOnBackground ?? null}
       lastActivityRef={ref}
       onForceEndTurn={onForceEndTurn}
     />,
@@ -165,5 +168,24 @@ describe("WorkingSpinner cancelling / force-stop (#1727)", () => {
     renderSpinner({ stalledSecs: 180, tool: "Task", cancelling: false });
     expect(screen.queryByRole("button", { name: /force stop/i })).toBeNull();
     expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
+  });
+});
+
+describe("WorkingSpinner while background work holds the turn", () => {
+  it("names the background work instead of the model past the stall threshold", () => {
+    renderSpinner({ stalledSecs: 90, tool: null, waitingOnBackground: "1 sub-agent" });
+    expect(screen.getByText(/waiting on background work \(1 sub-agent\)…/i)).toBeTruthy();
+    expect(screen.queryByText(/waiting on model…/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /force end turn/i })).toBeNull();
+  });
+
+  it("keeps the rattle verb below the stall threshold", () => {
+    renderSpinner({ stalledSecs: 5, tool: null, waitingOnBackground: "1 sub-agent" });
+    expect(screen.queryByText(/waiting on background work/i)).toBeNull();
+  });
+
+  it("still offers Stop's escalation while cancelling", () => {
+    renderSpinner({ stalledSecs: 90, tool: null, waitingOnBackground: "1 sub-agent", cancelling: true });
+    expect(screen.getByText(/stopping…/i)).toBeTruthy();
   });
 });

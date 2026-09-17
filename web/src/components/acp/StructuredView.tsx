@@ -51,6 +51,7 @@ import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
 import { BackgroundAgentsContext, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { BackgroundPanel } from "./BackgroundPanel";
+import { waitingOn } from "../../lib/background";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
@@ -885,6 +886,7 @@ function AcpChrome({
                       cancelling={state.cancelling}
                       cancelEscalatesAt={state.cancelEscalatesAt}
                       compacting={state.compacting}
+                      waitingOnBackground={background ? waitingOn(background) : null}
                       lastActivityRef={lastActivityRef}
                       onForceEndTurn={forceEndTurn}
                     />
@@ -1492,6 +1494,7 @@ export function WorkingSpinner({
   cancelling,
   cancelEscalatesAt,
   compacting,
+  waitingOnBackground = null,
   lastActivityRef,
   onForceEndTurn,
 }: {
@@ -1500,6 +1503,8 @@ export function WorkingSpinner({
   cancelling: boolean;
   cancelEscalatesAt: string | null;
   compacting: boolean;
+  /** Live sub-agents, workflows or shell commands, e.g. "1 sub-agent". */
+  waitingOnBackground?: string | null;
   lastActivityRef: React.RefObject<number>;
   onForceEndTurn: () => Promise<void>;
 }) {
@@ -1592,7 +1597,9 @@ export function WorkingSpinner({
       : showStalled
         ? toolInFlight
           ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
-          : `Waiting on model… ${formatElapsed(stalledSecs)}`
+          : waitingOnBackground
+            ? `Waiting on background work (${waitingOnBackground})… ${formatElapsed(stalledSecs)}`
+            : `Waiting on model… ${formatElapsed(stalledSecs)}`
         : chooseVerb(state, seed, tool);
   // A cancel is in flight: show the escape hatch even with a tool in
   // flight (the runaway loop IS a tool in flight). The legacy
@@ -1602,7 +1609,9 @@ export function WorkingSpinner({
   // Never offer the hatch during a compaction: it publishes a synthetic
   // Stopped plus a session/cancel, which is exactly the abort #2898 fixed
   // on the daemon side. The deliberate Stop path is still available.
-  const showForceEnd = !cancelling && !compacting && showStalled && !toolInFlight;
+  // Live background work keeps the turn open on purpose, so a quiet model is
+  // not a stall there either.
+  const showForceEnd = !cancelling && !compacting && !waitingOnBackground && showStalled && !toolInFlight;
 
   return (
     <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
