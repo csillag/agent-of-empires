@@ -3739,8 +3739,8 @@ mod tests {
         );
     }
 
-    /// A background item lost to a waking cause (`NewBuild`) queues exactly
-    /// one wake note naming it and marks the loss noted; a second pass with
+    /// Background items lost to a waking cause (`NewBuild`) queue exactly
+    /// one wake note naming them and mark the loss noted; a second pass with
     /// nothing new must not enqueue again.
     #[tokio::test]
     async fn note_background_losses_wakes_once_then_stays_quiet() {
@@ -3788,6 +3788,48 @@ mod tests {
             )
             .unwrap();
 
+        // A sub-agent lost in the same restart: its end is upstream's
+        // `Detached`, paired with the registry's cause by `at`.
+        for (seq, event) in [
+            (
+                12,
+                Event::BackgroundAgentLaunched {
+                    agent_id: "a1".into(),
+                    tool_call_id: "tc1".into(),
+                    description: "review-diff".into(),
+                    prompt: String::new(),
+                    model: String::new(),
+                    output_file: String::new(),
+                    started_at: now,
+                },
+            ),
+            (
+                13,
+                Event::BackgroundItemEnded {
+                    id: "a1".into(),
+                    reason: BackgroundEndReason::Lost,
+                    cause: Some(BackgroundLossCause::NewBuild),
+                    at: now,
+                },
+            ),
+            (
+                14,
+                Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: now,
+                },
+            ),
+        ] {
+            state
+                .acp_event_store
+                .record("sess-loss", seq, &event)
+                .unwrap();
+        }
+
         note_background_losses(&state).await;
 
         let queued = {
@@ -3801,8 +3843,8 @@ mod tests {
         };
         assert_eq!(queued.len(), 1, "exactly one wake note must be queued");
         assert!(
-            queued[0].text.contains("watch-log"),
-            "the note must name the lost item: {}",
+            queued[0].text.contains("watch-log") && queued[0].text.contains("review-diff"),
+            "the note must name every lost item: {}",
             queued[0].text
         );
         assert!(

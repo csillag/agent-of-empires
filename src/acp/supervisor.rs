@@ -3214,7 +3214,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
-                self.mark_background_lost(session_id, background_loss_cause);
+                // Registry items first, then upstream's detach below ends
+                // the sub-agents, then `Stopped`.
+                end_background_items_lost(
+                    &*self.sink,
+                    &self.next_seqs,
+                    session_id,
+                    background_loss_cause,
+                );
                 // Publish `Stopped` so the UI clears any "thinking" state
                 // now rather than on the next reap tick. Stdio fixtures have
                 // no UI and share the seq counter with budget tests.
@@ -4224,29 +4231,81 @@ fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
     *entry
 }
 
-/// End every live background item of a session whose worker is gone.
+/// A session's worker is gone: end its live registry items as lost and
+/// detach its unresolved sub-agents.
 fn mark_background_lost_via<S: BroadcastSink + ?Sized>(
     sink: &S,
     next_seqs: &SeqMap,
     session_id: &str,
     cause: crate::acp::state::BackgroundLossCause,
 ) -> usize {
-    let live = sink.live_background_items(session_id);
+    end_background_items_lost(sink, next_seqs, session_id, cause)
+        + detach_background_agents(sink, next_seqs, session_id, cause)
+}
+
+/// End the live items the registry tracks itself. Sub-agents are left to
+/// upstream's `BackgroundAgentCompleted`, so each item ends exactly once.
+fn end_background_items_lost<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
     let at = chrono::Utc::now();
-    for item in &live {
+    let mut ended = 0;
+    for item in sink.live_background_items(session_id) {
+        if item.kind == crate::acp::state::BackgroundKind::Subagent {
+            continue;
+        }
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(session_id, seq, &lost_end(item.id, cause, at));
+        ended += 1;
+    }
+    ended
+}
+
+/// Detach every sub-agent still unresolved on disk, as the teardown arm of
+/// `shutdown_with_reason` does, each preceded by its loss cause, which the
+/// registry pairs with the `Detached` by `at`.
+fn detach_background_agents<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
+    let ids = sink.unresolved_background_agent_ids(session_id);
+    let at = chrono::Utc::now();
+    for agent_id in &ids {
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(session_id, seq, &lost_end(agent_id.clone(), cause, at));
         let seq = next_seq(next_seqs, session_id);
         sink.publish(
             session_id,
             seq,
-            &Event::BackgroundItemEnded {
-                id: item.id.clone(),
-                reason: crate::acp::state::BackgroundEndReason::Lost,
-                cause: Some(cause),
-                at,
+            &Event::BackgroundAgentCompleted {
+                agent_id: agent_id.clone(),
+                status: BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: at,
             },
         );
     }
-    live.len()
+    ids.len()
+}
+
+fn lost_end(
+    id: String,
+    cause: crate::acp::state::BackgroundLossCause,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Event {
+    Event::BackgroundItemEnded {
+        id,
+        reason: crate::acp::state::BackgroundEndReason::Lost,
+        cause: Some(cause),
+        at,
+    }
 }
 
 /// Take a `std::sync::Mutex` guard, recovering the inner data if
@@ -4880,6 +4939,163 @@ mod tests {
             lost_ids(&sink),
             vec![("m1".into(), Some(NewBuild)), ("s1".into(), Some(NewBuild))]
         );
+    }
+
+    /// The teardown arm ends each item once, in a fixed order: the
+    /// registry's own items, then upstream's detach of the sub-agents, then
+    /// `Stopped`. A sub-agent never gets a registry end of its own there.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn teardown_ends_registry_items_then_detaches_sub_agents_then_stops() {
+        use crate::acp::state::{BackgroundKind, BackgroundLossCause::UserStop};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
+        let kinded = |id: &str, kind| crate::acp::state::BackgroundItem {
+            kind,
+            ..live_item(id)
+        };
+        let sink = VecSink::with_live_background(vec![
+            live_item("m1"),
+            kinded("s1", BackgroundKind::Shell),
+            kinded("bg-1", BackgroundKind::Subagent),
+        ]);
+        *sink.stale_background_agent_ids.lock().unwrap() = vec!["bg-1".into()];
+        let sup = Supervisor::new(sink.clone());
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-order".into()));
+        sup.test_install_handle("s-order", client, dummy_runner_kind(&tmp), None)
+            .await;
+
+        sup.shutdown("s-order").await.unwrap();
+
+        let frames: Vec<String> = sink
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, e)| match e {
+                Event::BackgroundItemEnded { id, cause, .. } => format!("lost {id} {cause:?}"),
+                Event::BackgroundAgentCompleted {
+                    agent_id, status, ..
+                } => format!("{status:?} {agent_id}"),
+                Event::Stopped { reason } => format!("stopped {reason}"),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        let lost = |id: &str| format!("lost {id} {:?}", Some(UserStop));
+        assert_eq!(
+            frames,
+            vec![
+                lost("m1"),
+                lost("s1"),
+                "Detached bg-1".into(),
+                "stopped user_stopped".into()
+            ]
+        );
+    }
+
+    /// Through a real store: a worker loss detaches an unresolved sub-agent
+    /// exactly once, lost to the loss's cause, so the one wake note lists it
+    /// with the monitor. A teardown's own detach carries no cause and, as a
+    /// deliberate stop, queues no note.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_lost_worker_ends_its_sub_agent_once_through_the_real_store() {
+        use crate::acp::state::{
+            BackgroundEndReason::Lost,
+            BackgroundKind,
+            BackgroundLossCause::{Respawn, UserStop},
+        };
+        for teardown in [false, true] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _home = crate::session::test_support::isolate_home(tmp.path());
+            let store = Arc::new(
+                crate::acp::event_store::EventStore::open(&tmp.path().join("acp.db"), 1000)
+                    .unwrap(),
+            );
+            let now = chrono::Utc::now();
+            store
+                .record(
+                    "s-loss",
+                    1,
+                    &Event::BackgroundAgentLaunched {
+                        agent_id: "bg".into(),
+                        tool_call_id: "tc".into(),
+                        description: "map backend".into(),
+                        prompt: String::new(),
+                        model: String::new(),
+                        output_file: "/tmp/bg.output".into(),
+                        started_at: now,
+                    },
+                )
+                .unwrap();
+            store
+                .record(
+                    "s-loss",
+                    2,
+                    &Event::BackgroundItemStarted {
+                        kind: BackgroundKind::Monitor,
+                        id: "m1".into(),
+                        tool_call_id: None,
+                        label: Some("watch".into()),
+                        started_at: now,
+                        expires_at: None,
+                    },
+                )
+                .unwrap();
+            let (tx, _rx) = tokio::sync::broadcast::channel(16);
+            let sup = Supervisor::new(Arc::new(ChannelSink {
+                tx,
+                event_store: store.clone(),
+                control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
+            }));
+            sup.hydrate_seqs([("s-loss".to_string(), 2)]);
+            if teardown {
+                let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-loss".into()));
+                sup.test_install_handle("s-loss", client, dummy_runner_kind(&tmp), None)
+                    .await;
+                sup.shutdown("s-loss").await.unwrap();
+            } else {
+                assert_eq!(sup.mark_background_lost("s-loss", Respawn), 2);
+            }
+            assert_eq!(
+                sup.mark_background_lost("s-loss", Respawn),
+                0,
+                "teardown={teardown}: nothing is left to end"
+            );
+
+            let detaches = store
+                .replay_from("s-loss", 0)
+                .into_iter()
+                .filter(|(_, e)| matches!(e, Event::BackgroundAgentCompleted { .. }))
+                .count();
+            assert_eq!(detaches, 1, "teardown={teardown}");
+            let items = store.background_items("s-loss", chrono::Utc::now());
+            let cause_of = |id: &str| {
+                let end = items.iter().find(|i| i.id == id).unwrap().ended.clone();
+                let end = end.unwrap_or_else(|| panic!("teardown={teardown}: {id} still live"));
+                assert_eq!(end.reason, Lost, "teardown={teardown}: {id}");
+                end.cause
+            };
+            let (sub_cause, monitor_cause) = if teardown {
+                (None, Some(UserStop))
+            } else {
+                (Some(Respawn), Some(Respawn))
+            };
+            assert_eq!(cause_of("bg"), sub_cause, "teardown={teardown}");
+            assert_eq!(cause_of("m1"), monitor_cause, "teardown={teardown}");
+            let mut noted: Vec<String> = store
+                .unnoted_background_losses("s-loss")
+                .into_iter()
+                .map(|i| i.id)
+                .collect();
+            noted.sort();
+            let expected: Vec<String> = if teardown {
+                Vec::new()
+            } else {
+                vec!["bg".into(), "m1".into()]
+            };
+            assert_eq!(noted, expected, "teardown={teardown}");
+        }
     }
 
     #[tokio::test]

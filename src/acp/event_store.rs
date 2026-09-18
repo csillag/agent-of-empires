@@ -3964,6 +3964,54 @@ mod tests {
         );
     }
 
+    /// The sessions API's `background` field is the contract the web's
+    /// chip, panel and `waitingOn()` read: a sub-agent launched through
+    /// upstream's event is a live `subagent` row with no `ended`, and its
+    /// completion takes it off the list.
+    #[test]
+    fn a_launched_sub_agent_is_live_background_work_until_it_completes() {
+        use crate::acp::background::BackgroundSummary;
+        let (_tmp, store) = open_store(1000);
+        let now = chrono::Utc::now();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "a1".into(),
+                    tool_call_id: "tc1".into(),
+                    description: "review the diff".into(),
+                    prompt: "p".into(),
+                    model: "claude".into(),
+                    output_file: "/tmp/a1.output".into(),
+                    started_at: now,
+                },
+            )
+            .unwrap();
+        let summary = BackgroundSummary::from_items(store.background_items("s-1", now)).unwrap();
+        assert_eq!(summary.live, 1);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["items"][0]["kind"], "subagent");
+        assert_eq!(wire["items"][0]["label"], "review the diff");
+        assert!(wire["items"][0].get("ended").is_none(), "{wire}");
+
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: now,
+                },
+            )
+            .unwrap();
+        assert!(BackgroundSummary::from_items(store.background_items("s-1", now)).is_none());
+    }
+
     #[test]
     fn unnoted_losses_are_the_waking_losses_after_the_last_note() {
         use crate::acp::state::{BackgroundEndReason, BackgroundKind, BackgroundLossCause};
