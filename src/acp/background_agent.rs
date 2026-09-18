@@ -115,7 +115,7 @@ impl TranscriptSource {
     /// vec when nothing is new or the file is momentarily unreadable, so the
     /// poll loop keeps waiting rather than aborting; mirrors the host
     /// open-failure path.
-    async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
+    pub(crate) async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
         match self {
             TranscriptSource::Host => {
                 let Ok(mut file) = tokio::fs::File::open(path).await else {

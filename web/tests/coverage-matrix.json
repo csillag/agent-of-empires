@@ -1238,6 +1238,13 @@
       "components": ["web/src/lib/session.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.background-chip",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx", "src/lib/backgroundAck.test.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/backgroundAck.ts"]
+    },
+    {
       "id": "sessions.fork.round-trip",
       "kind": "live-playwright",
       "risk": "high",
@@ -1986,6 +1993,13 @@
         "web/src/components/acp/Composer.tsx",
         "web/src/lib/acpTypes.ts"
       ]
+    },
+    {
+      "id": "acp.background-panel",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/BackgroundPanel.test.tsx", "src/lib/background.test.ts"],
+      "components": ["web/src/components/acp/BackgroundPanel.tsx"]
     },
     {
       "id": "acp.memory-recall",

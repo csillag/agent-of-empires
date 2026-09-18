@@ -57,8 +57,8 @@ pub async fn list_sessions(
             } else {
                 None
             };
-            // Archived sessions are sunk and not live; their wakeup/monitor
-            // badge is meaningless, so skip the per-poll SQLite lookups for
+            // Archived sessions are sunk and not live; their wakeup/background
+            // badges are meaningless, so skip the per-poll SQLite lookups for
             // them. Unarchiving restores the queries. latest_plan stays
             // ungated: a collapsed archived row may still show a plan summary.
             let structured_live = inst.is_structured() && !inst.is_archived() && !inst.is_trashed();
@@ -70,8 +70,12 @@ pub async fn list_sessions(
             } else {
                 (None, None)
             };
-            let active_monitor = if structured_live {
-                state.acp_event_store.latest_active_monitor(&inst.id)
+            let background = if structured_live {
+                crate::acp::background::BackgroundSummary::from_items(
+                    state
+                        .acp_event_store
+                        .background_items(&inst.id, chrono::Utc::now()),
+                )
             } else {
                 None
             };
@@ -86,7 +90,7 @@ pub async fn list_sessions(
                 acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
-                active_monitor,
+                background,
             );
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: the invariant (supervisor.rs) is that
@@ -640,8 +644,7 @@ mod workspace_ordering_tests {
             plan_summary: None,
             next_wakeup_at: None,
             next_wakeup_reason: None,
-            monitor_active: false,
-            monitor_description: None,
+            background: None,
             favorited: false,
             color: None,
             urgent: false,

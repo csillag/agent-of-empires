@@ -8,10 +8,11 @@
 // the dnd-kit plumbing that the production tree provides.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { useMemo, useRef, type ReactNode } from "react";
 
 import { DragSuppressContext, SessionRow, type RowBulkApi } from "../WorkspaceSidebar";
+import { acknowledgeBackground } from "../../lib/backgroundAck";
 
 // Single-row stub for the bulk-triage bridge: these tests mount one
 // unselected row, so the context menu is always single-scope. See #2312.
@@ -166,29 +167,6 @@ describe("SessionRow chips", () => {
     expect(screen.queryByLabelText("Pinned")).not.toBeNull();
     expect(screen.queryByLabelText("Archived")).toBeNull();
     expect(screen.queryByLabelText("Snoozed")).toBeNull();
-  });
-
-  it("renders the monitoring badge when the first session has an armed monitor", () => {
-    // A monitor-parked session would otherwise look like a plain idle dot;
-    // the badge signals it is waiting on a background watch, not dead.
-    const ws = workspace("w-monitor", [session({ monitor_active: true, monitor_description: "clippy passes" })]);
-    render(
-      <Wrap>
-        <Row ws={ws} />
-      </Wrap>,
-    );
-    const badge = screen.getByLabelText("Monitoring clippy passes");
-    expect(badge.textContent).toContain("monitoring");
-  });
-
-  it("renders no monitoring badge when no monitor is armed", () => {
-    const ws = workspace("w-none", [session()]);
-    render(
-      <Wrap>
-        <Row ws={ws} />
-      </Wrap>,
-    );
-    expect(screen.queryByLabelText(/^Monitoring/)).toBeNull();
   });
 
   it("renders the Archived chip when any session is archived", () => {
@@ -391,6 +369,116 @@ describe("SessionRow smart-rename chip", () => {
     );
     expect(screen.queryByLabelText("Will auto-name")).toBeNull();
     expect(screen.queryByLabelText("Naming")).toBeNull();
+  });
+});
+
+describe("SessionRow background chip", () => {
+  it("shows a background chip with the live count", () => {
+    const ws = workspace("w-bg", [
+      session({
+        background: {
+          live: 2,
+          items: [
+            { kind: "monitor", id: "m", label: "adam run", started_at: new Date().toISOString() },
+            { kind: "shell", id: "s", label: "make test", started_at: new Date().toISOString() },
+          ],
+        },
+      }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const chip = screen.getByLabelText("Background: 2 live");
+    expect(chip.textContent).toContain("2");
+  });
+
+  it("warns about a loss until it is acknowledged", () => {
+    window.localStorage.removeItem("aoe.backgroundAck.s-lost");
+    const lostAt = new Date().toISOString();
+    const ws = workspace("w-lost", [
+      session({
+        id: "s-lost",
+        background: {
+          live: 0,
+          lost_since: lostAt,
+          items: [
+            { kind: "monitor", id: "m", started_at: lostAt, ended: { reason: "lost", cause: "new_build", at: lostAt } },
+          ],
+        },
+      }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByLabelText("Background: 0 live, some lost").textContent).toContain("!");
+  });
+
+  it("shows no background chip without background work", () => {
+    render(
+      <Wrap>
+        <Row ws={workspace("w-none", [session({})])} />
+      </Wrap>,
+    );
+    expect(screen.queryByLabelText(/^Background:/)).toBeNull();
+  });
+
+  it("lists every item in the hover tooltip", () => {
+    const ws = workspace("w-bg-hover", [
+      session({
+        id: "s-hover",
+        background: {
+          live: 2,
+          items: [
+            { kind: "monitor", id: "m", label: "adam run", started_at: new Date().toISOString() },
+            { kind: "shell", id: "s", label: "make test", started_at: new Date().toISOString() },
+          ],
+        },
+      }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const chip = screen.getByLabelText("Background: 2 live");
+    fireEvent.mouseEnter(chip.parentElement!);
+    const tooltip = screen.getByRole("tooltip");
+    expect(tooltip.textContent).toContain("Monitor · adam run · live");
+    expect(tooltip.textContent).toContain("Shell · make test · live");
+    // The rows are joined with "\n"; whitespace-pre-line is what keeps them
+    // on separate lines instead of collapsing into one run-on sentence.
+    expect(tooltip.classList.contains("whitespace-pre-line")).toBe(true);
+  });
+
+  it("clears the warning immediately when acknowledged in the same tab", () => {
+    window.localStorage.removeItem("aoe.backgroundAck.s-ack");
+    const lostAt = new Date().toISOString();
+    const ws = workspace("w-ack", [
+      session({
+        id: "s-ack",
+        background: {
+          live: 0,
+          lost_since: lostAt,
+          items: [
+            { kind: "monitor", id: "m", started_at: lostAt, ended: { reason: "lost", cause: "new_build", at: lostAt } },
+          ],
+        },
+      }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.getByLabelText("Background: 0 live, some lost")).not.toBeNull();
+    act(() => {
+      acknowledgeBackground("s-ack");
+    });
+    expect(screen.queryByLabelText(/some lost/)).toBeNull();
   });
 });
 

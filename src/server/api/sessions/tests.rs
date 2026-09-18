@@ -1463,6 +1463,39 @@ fn session_response_surfaces_base_branch_when_set() {
 }
 
 #[test]
+fn session_response_carries_the_background_summary() {
+    let inst = make_test_instance();
+    let item = crate::acp::state::BackgroundItem {
+        kind: crate::acp::state::BackgroundKind::Monitor,
+        id: "m1".into(),
+        label: Some("watch".into()),
+        started_at: chrono::Utc::now(),
+        expires_at: None,
+        ended: None,
+    };
+    let summary = crate::acp::background::BackgroundSummary::from_items(vec![item]).unwrap();
+
+    let resp = SessionResponse::from_instance_with_plan(
+        &inst,
+        false,
+        None,
+        crate::daemon::AcpWorkerState::Absent,
+        None,
+        None,
+        Some(summary),
+    );
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["background"]["live"], 1);
+    assert_eq!(json["background"]["items"][0]["kind"], "monitor");
+    assert!(json["background"].get("lost_since").is_none());
+    assert!(json.get("monitor_active").is_none());
+    assert!(json.get("monitor_description").is_none());
+
+    let no_background = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    assert!(no_background.get("background").is_none());
+}
+
+#[test]
 fn session_response_serializes_to_json() {
     let inst = make_test_instance();
     let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();

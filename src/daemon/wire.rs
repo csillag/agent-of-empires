@@ -468,17 +468,10 @@ pub struct SessionResponse {
     /// `next_wakeup_at` is also set. See #1091.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_wakeup_reason: Option<String>,
-    /// True when the structured view session has an armed `Monitor` tool
-    /// (a background watch). Unlike a scheduled wakeup there is no fire
-    /// time, so the sidebar shows a static "monitoring" badge rather than a
-    /// countdown. Cleared once a `UserPromptSent` lands after the monitor
-    /// was armed (the user took over).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub monitor_active: bool,
-    /// The `description` the agent gave the `Monitor` tool, shown as the
-    /// badge tooltip. Only set when `monitor_active` is true.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub monitor_description: Option<String>,
+    /// Background work of an acp session: monitors, backgrounded shells,
+    /// wakeups, sub-agents, workflows. Absent when there is none to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<crate::acp::background::BackgroundSummary>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

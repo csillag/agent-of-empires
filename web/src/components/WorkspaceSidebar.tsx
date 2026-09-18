@@ -10,6 +10,7 @@ import {
   useReducer,
   useRef,
   useState,
+  useSyncExternalStore,
   type MutableRefObject,
 } from "react";
 import { createPortal } from "react-dom";
@@ -58,6 +59,7 @@ import {
 import { SortableContext, useSortable, verticalListSortingStrategy, arrayMove } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import type {
+  BackgroundSummary,
   ContextResumeAvailability,
   ContextResumeUnavailableReason,
   ProjectInfo,
@@ -66,6 +68,8 @@ import type {
   SessionStatus,
   Workspace,
 } from "../lib/types";
+import { describeBackgroundItem, hasUnacknowledgedLoss } from "../lib/background";
+import { getBackgroundAck, subscribeBackgroundAck } from "../lib/backgroundAck";
 import { ProjectsSection } from "./ProjectsSection";
 import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
@@ -85,6 +89,7 @@ import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanc
 import { STATUS_DOT_CLASS, getStatusTextClass, isSessionActive } from "../lib/session";
 import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useWebSettings } from "../hooks/useWebSettings";
+import { useNow } from "../hooks/useNow";
 import { exceedsTouchSlop } from "../lib/longPress";
 import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { computeSessionRowTag, useSessionRowTagMode } from "../lib/sessionRowTag";
@@ -537,22 +542,34 @@ function WakeupCountdown({ wakeAt, reason }: { wakeAt: string; reason: string | 
   );
 }
 
-/** Sidebar chip shown while the agent has an armed `Monitor` (a
- *  background watch). Unlike the wakeup chip there is no fire time, so this
- *  is a static "monitoring" badge with no countdown. It persists across the
- *  monitor's re-fires (those resume the agent without a user prompt) and
- *  the underlying `monitor_active` field clears on the next user prompt. */
-function MonitorBadge({ description }: { description: string | null | undefined }) {
-  const title = description ? `Monitoring: ${description}` : "Monitoring a background job";
+/** Sidebar chip for the session's background registry (monitors, shells,
+ *  wakeups, sub-agents, workflows). Hidden once nothing is live and no loss
+ *  is unacknowledged; turns warning-coloured with a trailing `!` while a
+ *  loss hasn't been seen. Hover lists every item via `describeBackgroundItem`.
+ *  Reads the ack through `useSyncExternalStore` (not a plain `getBackgroundAck`
+ *  call) so a same-tab acknowledgement re-renders this `memo`'d row instead of
+ *  leaving the warning up until an unrelated prop change forces a re-render. */
+function BackgroundChip({ sessionId, summary }: { sessionId: string; summary: BackgroundSummary }) {
+  const ackAt = useSyncExternalStore(subscribeBackgroundAck, () => getBackgroundAck(sessionId));
+  // 30s is plenty for a hover-only "how long ago" label.
+  const now = useNow(30_000);
+  const unacked = hasUnacknowledgedLoss(summary, ackAt);
+  if (summary.live === 0 && !unacked) return null;
+  const text = summary.items.map((i) => describeBackgroundItem(i, now)).join("\n");
+  const tone = unacked
+    ? "border-status-warning/40 bg-status-warning/10 text-status-warning"
+    : "border-violet-700/40 bg-violet-950/30 text-violet-300";
   return (
-    <span
-      title={title}
-      aria-label={`Monitoring${description ? ` ${description}` : ""}`}
-      className="inline-flex shrink-0 items-center gap-0.5 rounded border border-violet-700/40 bg-violet-950/30 px-1 py-0 text-[10px] font-medium text-violet-300"
-    >
-      <span aria-hidden="true">👁</span>
-      monitoring
-    </span>
+    <Tooltip text={text} multiline>
+      <span
+        aria-label={`Background: ${summary.live} live${unacked ? ", some lost" : ""}`}
+        className={`inline-flex shrink-0 items-center gap-0.5 rounded border px-1 py-0 text-[10px] font-medium tabular-nums ${tone}`}
+      >
+        <span aria-hidden="true">⌚</span>
+        {summary.live}
+        {unacked && <span aria-hidden="true">!</span>}
+      </span>
+    </Tooltip>
   );
 }
 
@@ -1751,7 +1768,9 @@ export const SessionRow = memo(function SessionRow({
                   {firstSession?.next_wakeup_at && (
                     <WakeupCountdown wakeAt={firstSession.next_wakeup_at} reason={firstSession.next_wakeup_reason} />
                   )}
-                  {firstSession?.monitor_active && <MonitorBadge description={firstSession.monitor_description} />}
+                  {firstSession?.background && (
+                    <BackgroundChip sessionId={firstSession.id} summary={firstSession.background} />
+                  )}
                 </>
               )}
             </span>

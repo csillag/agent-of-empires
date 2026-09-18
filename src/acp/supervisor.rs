@@ -291,6 +291,11 @@ pub trait BroadcastSink: Send + Sync + 'static {
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
         Vec::new()
     }
+    /// Background items still live for the session. Default empty for sinks
+    /// without an event store.
+    fn live_background_items(&self, _session_id: &str) -> Vec<crate::acp::state::BackgroundItem> {
+        Vec::new()
+    }
     /// Persist one prompt attachment blob keyed to the seq of the
     /// `UserPromptSent` it rides with, so the retention prune and
     /// session delete drop it in lockstep. Default no-op so test sinks
@@ -1980,6 +1985,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             "spawning structured view worker"
         );
 
+        // Anything still live belonged to a worker that is gone.
+        self.mark_background_lost(&session_id, crate::acp::state::BackgroundLossCause::Respawn);
+
         // Import seeding: clear any partial replay from a prior failed attempt
         // before session/load re-emits the transcript. Done here, after the
         // spawn reservation is held, rather than in the REST handler, so a
@@ -2348,6 +2356,27 @@ impl<S: BroadcastSink> Supervisor<S> {
                         agent_unresponsive,
                         "drain channel closed (agent connection task ended); evaluating respawn"
                     );
+                    // Detach (daemon shutdown) and replacement remove this
+                    // lease's handle first; neither loses the agent's work.
+                    let still_ours = workers
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .is_some_and(|h| h.lease.epoch() == lease.epoch());
+                    if still_ours {
+                        let cause = if agent_unresponsive {
+                            crate::acp::state::BackgroundLossCause::WedgeKill
+                        } else if matches!(
+                            crate::process::worker_registry::load(&session_id),
+                            Ok(None)
+                        ) {
+                            crate::acp::state::BackgroundLossCause::UserStop
+                        } else {
+                            crate::acp::state::BackgroundLossCause::Respawn
+                        };
+                        mark_background_lost_via(&*sink, &next_seqs, &session_id, cause);
+                    }
+
                     if agent_unresponsive {
                         kill_wedged_runner(&*process_control, &session_id).await;
                     }
@@ -3158,6 +3187,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         // resume cannot slip between the decision and the handle removal.
         let mut workers = self.workers.lock().await;
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
+        // Shared by both settle arms below: a stop is always deliberate,
+        // never `Respawn`/`WedgeKill`/`NewBuild`.
+        let background_loss_cause = if stop_reason == "idle_auto_stop" {
+            crate::acp::state::BackgroundLossCause::IdleCap
+        } else {
+            crate::acp::state::BackgroundLossCause::UserStop
+        };
         match decision {
             StopDecision::TearDown { lease, identity } => {
                 let handle = workers.remove(session_id);
@@ -3178,6 +3214,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
+                self.mark_background_lost(session_id, background_loss_cause);
                 // Publish `Stopped` so the UI clears any "thinking" state
                 // now rather than on the next reap tick. Stdio fixtures have
                 // no UI and share the seq counter with budget tests.
@@ -3254,6 +3291,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
                 if let Some(lease) = lease {
                     self.settle(&lease, settlement);
+                    self.mark_background_lost(session_id, background_loss_cause);
                 }
                 Ok(())
             }
@@ -3595,6 +3633,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
     }
 
+    /// The worker's background items died with it.
+    pub fn mark_background_lost(
+        &self,
+        session_id: &str,
+        cause: crate::acp::state::BackgroundLossCause,
+    ) -> usize {
+        mark_background_lost_via(&*self.sink, &self.next_seqs, session_id, cause)
+    }
+
+    /// Record that the agent was told about losses up to `up_to`.
+    pub fn note_background_losses(&self, session_id: &str, up_to: chrono::DateTime<chrono::Utc>) {
+        self.publish_next(session_id, &Event::BackgroundLossNoted { up_to });
+    }
+
     /// Whether this session has a structured view worker up or coming up.
     /// A worker that is stopping is owned but not running, so callers
     /// refuse prompts and resumes against it; see `is_owned`.
@@ -3824,6 +3876,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             session = %id,
             reason,
             "registry entry gone while worker handle live; tearing down"
+        );
+        self.mark_background_lost(
+            &id,
+            if is_restart {
+                crate::acp::state::BackgroundLossCause::Respawn
+            } else {
+                crate::acp::state::BackgroundLossCause::UserStop
+            },
         );
         self.publish_next(
             &id,
@@ -4164,6 +4224,31 @@ fn next_seq(next_seqs: &SeqMap, session_id: &str) -> u64 {
     *entry
 }
 
+/// End every live background item of a session whose worker is gone.
+fn mark_background_lost_via<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
+    let live = sink.live_background_items(session_id);
+    let at = chrono::Utc::now();
+    for item in &live {
+        let seq = next_seq(next_seqs, session_id);
+        sink.publish(
+            session_id,
+            seq,
+            &Event::BackgroundItemEnded {
+                id: item.id.clone(),
+                reason: crate::acp::state::BackgroundEndReason::Lost,
+                cause: Some(cause),
+                at,
+            },
+        );
+    }
+    live.len()
+}
+
 /// Take a `std::sync::Mutex` guard, recovering the inner data if
 /// the lock is poisoned. The supervisor maps wrapped in `std::sync::Mutex`
 /// only ever hold short, panic-free critical sections (HashMap inserts
@@ -4241,6 +4326,13 @@ impl BroadcastSink for ChannelSink {
 
     fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
         self.event_store.unresolved_elicitation_nonces(session_id)
+    }
+    fn live_background_items(&self, session_id: &str) -> Vec<crate::acp::state::BackgroundItem> {
+        self.event_store
+            .background_items(session_id, chrono::Utc::now())
+            .into_iter()
+            .filter(|i| i.is_live())
+            .collect()
     }
 
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
@@ -4682,6 +4774,7 @@ mod tests {
         stale_nonces: std::sync::Mutex<Vec<Nonce>>,
         stale_elicitation_nonces: std::sync::Mutex<Vec<Nonce>>,
         stale_background_agent_ids: std::sync::Mutex<Vec<String>>,
+        live_background: std::sync::Mutex<Vec<crate::acp::state::BackgroundItem>>,
     }
     impl VecSink {
         fn new() -> Arc<Self> {
@@ -4690,6 +4783,7 @@ mod tests {
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
+                live_background: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
@@ -4698,6 +4792,7 @@ mod tests {
                 stale_nonces: std::sync::Mutex::new(nonces),
                 stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
+                live_background: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_elicitation_nonces(nonces: Vec<Nonce>) -> Arc<Self> {
@@ -4706,6 +4801,7 @@ mod tests {
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_elicitation_nonces: std::sync::Mutex::new(nonces),
                 stale_background_agent_ids: std::sync::Mutex::new(Vec::new()),
+                live_background: std::sync::Mutex::new(Vec::new()),
             })
         }
         fn with_stale_background_agent_ids(ids: Vec<String>) -> Arc<Self> {
@@ -4714,7 +4810,13 @@ mod tests {
                 stale_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_elicitation_nonces: std::sync::Mutex::new(Vec::new()),
                 stale_background_agent_ids: std::sync::Mutex::new(ids),
+                live_background: std::sync::Mutex::new(Vec::new()),
             })
+        }
+        fn with_live_background(items: Vec<crate::acp::state::BackgroundItem>) -> Arc<Self> {
+            let sink = Self::new();
+            *sink.live_background.lock().unwrap() = items;
+            sink
         }
     }
     impl BroadcastSink for VecSink {
@@ -4733,7 +4835,243 @@ mod tests {
         fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
             self.stale_background_agent_ids.lock().unwrap().clone()
         }
+        fn live_background_items(
+            &self,
+            _session_id: &str,
+        ) -> Vec<crate::acp::state::BackgroundItem> {
+            self.live_background.lock().unwrap().clone()
+        }
     }
+
+    fn live_item(id: &str) -> crate::acp::state::BackgroundItem {
+        crate::acp::state::BackgroundItem {
+            kind: crate::acp::state::BackgroundKind::Monitor,
+            id: id.into(),
+            label: None,
+            started_at: chrono::Utc::now(),
+            expires_at: None,
+            ended: None,
+        }
+    }
+    fn lost_ids(sink: &VecSink) -> Vec<(String, Option<crate::acp::state::BackgroundLossCause>)> {
+        sink.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|f| match &f.2 {
+                Event::BackgroundItemEnded {
+                    id,
+                    reason: crate::acp::state::BackgroundEndReason::Lost,
+                    cause,
+                    ..
+                } => Some((id.clone(), *cause)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn mark_background_lost_ends_every_live_item_once() {
+        use crate::acp::state::BackgroundLossCause::NewBuild;
+        let sink = VecSink::with_live_background(vec![live_item("m1"), live_item("s1")]);
+        let sup = Supervisor::new(sink.clone());
+        assert_eq!(sup.mark_background_lost("s-bg", NewBuild), 2);
+        assert_eq!(
+            lost_ids(&sink),
+            vec![("m1".into(), Some(NewBuild)), ("s1".into(), Some(NewBuild))]
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_a_worker_loses_its_items_with_the_stop_cause() {
+        use crate::acp::state::BackgroundLossCause::{IdleCap, UserStop};
+        for (idle, cause) in [(true, IdleCap), (false, UserStop)] {
+            let sink = VecSink::with_live_background(vec![live_item("m1")]);
+            let sup = Supervisor::new(sink.clone());
+            sup.test_insert_worker("s-stop-bg").await;
+            if idle {
+                sup.shutdown_idle("s-stop-bg").await.unwrap()
+            } else {
+                sup.shutdown("s-stop-bg").await.unwrap()
+            }
+            assert_eq!(
+                lost_ids(&sink),
+                vec![("m1".into(), Some(cause))],
+                "idle={idle}"
+            );
+        }
+    }
+
+    /// `StopDecision::NotOwned` (a disk-only runner from a previous daemon,
+    /// adopted for stop with no in-memory `WorkerHandle`) marks losses too.
+    /// Otherwise the next `spawn_inner` for that session would find the
+    /// item still live and report it `Respawn`, queuing a wake note for a
+    /// stop that was deliberate.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn stopping_a_disk_only_runner_loses_its_items_too() {
+        use crate::acp::state::BackgroundLossCause::UserStop;
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        let sink = VecSink::with_live_background(vec![live_item("m1")]);
+        let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+        save_record("s-notowned-bg", 6061, 1);
+
+        sup.shutdown("s-notowned-bg")
+            .await
+            .expect("disk-only runner is stoppable");
+
+        assert_eq!(lost_ids(&sink), vec![("m1".into(), Some(UserStop))]);
+    }
+
+    /// `reap_candidate` is the runner-managed counterpart of the disk-only
+    /// path above: `aoe acp stop` on an idle worker deletes the registry
+    /// entry while the handle is still live, and the reaper must mark that
+    /// worker's background items lost too, before the client shutdown that
+    /// used to leave nothing for the drain task's `still_ours` guard to find.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reap_candidate_marks_background_lost_for_a_user_stop() {
+        use crate::acp::state::BackgroundLossCause::UserStop;
+        let _home = isolate_home();
+        let sink = VecSink::with_live_background(vec![live_item("m1")]);
+        let sup = Supervisor::new(sink.clone());
+        let socket = crate::process::worker_registry::socket_path_for("s-reap-stop").unwrap();
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-reap-stop".into()));
+        sup.test_install_handle(
+            "s-reap-stop",
+            client,
+            WorkerKind::Runner {
+                spawn_config: Box::new(runner_config(socket)),
+            },
+            None,
+        )
+        .await;
+
+        let candidates = sup.reap_candidates().await;
+        let outcome = sup
+            .reap_candidate(candidates.into_iter().next().unwrap())
+            .await;
+
+        assert_eq!(outcome, Some(false), "no restart marker means a user stop");
+        assert_eq!(lost_ids(&sink), vec![("m1".into(), Some(UserStop))]);
+    }
+
+    /// Same path, but with a restart marker present: the loss is `Respawn`
+    /// so the wake note fires, unlike the plain user-stop case above.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn reap_candidate_marks_background_lost_as_respawn_for_a_restart() {
+        use crate::acp::state::BackgroundLossCause::Respawn;
+        let _home = isolate_home();
+        let sink = VecSink::with_live_background(vec![live_item("m1")]);
+        let sup = Supervisor::new(sink.clone());
+        let socket = crate::process::worker_registry::socket_path_for("s-reap-restart").unwrap();
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-reap-restart".into()));
+        sup.test_install_handle(
+            "s-reap-restart",
+            client,
+            WorkerKind::Runner {
+                spawn_config: Box::new(runner_config(socket)),
+            },
+            Some(RunnerIdentity {
+                pid: 999_999_999,
+                generation: 7,
+            }),
+        )
+        .await;
+        crate::process::worker_registry::mark_restart_pending("s-reap-restart", 7);
+
+        let candidates = sup.reap_candidates().await;
+        let outcome = sup
+            .reap_candidate(candidates.into_iter().next().unwrap())
+            .await;
+
+        assert_eq!(outcome, Some(true), "restart marker present");
+        assert_eq!(lost_ids(&sink), vec![("m1".into(), Some(Respawn))]);
+    }
+
+    /// `detach_all` drains the worker table before it shuts each client down
+    /// and aborts the drain task, so the drain task's channel-closed branch
+    /// can still run in that window. It must see the handle already gone
+    /// and skip marking, or a graceful `aoe serve` shutdown would report
+    /// every live item lost to `Respawn` and queue a wake note for nothing.
+    #[tokio::test]
+    async fn drain_close_after_detach_does_not_mark_background_lost() {
+        let sink = VecSink::with_live_background(vec![live_item("m1")]);
+        let sup = Supervisor::new(sink.clone());
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId("s-detach".into()));
+        let lease = sup
+            .test_install_handle("s-detach", client, WorkerKind::Stdio, None)
+            .await;
+        // Simulate `detach_all`, which removes the handle before the drain
+        // task observes the channel close.
+        sup.workers.lock().await.remove("s-detach");
+        let drain = sup.start_drain_task("s-detach".into(), lease, inbound_rx);
+        drop(inbound_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("drain task should exit within 2s of inbound close");
+        assert!(
+            lost_ids(&sink).is_empty(),
+            "a detached handle must not mark background items lost"
+        );
+    }
+
+    /// The drain task's own cause selection, exercised only when
+    /// `still_ours` is true (unlike the `settle`-path tests above, which
+    /// never reach this branch, and the detach test above, which is
+    /// `still_ours == false`): `WedgeKill` when the connection ended
+    /// because the agent was judged unresponsive, else `UserStop` when the
+    /// on-disk registry record is already gone, else `Respawn`.
+    /// `WorkerKind::Attached` keeps `restart_decision` off the real-respawn
+    /// path (it resolves to `BudgetBurned` or `UserStopped`, never
+    /// `Respawn(_)`), so the drain task returns quickly with no process
+    /// signals sent: `kill_wedged_runner`'s pid lookup is a no-op when (as
+    /// here) no registry record names a pid.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_close_cause_selection_when_still_ours() {
+        use crate::acp::state::BackgroundLossCause::{Respawn, UserStop, WedgeKill};
+        let _home = isolate_home();
+        for (session_id, registry_present, send_unresponsive_stop, expected) in [
+            ("s-drain-respawn", true, false, Respawn),
+            ("s-drain-userstop", false, false, UserStop),
+            ("s-drain-wedge", false, true, WedgeKill),
+        ] {
+            let sink = VecSink::with_live_background(vec![live_item("m1")]);
+            let sup = Supervisor::new(sink.clone());
+            let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+            let (client, _client_tx) = AcpClient::fake_for_test(AcpSessionId(session_id.into()));
+            let lease = sup
+                .test_install_handle(session_id, client, WorkerKind::Attached, None)
+                .await;
+            if registry_present {
+                save_record(session_id, 1, lease.epoch());
+            }
+            let drain = sup.start_drain_task(session_id.into(), lease, inbound_rx);
+            if send_unresponsive_stop {
+                inbound_tx
+                    .send(Event::Stopped {
+                        reason: "agent_unresponsive".into(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(inbound_tx);
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+                .await
+                .unwrap_or_else(|_| panic!("drain task should exit within 2s ({session_id})"));
+
+            assert_eq!(
+                lost_ids(&sink),
+                vec![("m1".into(), Some(expected))],
+                "case {session_id}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn respawned_worker_rejects_the_prior_generation() {
         let sup = Supervisor::new(VecSink::new());
