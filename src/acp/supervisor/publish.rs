@@ -306,32 +306,89 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
     resumable
 }
 
-/// Cancel approvals and elicitations a dead worker left unresolved in the log:
-/// their responders died with it, so the cards would fail on submit.
-/// End every live background item of a session whose worker is gone.
+/// A session's worker is gone: end its live registry items as lost and
+/// detach its unresolved sub-agents.
 pub(super) fn mark_background_lost_via<S: BroadcastSink + ?Sized>(
     sink: &S,
     next_seqs: &SeqMap,
     session_id: &str,
     cause: crate::acp::state::BackgroundLossCause,
 ) -> usize {
-    let live = sink.live_background_items(session_id);
+    end_background_items_lost(sink, next_seqs, session_id, cause)
+        + detach_background_agents(sink, next_seqs, session_id, cause)
+}
+
+/// End the live items the registry tracks itself. Sub-agents are left to
+/// `BackgroundAgentCompleted`, so each item ends exactly once.
+pub(super) fn end_background_items_lost<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
     let at = chrono::Utc::now();
-    for item in &live {
+    let mut ended = 0;
+    for item in sink.live_background_items(session_id) {
+        if item.kind == crate::acp::state::BackgroundKind::Subagent {
+            continue;
+        }
         sink.publish(
             session_id,
             next_seq(next_seqs, session_id),
-            &Event::BackgroundItemEnded {
-                id: item.id.clone(),
-                reason: crate::acp::state::BackgroundEndReason::Lost,
-                cause: Some(cause),
-                at,
+            &lost_background_end(item.id, cause, at),
+        );
+        ended += 1;
+    }
+    ended
+}
+
+/// Detach every sub-agent still unresolved, each preceded by its loss cause.
+/// The fold pairs that cause with `Detached` when the timestamps match.
+fn detach_background_agents<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
+    let ids = sink.unresolved_background_agent_ids(session_id);
+    let at = chrono::Utc::now();
+    for agent_id in &ids {
+        sink.publish(
+            session_id,
+            next_seq(next_seqs, session_id),
+            &lost_background_end(agent_id.clone(), cause, at),
+        );
+        sink.publish(
+            session_id,
+            next_seq(next_seqs, session_id),
+            &Event::BackgroundAgentCompleted {
+                agent_id: agent_id.clone(),
+                status: BackgroundAgentStatus::Detached,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: at,
             },
         );
     }
-    live.len()
+    ids.len()
 }
 
+fn lost_background_end(
+    id: String,
+    cause: crate::acp::state::BackgroundLossCause,
+    at: chrono::DateTime<chrono::Utc>,
+) -> Event {
+    Event::BackgroundItemEnded {
+        id,
+        reason: crate::acp::state::BackgroundEndReason::Lost,
+        cause: Some(cause),
+        at,
+    }
+}
+
+/// Cancel approvals and elicitations a dead worker left unresolved in the log:
+/// their responders died with it, so the cards would fail on submit.
 pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,

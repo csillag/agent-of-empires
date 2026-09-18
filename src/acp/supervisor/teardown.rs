@@ -124,7 +124,14 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
-                self.mark_background_lost(session_id, background_loss_cause);
+                // Registry items first. The detach loop below ends sub-agents,
+                // then `Stopped`. A stop does not pair a loss cause onto them.
+                super::publish::end_background_items_lost(
+                    &*self.sink,
+                    &self.next_seqs,
+                    session_id,
+                    background_loss_cause,
+                );
                 // Publish now so the UI clears its thinking state before the next reap tick.
                 if !is_test_worker(&handle) {
                     // The worker's tailer died with it, so a sub-agent still

@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::acp::state::{
-    BackgroundEnd, BackgroundEndReason, BackgroundItem, BackgroundKind, Event,
+    BackgroundAgentStatus, BackgroundEnd, BackgroundEndReason, BackgroundItem, BackgroundKind,
+    BackgroundLossCause, Event,
 };
 
 /// How long an ended item stays listed.
@@ -32,12 +33,19 @@ fn end_item(
 /// Fold `(created_at, event)` rows, in log order, into the session's items.
 /// Deadlines that have passed by `now` end their item: a timed monitor times
 /// out and a wakeup fires. A later end never overrides an earlier one.
+///
+/// Sub-agent rows mirror upstream's `BackgroundAgent*` events and end only on
+/// `BackgroundAgentCompleted`; `Detached` means lost. A `BackgroundItemEnded`
+/// for a sub-agent never ends it: it records the loss cause, which applies to
+/// the `Detached` published with the same `at` (see `detach_background_agents`
+/// in the supervisor).
 pub fn fold_background(
     rows: impl IntoIterator<Item = (DateTime<Utc>, Event)>,
     now: DateTime<Utc>,
 ) -> Vec<BackgroundItem> {
     let mut items: Vec<BackgroundItem> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
+    let mut detach_causes: HashMap<String, (DateTime<Utc>, BackgroundLossCause)> = HashMap::new();
     for (created_at, event) in rows {
         let (kind, id, label, started_at, expires_at) = match event {
             Event::BackgroundItemStarted {
@@ -73,16 +81,37 @@ pub fn fold_background(
                 cause,
                 at,
             } => {
-                end_item(&mut items, &index, &id, BackgroundEnd { reason, cause, at });
+                let is_subagent = index
+                    .get(&id)
+                    .is_some_and(|&i| items[i].kind == BackgroundKind::Subagent);
+                if !is_subagent {
+                    end_item(&mut items, &index, &id, BackgroundEnd { reason, cause, at });
+                } else if let (BackgroundEndReason::Lost, Some(cause)) = (reason, cause) {
+                    detach_causes.insert(id, (at, cause));
+                }
                 continue;
             }
             Event::BackgroundAgentCompleted {
-                agent_id, ended_at, ..
+                agent_id,
+                status,
+                ended_at,
+                ..
             } => {
-                let e = BackgroundEnd {
-                    reason: BackgroundEndReason::Finished,
-                    cause: None,
-                    at: ended_at,
+                let e = if status == BackgroundAgentStatus::Detached {
+                    BackgroundEnd {
+                        reason: BackgroundEndReason::Lost,
+                        cause: detach_causes
+                            .remove(&agent_id)
+                            .filter(|(at, _)| *at == ended_at)
+                            .map(|(_, cause)| cause),
+                        at: ended_at,
+                    }
+                } else {
+                    BackgroundEnd {
+                        reason: BackgroundEndReason::Finished,
+                        cause: None,
+                        at: ended_at,
+                    }
                 };
                 end_item(&mut items, &index, &agent_id, e);
                 continue;
@@ -436,29 +465,8 @@ mod tests {
     #[test]
     fn fold_mirrors_sub_agents_and_drops_old_ended_items() {
         let rows = vec![
-            (
-                t(0),
-                Event::BackgroundAgentLaunched {
-                    agent_id: "a1".into(),
-                    tool_call_id: "tc".into(),
-                    description: "review".into(),
-                    prompt: String::new(),
-                    model: String::new(),
-                    started_at: t(0),
-                    output_file: String::new(),
-                },
-            ),
-            (
-                t(5),
-                Event::BackgroundAgentCompleted {
-                    agent_id: "a1".into(),
-                    status: crate::acp::state::BackgroundAgentStatus::Completed,
-                    tools: Vec::new(),
-                    result: None,
-                    warning: None,
-                    ended_at: t(5),
-                },
-            ),
+            launched("a1", 0),
+            completed("a1", BackgroundAgentStatus::Completed, 5),
             started(BackgroundKind::Monitor, "old", 0, None),
             ended("old", BackgroundEndReason::Stopped, None, 1),
             started(BackgroundKind::Monitor, "lost", 0, None),
@@ -500,6 +508,103 @@ mod tests {
             much_later.iter().all(|i| i.id != "lost"),
             "a lost item must drop after 7 days: {much_later:?}"
         );
+    }
+
+    fn launched(id: &str, at: i64) -> (DateTime<Utc>, Event) {
+        (
+            t(at),
+            Event::BackgroundAgentLaunched {
+                agent_id: id.into(),
+                tool_call_id: format!("tc-{id}"),
+                description: format!("{id} task"),
+                prompt: String::new(),
+                model: String::new(),
+                started_at: t(at),
+                output_file: String::new(),
+            },
+        )
+    }
+    fn completed(id: &str, status: BackgroundAgentStatus, at: i64) -> (DateTime<Utc>, Event) {
+        (
+            t(at),
+            Event::BackgroundAgentCompleted {
+                agent_id: id.into(),
+                status,
+                tools: Vec::new(),
+                result: None,
+                warning: None,
+                ended_at: t(at),
+            },
+        )
+    }
+
+    /// Sub-agent rows follow upstream's `BackgroundAgent*` events alone. A
+    /// registry `BackgroundItemEnded` only lends its cause to the `Detached`
+    /// that carries the same `at`.
+    #[test]
+    fn sub_agents_follow_upstream_background_agent_events() {
+        use BackgroundAgentStatus::{Completed, Detached, Error};
+        use BackgroundEndReason::{Finished, Lost};
+        use BackgroundLossCause::Respawn;
+        let cases = vec![
+            ("launched is live", vec![launched("a", 0)], None),
+            (
+                "completion finishes it",
+                vec![launched("a", 0), completed("a", Completed, 5)],
+                Some(BackgroundEnd {
+                    reason: Finished,
+                    cause: None,
+                    at: t(5),
+                }),
+            ),
+            (
+                "an error completion finishes it too",
+                vec![launched("a", 0), completed("a", Error, 5)],
+                Some(BackgroundEnd {
+                    reason: Finished,
+                    cause: None,
+                    at: t(5),
+                }),
+            ),
+            (
+                "a registry end alone does not end it",
+                vec![launched("a", 0), ended("a", Lost, Some(Respawn), 5)],
+                None,
+            ),
+            (
+                "detached with its paired cause is lost to that cause",
+                vec![
+                    launched("a", 0),
+                    ended("a", Lost, Some(Respawn), 5),
+                    completed("a", Detached, 5),
+                ],
+                Some(BackgroundEnd {
+                    reason: Lost,
+                    cause: Some(Respawn),
+                    at: t(5),
+                }),
+            ),
+            (
+                "an unpaired detach is lost with no cause",
+                vec![
+                    launched("a", 0),
+                    ended("a", Lost, Some(Respawn), 3),
+                    completed("a", Detached, 5),
+                ],
+                Some(BackgroundEnd {
+                    reason: Lost,
+                    cause: None,
+                    at: t(5),
+                }),
+            ),
+        ];
+        for (label, rows, expected) in cases {
+            let items = fold_background(rows, t(10));
+            assert_eq!(items.len(), 1, "{label}: {items:?}");
+            assert_eq!(items[0].kind, BackgroundKind::Subagent, "{label}");
+            assert_eq!(items[0].label.as_deref(), Some("a task"), "{label}");
+            assert_eq!(items[0].ended, expected, "{label}");
+        }
     }
 
     #[test]

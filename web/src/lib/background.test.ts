@@ -42,6 +42,7 @@ describe("waitingOn", () => {
       items: [
         { kind: "subagent", id: "a", started_at: at(-1) },
         { kind: "subagent", id: "b", started_at: at(-1) },
+        { kind: "subagent", id: "c", started_at: at(-1), ended: { reason: "lost", at: at(0) } },
         { kind: "workflow", id: "w", started_at: at(-1) },
         { kind: "monitor", id: "m", started_at: at(-1) },
       ],
