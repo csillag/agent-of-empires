@@ -42,11 +42,6 @@ const incompatibleDetail = {
   install_command: "npm install -g @agentclientprotocol/claude-agent-acp@latest",
   auto_install: false,
 };
-const toolStart: AcpEvent = {
-  ToolCallStarted: {
-    tool_call: { id: "tc-1", name: "Read File", kind: "read", args_preview: "{}", started_at: "2026-01-01T00:00:00Z" },
-  },
-};
 const future = new Date(Date.now() + 95_000).toISOString();
 const past = new Date(Date.now() - 5_000).toISOString();
 
@@ -73,8 +68,6 @@ describe("applyEvent control state", () => {
       agentOrphaned: true,
       rateLimitRetriesExhausted: true,
       contextPrimerAvailable: { resetSeq: 1, reason: "x" },
-      monitorArmed: true,
-      monitorDescription: "watch",
     };
     expect(fold(stale, kind === "plain" ? prompt() : diffComments)).toMatchObject({
       startupError: null,
@@ -86,8 +79,6 @@ describe("applyEvent control state", () => {
       agentOrphaned: false,
       rateLimitRetriesExhausted: false,
       contextPrimerAvailable: null,
-      monitorArmed: false,
-      monitorDescription: null,
       turnActive: true,
     });
   });
@@ -219,26 +210,6 @@ describe("applyEvent control state", () => {
       [{ WakeupScheduled: { at: past, reason: "wake" } }, prompt()],
       { nextWakeupAt: null, nextWakeupReason: null },
     ],
-    [
-      "MonitorArmed",
-      [{ MonitorArmed: { description: "clippy passes" } }],
-      { monitorArmed: true, monitorDescription: "clippy passes" },
-    ],
-    [
-      "a monitor persists through agent activity",
-      [{ MonitorArmed: { description: "b" } }, "ThinkingStarted", { AgentMessageChunk: { text: "x" } }],
-      { monitorArmed: true },
-    ],
-    [
-      "a monitor persists past the arming turn's Stopped",
-      [{ MonitorArmed: { description: "w" } }, stopped("prompt_complete")],
-      { monitorArmed: true },
-    ],
-    ...["prompt_complete", "agent_idle"].map((reason): [string, AcpEvent[], Partial<AcpState>] => [
-      `a fired monitor clears when the turn ends with ${reason}`,
-      [{ MonitorArmed: { description: "w" } }, toolStart, stopped(reason)],
-      { monitorArmed: false, monitorDescription: null },
-    ]),
     [
       "ModeSwitchFailed",
       [{ ModeSwitchFailed: { mode_id: "bypassPermissions", reason: "denied" } }],

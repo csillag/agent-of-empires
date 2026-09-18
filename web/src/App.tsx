@@ -1989,6 +1989,7 @@ function AppContent({
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
                         isSandboxed={activeSession.is_sandboxed}
+                        background={activeSession?.background}
                       />
                     </Suspense>
                   ) : (

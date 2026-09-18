@@ -101,6 +101,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         // the decision and the handle removal.
         let mut workers = self.workers.lock().await;
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
+        // A stop is deliberate: never Respawn, WedgeKill, or NewBuild.
+        let background_loss_cause = if stop_reason == "idle_auto_stop" {
+            crate::acp::state::BackgroundLossCause::IdleCap
+        } else {
+            crate::acp::state::BackgroundLossCause::UserStop
+        };
         match decision {
             StopDecision::TearDown { lease, identity } => {
                 let handle = workers.remove(session_id);
@@ -118,6 +124,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
+                self.mark_background_lost(session_id, background_loss_cause);
                 // Publish now so the UI clears its thinking state before the next reap tick.
                 if !is_test_worker(&handle) {
                     // The worker's tailer died with it, so a sub-agent still
@@ -180,6 +187,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     tear_down_runner(&*self.process_control, session_id, Some(identity)).await;
                 if let Some(lease) = lease {
                     self.settle(&lease, settlement);
+                    self.mark_background_lost(session_id, background_loss_cause);
                 }
                 Ok(())
             }
@@ -342,6 +350,14 @@ impl<S: BroadcastSink> Supervisor<S> {
             session = %id,
             reason,
             "registry entry gone while worker handle live; tearing down"
+        );
+        self.mark_background_lost(
+            &id,
+            if is_restart {
+                crate::acp::state::BackgroundLossCause::Respawn
+            } else {
+                crate::acp::state::BackgroundLossCause::UserStop
+            },
         );
         self.publish_next(
             &id,

@@ -27,14 +27,8 @@ impl SessionResponse {
         acp_worker_state: crate::daemon::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
-        // `Some(description)` when the session has an armed `Monitor`, `None`
-        // otherwise, mirroring `EventStore::latest_active_monitor`.
-        active_monitor: Option<Option<String>>,
+        background: Option<crate::acp::background::BackgroundSummary>,
     ) -> Self {
-        let (monitor_active, monitor_description) = match active_monitor {
-            Some(description) => (true, description),
-            None => (false, None),
-        };
         Self {
             id: inst.id.clone(),
             title: inst.title.clone(),
@@ -180,8 +174,7 @@ impl SessionResponse {
             plan_summary,
             next_wakeup_at,
             next_wakeup_reason,
-            monitor_active,
-            monitor_description,
+            background,
         }
     }
 }

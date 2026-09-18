@@ -156,6 +156,12 @@ pub(super) async fn establish(
         &init.agent_capabilities.mcp_capabilities,
         &label,
     );
+    let task_notifications = crate::acp::task_notifications::TaskNotificationFollower::new(
+        shared.profile,
+        &shared.bg_transcript_source,
+        &ctx.agent_cwd,
+        shared.event_tx.clone(),
+    );
     let mut session = Session {
         connection,
         shared: shared.clone(),
@@ -173,6 +179,7 @@ pub(super) async fn establish(
         cmd_rx: ctx.cmd_rx,
         lifecycle_rx: ctx.lifecycle_rx,
         pending_prompts: VecDeque::new(),
+        task_notifications,
     };
     session.acp_session_id = match ctx.mode {
         ConnectMode::Resume { acp_session_id, .. } => session.resume(acp_session_id).await?,
@@ -194,6 +201,9 @@ pub(super) async fn establish(
                 .await?
         }
     };
+    session
+        .task_notifications
+        .follow(&session.acp_session_id.0);
     session.apply_default_model().await;
     session.apply_default_effort().await;
     if arm_resume_watchdog {

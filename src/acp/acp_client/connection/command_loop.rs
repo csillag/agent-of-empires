@@ -58,6 +58,8 @@ pub(super) struct Session {
     /// Steers the adapter handed back unconsumed, run as ordinary turns.
     /// Kept here rather than re-sent on the bounded channel this task drains.
     pub(super) pending_prompts: VecDeque<Vec<ContentBlock>>,
+    /// Ends background items from the session transcript's task notifications.
+    pub(super) task_notifications: crate::acp::task_notifications::TaskNotificationFollower,
 }
 
 impl Session {
@@ -309,6 +311,7 @@ impl Session {
                     new_id = %new_id.0,
                     "conversation reset: session/new succeeded, swapped acp_session_id"
                 );
+                self.task_notifications.follow(&new_id.0);
                 self.shared.emit(Event::SessionCleared).await;
                 self.shared
                     .emit(Event::SessionContextReset {

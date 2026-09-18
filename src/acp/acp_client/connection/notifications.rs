@@ -66,7 +66,9 @@ pub(super) struct Shared {
     /// Scoped to one turn; see `AgentMessageDedup` (#2281).
     pub(super) agent_msg_dedup: std::sync::Mutex<AgentMessageDedup>,
     pub(super) tool_context_cache: ToolContextCache,
-    bg_transcript_source: TranscriptSource,
+    pub(super) bg_transcript_source: TranscriptSource,
+    /// Labels for background items, filled from the tool call that started them.
+    pub(super) recent_tool_labels: std::sync::Mutex<crate::acp::background::RecentToolLabels>,
 }
 
 impl Shared {
@@ -109,6 +111,7 @@ impl Shared {
             agent_msg_dedup: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
+            recent_tool_labels: std::sync::Mutex::new(crate::acp::background::RecentToolLabels::default()),
         }
     }
 
@@ -214,7 +217,17 @@ impl Shared {
         }
         self.capture_rate_limit(&notification.update);
         let update_for_tool_context = notification.update.clone();
-        let events = map_update_to_events(notification.update, self.profile);
+        let mut events = map_update_to_events(notification.update, self.profile);
+        {
+            let mut labels = self
+                .recent_tool_labels
+                .lock()
+                .expect("tool label mutex poisoned");
+            for event in &mut events {
+                labels.observe(event);
+                labels.fill_label(event);
+            }
+        }
         // Signals go first: if the event send backpressures, the watchdog must
         // not evaluate without a suppression-bearing signal.
         forward_lifecycle_signals(

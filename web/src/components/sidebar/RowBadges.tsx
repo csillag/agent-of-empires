@@ -1,11 +1,16 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, useSyncExternalStore, type ReactNode } from "react";
 import { Archive, Hourglass, Moon, Pencil, Sparkles } from "lucide-react";
+import { describeBackgroundItem, hasUnacknowledgedLoss } from "../../lib/background";
+import { getBackgroundAck, subscribeBackgroundAck } from "../../lib/backgroundAck";
+import { useNow } from "../../hooks/useNow";
 import type {
+  BackgroundSummary,
   ContextResumeAvailability,
   ContextResumeUnavailableReason,
   SessionResponse,
   Workspace,
 } from "../../lib/types";
+import { Tooltip } from "../Tooltip";
 import { useHasDraftForSessions } from "../../lib/acpDrafts";
 import { useQueuedCountForSessions } from "../../hooks/useAcpQueueCount";
 import { summarizeRateLimits } from "../../lib/rateLimitSummary";
@@ -198,17 +203,31 @@ export function RowTrailingBadges({ workspace, model }: { workspace: Workspace; 
         </Chip>
       )}
       {first?.next_wakeup_at && <WakeupCountdown wakeAt={first.next_wakeup_at} reason={first.next_wakeup_reason} />}
-      {first?.monitor_active && (
-        <Chip
-          title={first.monitor_description ? `Monitoring: ${first.monitor_description}` : "Monitoring a background job"}
-          label={`Monitoring${first.monitor_description ? ` ${first.monitor_description}` : ""}`}
-          className={`${CHIP} gap-0.5 border-violet-700/40 bg-violet-950/30 font-medium text-violet-300`}
-        >
-          <span aria-hidden="true">👁</span>
-          monitoring
-        </Chip>
-      )}
+      {first?.background && <BackgroundChip sessionId={first.id} summary={first.background} />}
     </>
+  );
+}
+
+function BackgroundChip({ sessionId, summary }: { sessionId: string; summary: BackgroundSummary }) {
+  const ackAt = useSyncExternalStore(subscribeBackgroundAck, () => getBackgroundAck(sessionId));
+  const now = useNow(30_000);
+  const unacked = hasUnacknowledgedLoss(summary, ackAt);
+  if (summary.live === 0 && !unacked) return null;
+  const text = summary.items.map((item) => describeBackgroundItem(item, now)).join("\n");
+  const tone = unacked
+    ? "border-status-warning/40 bg-status-warning/10 text-status-warning"
+    : "border-violet-700/40 bg-violet-950/30 text-violet-300";
+  return (
+    <Tooltip text={text} multiline>
+      <span
+        aria-label={`Background: ${summary.live} live${unacked ? ", some lost" : ""}`}
+        className={`inline-flex shrink-0 items-center gap-0.5 rounded border px-1 py-0 text-[10px] font-medium tabular-nums ${tone}`}
+      >
+        <span aria-hidden="true">⌚</span>
+        {summary.live}
+        {unacked && <span aria-hidden="true">!</span>}
+      </span>
+    </Tooltip>
   );
 }
 

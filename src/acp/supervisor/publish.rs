@@ -201,6 +201,20 @@ impl<S: BroadcastSink> Supervisor<S> {
         cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
     }
 
+    /// The worker's background items died with it.
+    pub fn mark_background_lost(
+        &self,
+        session_id: &str,
+        cause: crate::acp::state::BackgroundLossCause,
+    ) -> usize {
+        mark_background_lost_via(&*self.sink, &self.next_seqs, session_id, cause)
+    }
+
+    /// Record that the agent was told about losses up to `up_to`.
+    pub fn note_background_losses(&self, session_id: &str, up_to: chrono::DateTime<chrono::Utc>) {
+        self.publish_next(session_id, &Event::BackgroundLossNoted { up_to });
+    }
+
     /// Detach background sub-agents the previous daemon left outstanding.
     /// See [`detach_orphaned_background_agents_on`].
     pub(super) fn detach_orphaned_background_agents(&self, session_id: &str) {
@@ -294,6 +308,30 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
 
 /// Cancel approvals and elicitations a dead worker left unresolved in the log:
 /// their responders died with it, so the cards would fail on submit.
+/// End every live background item of a session whose worker is gone.
+pub(super) fn mark_background_lost_via<S: BroadcastSink + ?Sized>(
+    sink: &S,
+    next_seqs: &SeqMap,
+    session_id: &str,
+    cause: crate::acp::state::BackgroundLossCause,
+) -> usize {
+    let live = sink.live_background_items(session_id);
+    let at = chrono::Utc::now();
+    for item in &live {
+        sink.publish(
+            session_id,
+            next_seq(next_seqs, session_id),
+            &Event::BackgroundItemEnded {
+                id: item.id.clone(),
+                reason: crate::acp::state::BackgroundEndReason::Lost,
+                cause: Some(cause),
+                at,
+            },
+        );
+    }
+    live.len()
+}
+
 pub(super) fn cancel_orphaned_requests_on<S: BroadcastSink>(
     sink: &S,
     next_seqs: &SeqMap,

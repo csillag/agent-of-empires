@@ -6,7 +6,7 @@ use tokio::sync::broadcast;
 
 use crate::acp::approvals::Nonce;
 use crate::acp::event_store::{AttachmentBlob, EventStore, UnresolvedBackgroundAgentLaunch};
-use crate::acp::state::{Event, RateLimitInfo};
+use crate::acp::state::{BackgroundItem, Event, RateLimitInfo};
 
 /// Destination for published events; test sinks override only what they observe.
 pub trait BroadcastSink: Send + Sync + 'static {
@@ -34,6 +34,10 @@ pub trait BroadcastSink: Send + Sync + 'static {
     /// `BackgroundAgentCompleted`: sub-agents a dead worker's tailer will
     /// never report on again.
     fn unresolved_background_agent_ids(&self, _session_id: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// Background items still live for the session. Empty for sinks without a store.
+    fn live_background_items(&self, _session_id: &str) -> Vec<BackgroundItem> {
         Vec::new()
     }
     /// The same rows, carrying `output_file` so `Supervisor::attach` can
@@ -88,6 +92,14 @@ impl BroadcastSink for ChannelSink {
 
     fn unresolved_background_agent_ids(&self, session_id: &str) -> Vec<String> {
         self.event_store.unresolved_background_agent_ids(session_id)
+    }
+
+    fn live_background_items(&self, session_id: &str) -> Vec<BackgroundItem> {
+        self.event_store
+            .background_items(session_id, chrono::Utc::now())
+            .into_iter()
+            .filter(|item| item.is_live())
+            .collect()
     }
 
     fn unresolved_background_agent_launches(

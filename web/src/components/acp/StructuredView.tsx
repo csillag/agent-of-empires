@@ -11,6 +11,7 @@ import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
+import type { BackgroundSummary } from "../../lib/types";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
@@ -20,7 +21,8 @@ import { AcpRuntime, type AcpContext } from "./AcpRuntime";
 import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AttentionChime } from "./AttentionChime";
-import { BackgroundAgentsContext } from "./backgroundAgentsContext";
+import { BackgroundAgentsContext, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
+import { BackgroundPanel } from "./BackgroundPanel";
 import { CompactionReminderBanner } from "./CompactionReminderBanner";
 import { Composer } from "./Composer";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
@@ -59,6 +61,8 @@ interface Props {
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
   onOpenAgentsPane?: () => void;
+  /** Background work of this session, from the sessions API. */
+  background?: BackgroundSummary;
 }
 
 const STARTER_PROMPTS = [
@@ -153,6 +157,7 @@ function AcpChrome({
 }: ChromeProps) {
   const { sessionId, acpWorkerState, acpAgent } = view;
   const { state, status } = ctx;
+  const openAgentsPane = useOpenBackgroundAgentsPane();
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
   const [primerPrefill, setPrimerPrefill] = useState<Prefill>(null);
@@ -237,6 +242,12 @@ function AcpChrome({
         snoozedUntil={view.snoozedUntil}
         onRestore={view.onRestore}
         dismissError={ctx.dismissError}
+      />
+      <BackgroundPanel
+        sessionId={sessionId}
+        summary={view.background}
+        turnActive={state.turnActive}
+        onOpenAgentsPane={openAgentsPane}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
