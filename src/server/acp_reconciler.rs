@@ -3428,7 +3428,7 @@ mod tests {
     #[serial_test::serial]
     async fn a_drained_stale_worker_settles_then_is_retired_as_one_restart() {
         let id = "s-drained";
-        let (state, _home, _project) = capacity_test_state(id).await;
+        let (_home, state, _project) = capacity_test_state(id).await;
         let ended_at = Utc::now().timestamp_millis() - 60_000;
         state
             .acp_event_store
@@ -3838,7 +3838,7 @@ mod tests {
                 true,
             ),
         ] {
-            let (state, _home, _project) = capacity_test_state(id).await;
+            let (_home, state, _project) = capacity_test_state(id).await;
             let flagged_at = Utc::now().timestamp_millis() - 60_000;
             // Sub-agent rows come only from upstream's launch event.
             let started = if kind == BackgroundKind::Subagent {
