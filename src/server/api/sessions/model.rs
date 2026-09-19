@@ -17,7 +17,6 @@ impl SessionResponse {
             crate::daemon::AcpWorkerState::Absent,
             None,
             None,
-            None,
         )
     }
 
@@ -31,7 +30,6 @@ impl SessionResponse {
         acp_worker_state: crate::daemon::AcpWorkerState,
         next_wakeup_at: Option<String>,
         next_wakeup_reason: Option<String>,
-        background: Option<crate::acp::background::BackgroundSummary>,
     ) -> Self {
         Self {
             id: inst.id.clone(),
@@ -186,7 +184,7 @@ impl SessionResponse {
             plan_summary,
             next_wakeup_at,
             next_wakeup_reason,
-            background,
+            background: None,
         }
     }
 }

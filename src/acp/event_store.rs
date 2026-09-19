@@ -864,29 +864,29 @@ impl EventStore {
         // `agent_id`, `description`, `started_at`, `ended_at`). One live
         // session measured 421 KB of that dead weight per `/api/sessions`
         // poll; strip it in SQL so it never leaves the database.
-        let sql = format!(
-            "SELECT created_at, CASE discriminant \
-             WHEN 'BackgroundAgentLaunched' THEN json_set(event_json, '$.BackgroundAgentLaunched.prompt', '') \
-             WHEN 'BackgroundAgentCompleted' THEN json_set(event_json, '$.BackgroundAgentCompleted.tools', json('[]')) \
-             ELSE event_json END \
-             FROM {} WHERE session_id = ?1 AND discriminant IN \
-             ('BackgroundItemStarted','BackgroundItemEnded','WakeupScheduled',\
-              'BackgroundAgentLaunched','BackgroundAgentCompleted') ORDER BY seq",
-            self.schema.events_table()
-        );
-        let rows = match conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(params![session_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        }) {
-            Ok(rows) => rows,
+        let rows = match conn
+            .prepare(&background_items_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(mut rows) => {
+                drop(conn);
+                rows.sort_unstable_by_key(|(seq, _, _)| *seq);
+                rows
+            }
             Err(e) => {
                 warn!(target: "acp.event_store", session = %session_id, "background_items: {e}");
                 return Vec::new();
             }
         };
-        let events = rows.into_iter().filter_map(|(ms, json)| {
+        let events = rows.into_iter().filter_map(|(_, ms, json)| {
             let at = DateTime::from_timestamp_millis(ms)?;
             serde_json::from_str::<Event>(&json).ok().map(|e| (at, e))
         });
@@ -927,14 +927,12 @@ impl EventStore {
                     && cause.is_some_and(|c| c.wakes_agent())
                     && up_to.is_none_or(|up_to| at > up_to)
             };
-        let sql = format!(
-            "SELECT event_json FROM {} WHERE session_id = ?1 AND discriminant = 'BackgroundItemEnded'",
-            self.schema.events_table()
-        );
-        let any_new_loss = match conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        }) {
+        let any_new_loss = match conn
+            .prepare(&background_ends_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
             Ok(rows) => rows
                 .iter()
                 .any(|json| match serde_json::from_str::<Event>(json) {
@@ -2398,6 +2396,29 @@ fn make_snippet(text: &str, needle: &str) -> String {
         snippet.push('…');
     }
     snippet
+}
+
+/// `INDEXED BY` with the sort left to the caller: under `ORDER BY seq`
+/// SQLite walked every row of the session via `session_seq` (137 MB for one
+/// session, per sessions poll, under the store mutex; the 2026-09-19 stall).
+fn background_items_sql(table: &str) -> String {
+    format!(
+        "SELECT seq, created_at, CASE discriminant \
+         WHEN 'BackgroundAgentLaunched' THEN json_set(event_json, '$.BackgroundAgentLaunched.prompt', '') \
+         WHEN 'BackgroundAgentCompleted' THEN json_set(event_json, '$.BackgroundAgentCompleted.tools', json('[]')) \
+         ELSE event_json END \
+         FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant IN \
+         ('BackgroundItemStarted','BackgroundItemEnded','WakeupScheduled',\
+          'BackgroundAgentLaunched','BackgroundAgentCompleted')"
+    )
+}
+
+fn background_ends_sql(table: &str) -> String {
+    format!(
+        "SELECT event_json FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant = 'BackgroundItemEnded'"
+    )
 }
 
 fn event_kind(event: &Event) -> &'static str {
@@ -3880,6 +3901,31 @@ mod tests {
             .unwrap();
         let pending = store.latest_pending_wakeup("s-1").expect("pending");
         assert_eq!(pending.1.as_deref(), Some("rescheduled"));
+    }
+
+    /// Every registry query seeks the discriminant index. Walking the
+    /// session's rows instead stalled the daemon (2026-09-19).
+    #[test]
+    fn background_queries_seek_the_discriminant_index() {
+        let (_tmp, store) = open_store(1000);
+        let conn = store.conn.lock().unwrap();
+        let table = store.schema.events_table();
+        for sql in [background_items_sql(table), background_ends_sql(table)] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params!["s-1"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(plan.len(), 1, "{plan:?}");
+            assert!(
+                plan[0].contains(&format!(
+                    "USING INDEX idx_{table}_session_discriminant_seq (session_id=? AND discriminant=?)"
+                )),
+                "{plan:?}"
+            );
+        }
     }
 
     #[test]

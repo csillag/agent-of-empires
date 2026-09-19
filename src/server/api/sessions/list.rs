@@ -70,15 +70,6 @@ pub async fn list_sessions(
             } else {
                 (None, None)
             };
-            let background = if structured_live {
-                crate::acp::background::BackgroundSummary::from_items(
-                    state
-                        .acp_event_store
-                        .background_items(&inst.id, chrono::Utc::now()),
-                )
-            } else {
-                None
-            };
             let acp_worker_state = worker_states
                 .get(&inst.id)
                 .copied()
@@ -90,7 +81,6 @@ pub async fn list_sessions(
                 acp_worker_state,
                 next_wakeup_at,
                 next_wakeup_reason,
-                background,
             );
             if structured_live && acp_worker_state == crate::daemon::AcpWorkerState::Running {
                 // Gate on a live worker: the invariant (supervisor.rs) is that
@@ -274,10 +264,39 @@ pub async fn list_sessions(
         "list_sessions resolved session config once per unique profile/project pair"
     );
 
+    // Off the runtime thread: a slow store read must not stall the handler.
+    let background_probes: Vec<(usize, String)> = scoped_instances
+        .iter()
+        .enumerate()
+        .filter(|(_, inst)| inst.is_structured() && !inst.is_archived() && !inst.is_trashed())
+        .map(|(i, inst)| (i, inst.id.clone()))
+        .collect();
+
     // The park probe touches config files and SQLite; run it with the
     // session registry unlocked so writers are not held behind it.
     drop(scoped_instances);
     drop(instances);
+    if !background_probes.is_empty() {
+        let store = Arc::clone(&state.acp_event_store);
+        let summaries = tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now();
+            background_probes
+                .into_iter()
+                .map(|(i, id)| {
+                    let items = store.background_items(&id, now);
+                    (
+                        i,
+                        crate::acp::background::BackgroundSummary::from_items(items),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .unwrap_or_default();
+        for (i, summary) in summaries {
+            sessions[i].background = summary;
+        }
+    }
     if !park_probes.is_empty() {
         let store = Arc::clone(&state.acp_event_store);
         let overlays = tokio::task::spawn_blocking(move || {

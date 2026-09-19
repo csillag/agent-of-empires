@@ -1475,15 +1475,8 @@ fn session_response_carries_the_background_summary() {
     };
     let summary = crate::acp::background::BackgroundSummary::from_items(vec![item]).unwrap();
 
-    let resp = SessionResponse::from_instance_with_plan(
-        &inst,
-        false,
-        None,
-        crate::daemon::AcpWorkerState::Absent,
-        None,
-        None,
-        Some(summary),
-    );
+    let mut resp = SessionResponse::from_instance(&inst, false);
+    resp.background = Some(summary);
     let json = serde_json::to_value(&resp).unwrap();
     assert_eq!(json["background"]["live"], 1);
     assert_eq!(json["background"]["items"][0]["kind"], "monitor");
