@@ -848,14 +848,24 @@ async fn repair_missing_terminal(state: &Arc<AppState>) {
 fn should_auto_stop(
     now_ms: i64,
     last_event_ms: Option<i64>,
+    worker_started_ms: Option<i64>,
     threshold_secs: u32,
     in_flight: bool,
 ) -> bool {
     if threshold_secs == 0 || in_flight {
         return false;
     }
+    let window_ms = i64::from(threshold_secs) * 1000;
+    // A worker younger than the threshold cannot have been idle for it,
+    // whatever the event store says. Without this a prompt-wake is reaped by
+    // its own idle pass: waking spawns the worker BEFORE any event records the
+    // prompt, so the newest row is still the one from before the session went
+    // dormant. `None` (no registry record) falls back to the event age.
+    if worker_started_ms.is_some_and(|ms| now_ms.saturating_sub(ms) < window_ms) {
+        return false;
+    }
     match last_event_ms {
-        Some(ms) => now_ms.saturating_sub(ms) >= i64::from(threshold_secs) * 1000,
+        Some(ms) => now_ms.saturating_sub(ms) >= window_ms,
         None => false,
     }
 }
@@ -952,10 +962,35 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
     let now_ms = chrono::Utc::now().timestamp_millis();
     for (id, profile, idle_secs) in live {
         // Cheap pre-check (no in-flight probe yet): skips sessions with no
-        // history or still within the idle window. Sessions with no events
-        // are never reaped, so a freshly-spawned worker is safe.
-        let last_ms = latest.get(&id).copied();
-        if !should_auto_stop(now_ms, last_ms, idle_secs, false) {
+        // history or still within the idle window.
+        // The store can stay quiet while the worker is busy: after a respawn's
+        // session/load, transcript events are dropped as history replay until
+        // the next prompt, so a turn the agent starts itself never reaches it.
+        // The connection's own notification clock still moves.
+        let live_ms = state.acp_supervisor.last_notification_ms(&id).await;
+        let last_ms = latest.get(&id).copied().max(live_ms);
+        if !should_auto_stop(now_ms, last_ms, None, idle_secs, false) {
+            continue;
+        }
+        // Only now read the worker's own age, so the file read is paid for the
+        // few sessions that are actually reap candidates rather than every
+        // live worker on every pass.
+        let worker_started_ms = crate::process::worker_registry::load(&id)
+            .ok()
+            .flatten()
+            .and_then(|rec| i64::try_from(rec.started_at).ok())
+            .map(|secs| secs.saturating_mul(1000));
+        // A worker blocked on the owner's answer is waiting, not idle:
+        // stopping it kills the question, and the card's answer then 404s.
+        let store = Arc::clone(&state.acp_event_store);
+        let id_probe = id.clone();
+        let awaiting_owner = tokio::task::spawn_blocking(move || {
+            !store.unresolved_elicitation_nonces(&id_probe).is_empty()
+                || !store.unresolved_approval_nonces(&id_probe).is_empty()
+        })
+        .await
+        .unwrap_or(true);
+        if awaiting_owner {
             continue;
         }
         // Re-check mid-turn right before stopping: a turn may have started
@@ -966,7 +1001,7 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         let in_flight = tokio::task::spawn_blocking(move || store.has_in_flight_turn(&id_probe))
             .await
             .unwrap_or(false);
-        if !should_auto_stop(now_ms, last_ms, idle_secs, in_flight) {
+        if !should_auto_stop(now_ms, last_ms, worker_started_ms, idle_secs, in_flight) {
             continue;
         }
         // A turn the agent opened itself has no prompt behind it, so the probe
@@ -2700,19 +2735,19 @@ mod tests {
     #[test]
     fn disabled_threshold_never_stops() {
         // threshold 0 = feature off; even a worker idle for a day survives.
-        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), 0, false));
+        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), None, 0, false));
     }
 
     #[test]
     fn in_flight_worker_is_never_stopped() {
         // Idle far past the threshold, but mid-turn: do not kill.
-        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), 3600, true));
+        assert!(!should_auto_stop(HOUR_MS * 24, Some(0), None, 3600, true));
     }
 
     #[test]
     fn idle_past_threshold_stops() {
         // Last event 2h ago, threshold 1h, not mid-turn: reap.
-        assert!(should_auto_stop(HOUR_MS * 2, Some(0), 3600, false));
+        assert!(should_auto_stop(HOUR_MS * 2, Some(0), None, 3600, false));
     }
 
     #[test]
@@ -2720,19 +2755,52 @@ mod tests {
         // Last event 30min ago, threshold 1h: too soon.
         let now = HOUR_MS;
         let last = HOUR_MS / 2;
-        assert!(!should_auto_stop(now, Some(last), 3600, false));
+        assert!(!should_auto_stop(now, Some(last), None, 3600, false));
     }
 
     #[test]
     fn no_events_never_stops() {
         // A worker with no recorded events (fresh spawn) is never reaped.
-        assert!(!should_auto_stop(HOUR_MS * 24, None, 3600, false));
+        assert!(!should_auto_stop(HOUR_MS * 24, None, None, 3600, false));
     }
 
     #[test]
     fn exactly_at_threshold_stops() {
         // Boundary: elapsed == threshold reaps (>= comparison).
-        assert!(should_auto_stop(3600 * 1000, Some(0), 3600, false));
+        assert!(should_auto_stop(3600 * 1000, Some(0), None, 3600, false));
+    }
+
+    /// The prompt-wake race: a session dormant for hours is woken by a prompt,
+    /// which spawns a worker BEFORE any event records that prompt, so the
+    /// newest row is still hours old. Reaping on that alone kills the new
+    /// worker mid-handshake, which is what happened on 2026-09-08 (the spawn
+    /// died with "control channel closed during initialize" 330ms in).
+    #[test]
+    fn a_just_spawned_worker_is_never_reaped_however_old_the_last_event() {
+        let now = HOUR_MS * 24;
+        let ancient_event = Some(0);
+        let worker_started_a_moment_ago = Some(now - 300);
+        assert!(
+            !should_auto_stop(now, ancient_event, worker_started_a_moment_ago, 3600, false),
+            "a worker 300ms old cannot have been idle for an hour"
+        );
+        // Same session once the worker itself has aged past the window.
+        let worker_started_long_ago = Some(now - HOUR_MS * 2);
+        assert!(should_auto_stop(
+            now,
+            ancient_event,
+            worker_started_long_ago,
+            3600,
+            false
+        ));
+    }
+
+    /// No registry record means no age to check, so the decision falls back to
+    /// the event age exactly as before.
+    #[test]
+    fn unknown_worker_age_falls_back_to_event_age() {
+        assert!(should_auto_stop(HOUR_MS * 24, Some(0), None, 3600, false));
+        assert!(!should_auto_stop(HOUR_MS * 24, None, None, 3600, false));
     }
 
     // --- CapacityFull as a first-class transient (#1027) ---

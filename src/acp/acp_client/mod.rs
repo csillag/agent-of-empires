@@ -107,6 +107,8 @@ pub struct AcpClient {
     /// Pid of the detached `aoe __acp-runner` this client launched, so the
     /// supervisor can identify the exact process its lease owns.
     runner_pid: Option<u32>,
+    /// See [`AcpClient::last_notification_ms`]. 0 = no notification yet.
+    last_notification_at: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Per-session resources the connection task uses to handle ACP fs/* and
@@ -138,6 +140,20 @@ impl AcpClient {
 
     /// Pid of the runner this client spawned, if any. Attached and
     /// stdio clients have none; their identity comes from the registry.
+    /// Wall-clock ms of the last notification this connection received from
+    /// the agent, or `None` before the first. Bumped before any filtering, so it
+    /// moves even while post-load replay suppression keeps the event store
+    /// quiet, which is what the idle reaper needs to tell busy from idle.
+    pub fn last_notification_ms(&self) -> Option<i64> {
+        match self
+            .last_notification_at
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            0 => None,
+            ms => Some(ms),
+        }
+    }
+
     pub fn runner_pid(&self) -> Option<u32> {
         self.runner_pid
     }
@@ -159,6 +175,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            last_notification_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
         (client, event_tx)
     }
@@ -180,6 +197,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            last_notification_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         }
     }
 
@@ -218,6 +236,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            last_notification_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
         (client, event_tx, saw_delete)
     }
@@ -274,6 +293,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            last_notification_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
         (client, event_tx, cmds)
     }
@@ -312,6 +332,7 @@ impl AcpClient {
             pending_responders: Arc::new(Mutex::new(HashMap::new())),
             _child: None,
             runner_pid: None,
+            last_notification_at: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         };
         (client, event_tx)
     }
@@ -502,6 +523,7 @@ impl AcpClient {
         // per-session log tee routes by that field (#1864). The span name
         // must match `crate::acp::session_tee::SESSION_SPAN`.
         let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        let last_notification_at = Arc::new(std::sync::atomic::AtomicI64::new(0));
         tokio::spawn(
             run_connection_task(
                 transport,
@@ -529,6 +551,7 @@ impl AcpClient {
                 None,
                 None,
                 None,
+                last_notification_at.clone(),
             )
             .instrument(conn_span),
         );
@@ -542,6 +565,7 @@ impl AcpClient {
             pending_responders,
             _child: Some(child),
             runner_pid: None,
+            last_notification_at,
         })
     }
 
@@ -662,6 +686,7 @@ impl AcpClient {
         // an `acp_session` span so per-session log teeing (#1864) catches
         // events that do not set the `session` field explicitly.
         let conn_span = tracing::info_span!("acp_session", session = %session_label);
+        let last_notification_at = Arc::new(std::sync::atomic::AtomicI64::new(0));
         tokio::spawn(
             run_connection_task(
                 transport,
@@ -685,6 +710,7 @@ impl AcpClient {
                 external_terminal_guard,
                 external_prompt_in_flight,
                 control_client,
+                last_notification_at.clone(),
             )
             .instrument(conn_span),
         );
@@ -698,6 +724,7 @@ impl AcpClient {
             pending_responders,
             _child: None,
             runner_pid: None,
+            last_notification_at,
         })
     }
 
