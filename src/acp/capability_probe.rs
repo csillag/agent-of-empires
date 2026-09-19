@@ -76,6 +76,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         host_environment: Vec::new(),
         default_effort: None,
         default_effort_explicit: false,
+        default_model: None,
         default_mode: None,
         // In-process stdio: no detached runner, no persistent worker entry.
         socket_path: None,

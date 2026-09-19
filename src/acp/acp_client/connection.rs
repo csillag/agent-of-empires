@@ -30,7 +30,7 @@ use super::between_prompt::{
 use super::commands::{ClientCmd, ConnectMode};
 use super::config_options::{
     config_options_event, dispatch_set_config_option, dispatch_set_mode, mode_config_id,
-    thought_level_config_id, ConfigOptionDispatchPurpose,
+    model_config_id, thought_level_config_id, ConfigOptionDispatchPurpose,
 };
 use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonControlClient};
 use super::delete::handle_delete_session_cmd;
@@ -168,6 +168,7 @@ pub(super) async fn run_connection_task<W, R>(
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_model: Option<String>,
     default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
     // Shared terminal guard for a completion reported by an attached runner.
@@ -1040,6 +1041,11 @@ pub(super) async fn run_connection_task<W, R>(
             // effort only on a fresh session is what made a picked effort revert
             // on every respawn.
             let mut thought_level_config_option_id: Option<String> = None;
+            // Model option id, captured from the same three branches and for
+            // the same reason: a respawn resumes via session/load, which
+            // restores the transcript's model, so a pin applied only on a
+            // fresh session reverts on every restart.
+            let mut model_config_option_id: Option<String> = None;
 
             // Drop any http/sse servers the agent did not advertise before they
             // reach session/new or session/load; stdio is always kept. Computed
@@ -1188,6 +1194,11 @@ pub(super) async fn run_connection_task<W, R>(
                                     .as_deref()
                                     .and_then(thought_level_config_id)
                                     .map(|id| id.0.to_string());
+                                model_config_option_id = resp
+                                    .config_options
+                                    .as_deref()
+                                    .and_then(model_config_id)
+                                    .map(|id| id.0.to_string());
                                 // Surface agent-advertised modes (when carried in
                                 // the ACP `modes` field rather than the `mode`
                                 // config option), mirroring session/new so a fork
@@ -1330,6 +1341,11 @@ pub(super) async fn run_connection_task<W, R>(
                                         .as_deref()
                                         .and_then(thought_level_config_id)
                                         .map(|id| id.0.to_string());
+                                    model_config_option_id = resp
+                                        .config_options
+                                        .as_deref()
+                                        .and_then(model_config_id)
+                                        .map(|id| id.0.to_string());
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -1450,6 +1466,11 @@ pub(super) async fn run_connection_task<W, R>(
                             .as_deref()
                             .and_then(thought_level_config_id)
                             .map(|id| id.0.to_string());
+                        model_config_option_id = new_session
+                            .config_options
+                            .as_deref()
+                            .and_then(model_config_id)
+                            .map(|id| id.0.to_string());
 
                         // Surface the agent-advertised modes (if any) so the UI
                         // can render the actual modes the agent supports rather
@@ -1538,6 +1559,56 @@ pub(super) async fn run_connection_task<W, R>(
                     }
                 }
             };
+
+            // Apply the session's pinned model once, after whichever establish
+            // call ran and before the effort below: effort vocabularies are
+            // per-model, so a model switch applied second would invalidate an
+            // effort applied first. This sits outside the branches for the same
+            // reason the effort does. `Instance.agent_model` also travels as
+            // AOE_AGENT_MODEL, but only aoe's own agent reads that variable, and
+            // a respawn resumes via session/load, which restores the model
+            // recorded in the resumed transcript. Without this re-apply a picked
+            // model silently reverts on every worker restart. Strict like the
+            // mode default: a value the agent no longer advertises is rejected
+            // and warned, never failing the spawn.
+            if let (Some(model), Some(config_id)) =
+                (default_model.as_deref(), model_config_option_id.as_deref())
+            {
+                info!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    model,
+                    "applying structured view model"
+                );
+                match connection
+                    .send_request(SetSessionConfigOptionRequest::new(
+                        acp_session_id.clone(),
+                        SessionConfigId::new(config_id.to_string()),
+                        SessionConfigValueId::new(model.to_string()),
+                    ))
+                    .block_task()
+                    .await
+                {
+                    Ok(resp) => {
+                        if let Some(event) = config_options_event(Some(resp.config_options)) {
+                            let _ = event_tx_for_block.send(event).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "structured view model failed: {e}"
+                        );
+                    }
+                }
+            } else if default_model.is_some() {
+                debug!(
+                    target: "acp.protocol",
+                    session = %session_label,
+                    "structured view model skipped; no model option"
+                );
+            }
 
             // Apply the session's reasoning effort ("thought level") once, after
             // whichever establish call ran. This sits outside the branches on
@@ -2981,6 +3052,10 @@ pub(super) async fn run_connection_task<W, R>(
                                     new_session.config_options.as_deref();
                                 for (value, config_id) in [
                                     (
+                                        default_model.as_deref(),
+                                        reset_config_options.and_then(model_config_id),
+                                    ),
+                                    (
                                         default_effort.as_deref(),
                                         reset_config_options
                                             .and_then(thought_level_config_id),
@@ -3331,6 +3406,7 @@ mod cancel_fairness_tests {
                 Some(ready_tx),
                 &crate::acp::agent_profiles::GEMINI,
                 ExpectedAgent::Gemini,
+                None,
                 None,
                 None,
                 None,

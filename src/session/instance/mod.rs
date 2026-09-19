@@ -548,9 +548,24 @@ pub struct Instance {
     /// Optional model id, injected at spawn as `AOE_AGENT_MODEL` (e.g.,
     /// "claude-opus-4-7", "gpt-5", "gemini-2.5-pro"). Only `aoe-agent` reads
     /// it, and it routes Anthropic, OpenAI and Google ids only, by bare
-    /// prefix or an explicit `anthropic:`/`openai:`/`google:` prefix.
+    /// prefix or an explicit `anthropic:`/`openai:`/`google:` prefix. Every
+    /// other adapter learns the model through the config option instead, and
+    /// only when `agent_model_pending` says it has not learned it yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
+    /// Set when `agent_model` was picked with no worker running to take it, so
+    /// the next spawn must assert it through the agent's model config option.
+    /// Cleared once a spawn has carried it. A pick that reached a live agent
+    /// needs no flag: the agent already has it.
+    ///
+    /// Deliberately NOT "re-apply `agent_model` on every spawn". A stored pin
+    /// can be older than a model the user has since chosen outside aoe (Claude
+    /// Code's own `settings.json`, or `/model` in a terminal session), and
+    /// asserting the stale one over the newer would silently change the model a
+    /// running session answers on, with nothing in the transcript saying so.
+    /// aoe's copy wins only while it carries intent no agent has seen.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub agent_model_pending: bool,
     /// Reasoning effort ("thought level") this session was explicitly pinned
     /// to, applied through the agent's `category:"thought_level"` config
     /// option after every worker (re)spawn. `None` means the session inherits

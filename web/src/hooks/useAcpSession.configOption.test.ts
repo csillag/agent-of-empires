@@ -56,6 +56,36 @@ describe("acpHookReducer / config option actions", () => {
     expect(next.configOptionSwitchFailed).toBeNull();
   });
 
+  it("dismiss_config_option_deferred clears the notice", () => {
+    const seeded = {
+      ...emptyAcpState(),
+      configOptionDeferred: {
+        configId: "model",
+        value: "opus[1m]",
+        at: new Date().toISOString(),
+      },
+    };
+    const next = acpHookReducer(seeded, {
+      kind: "dismiss_config_option_deferred",
+    });
+    expect(next.configOptionDeferred).toBeNull();
+  });
+
+  it("config_option_deferred replaces a pending click with the notice", () => {
+    const seeded = acpHookReducer(emptyAcpState(), {
+      kind: "set_pending_config_option",
+      configId: "model",
+      value: "opus[1m]",
+    });
+    const next = acpHookReducer(seeded, {
+      kind: "config_option_deferred",
+      configId: "model",
+      value: "opus[1m]",
+    });
+    expect(next.pendingConfigOption).toBeNull();
+    expect(next.configOptionDeferred).toMatchObject({ configId: "model", value: "opus[1m]" });
+  });
+
   it("set_pending overrides any previous pending click on the same option", () => {
     let state = acpHookReducer(emptyAcpState(), {
       kind: "set_pending_config_option",
@@ -178,11 +208,13 @@ const wrapper = ({ children }: { children: ReactNode }): ReactNode =>
 describe("useAcpSession / setConfigOption", () => {
   let postBodies: Array<{ url: string; body: unknown }>;
   let postShouldFail: number | "throw" | null;
+  let postDeferred: boolean;
 
   beforeEach(() => {
     sockets.length = 0;
     postBodies = [];
     postShouldFail = null;
+    postDeferred = false;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -203,7 +235,9 @@ describe("useAcpSession / setConfigOption", () => {
               status: postShouldFail,
             });
           }
-          return new Response("{}", { status: 202 });
+          return new Response(JSON.stringify(postDeferred ? { applied: "deferred" } : { applied: "live" }), {
+            status: 202,
+          });
         }
         return new Response("{}", { status: 200 });
       }),
@@ -272,6 +306,42 @@ describe("useAcpSession / setConfigOption", () => {
     });
     expect(result.current.state.pendingConfigOption).toBeNull();
     expect(result.current.state.lastError).toMatch(/Network error setting effort/);
+  });
+
+  it("setConfigOption keeps pending on a live 202, waiting for the agent snapshot", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-cfg-live"), {
+      wrapper,
+    });
+    await flushAsync();
+    await act(async () => {
+      await result.current.setConfigOption("model", "claude-sonnet-4-6");
+    });
+    expect(result.current.state.pendingConfigOption).toEqual({
+      configId: "model",
+      value: "claude-sonnet-4-6",
+    });
+    expect(result.current.state.configOptionDeferred).toBeNull();
+  });
+
+  // The rate-limit park: the daemon saved the pick because no worker was
+  // running to take it. Nothing will ever confirm it, so pending has to be
+  // released here or the picker spins until the session resumes.
+  it("setConfigOption clears pending and raises the notice on a deferred 202", async () => {
+    postDeferred = true;
+    const { result } = renderHook(() => useAcpSession("sess-cfg-deferred"), {
+      wrapper,
+    });
+    await flushAsync();
+    await act(async () => {
+      await result.current.setConfigOption("model", "opus[1m]");
+    });
+    expect(result.current.state.pendingConfigOption).toBeNull();
+    expect(result.current.state.configOptionDeferred).toMatchObject({
+      configId: "model",
+      value: "opus[1m]",
+    });
+    // Saved, not failed: no error banner.
+    expect(result.current.state.lastError).toBeNull();
   });
 
   it("dismissConfigOptionSwitchFailed clears a populated notice", async () => {

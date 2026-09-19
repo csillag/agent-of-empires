@@ -136,7 +136,9 @@ export type Action =
       configId: string;
       value: string;
     }
-  | { kind: "dismiss_config_option_switch_failed" };
+  | { kind: "dismiss_config_option_switch_failed" }
+  | { kind: "config_option_deferred"; configId: string; value: string }
+  | { kind: "dismiss_config_option_deferred" };
 
 // Per-session memory and localStorage cache. Versioned keys allow schema
 // invalidation; TTL and LRU limits bound abandoned session state. Refresh an
@@ -854,6 +856,19 @@ export function reducer(state: AcpState, action: Action): AcpState {
   }
   if (action.kind === "dismiss_config_option_switch_failed") {
     return { ...state, configOptionSwitchFailed: null };
+  }
+  if (action.kind === "config_option_deferred") {
+    // The daemon persisted the pick with no worker to apply it, so no
+    // ConfigOptionsUpdated is coming: clear the pending affordance here or it
+    // spins until the session next resumes.
+    return {
+      ...state,
+      pendingConfigOption: null,
+      configOptionDeferred: { configId: action.configId, value: action.value, at: new Date().toISOString() },
+    };
+  }
+  if (action.kind === "dismiss_config_option_deferred") {
+    return { ...state, configOptionDeferred: null };
   }
   return emptyAcpState();
 }
@@ -2109,6 +2124,11 @@ export function useAcpSession(
             kind: "error",
             message: `Could not set ${configId} (${res.status}). ${detail}`.trim(),
           });
+        } else if (await isDeferredConfigOption(res)) {
+          // Persisted without a running agent: it applies on the next spawn,
+          // and nothing will confirm it in the meantime. A body we cannot read
+          // as deferred is treated as live, which keeps the pessimistic path.
+          dispatch({ kind: "config_option_deferred", configId, value });
         }
       } catch (e) {
         dispatch({
@@ -2127,6 +2147,10 @@ export function useAcpSession(
 
   const dismissConfigOptionSwitchFailed = useCallback(() => {
     dispatch({ kind: "dismiss_config_option_switch_failed" });
+  }, []);
+
+  const dismissConfigOptionDeferred = useCallback(() => {
+    dispatch({ kind: "dismiss_config_option_deferred" });
   }, []);
 
   // Cancels the in-flight agent turn (ACP session/cancel). Must only
@@ -2272,6 +2296,7 @@ export function useAcpSession(
     dismissModeSwitchFailed,
     setConfigOption,
     dismissConfigOptionSwitchFailed,
+    dismissConfigOptionDeferred,
   };
 }
 
@@ -2281,6 +2306,15 @@ async function safeText(res: Response): Promise<string> {
   } catch {
     return "";
   }
+}
+
+/** True when a 2xx from `/acp/config-option` says the pick was only persisted,
+ *  because no structured-view worker was running to take it. Anything else,
+ *  including an unreadable body, counts as applied live: the pessimistic
+ *  pending affordance then resolves on the agent's own snapshot as before. */
+async function isDeferredConfigOption(res: Response): Promise<boolean> {
+  const body = await safeJson<{ applied?: string }>(res);
+  return body?.applied === "deferred";
 }
 
 /** Parse a JSON body, `null` on anything unparseable. Used where a missing or

@@ -422,6 +422,9 @@ pub async fn spawn_acp(
         .into_iter()
         .map(|p| (p.key, p.value))
         .collect();
+    // An explicit model on the request is intent the agent has not seen; a
+    // stored one only counts while `agent_model_pending` says so.
+    let assert_model = req.model.is_some() || instance.agent_model_pending;
     let model = req.model.or_else(|| instance.agent_model.clone());
     let effort = instance.acp_effort.clone();
     let stored_acp_session_id = instance.acp_session_id.clone();
@@ -485,6 +488,7 @@ pub async fn spawn_acp(
             additional_dirs: req.additional_dirs,
             provider_env,
             model,
+            assert_model,
             effort,
             effort_explicit: instance.acp_effort.is_some(),
             stored_acp_session_id,
@@ -1110,6 +1114,7 @@ pub async fn switch_acp_agent(
             additional_dirs: vec![],
             provider_env: vec![],
             model: model.clone(),
+            assert_model: model.is_some(),
             // Effort vocabularies are adapter-specific ("high" on one adapter,
             // "xhigh" / "medium" naming on another), so the previous agent's
             // pick is meaningless here. The new agent starts on its configured
@@ -2121,6 +2126,7 @@ pub async fn acp_enable(
     let supervisor = state.acp_supervisor.clone();
     let session_id = id.clone();
     let model = instance.agent_model.clone();
+    let assert_model = instance.agent_model_pending;
     let effort = instance.acp_effort.clone();
     let yolo_mode = instance.yolo_mode;
     let acp_mode_id = instance.acp_mode_id.clone();
@@ -2208,6 +2214,7 @@ pub async fn acp_enable(
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model,
+                assert_model,
                 effort,
                 effort_explicit: instance.acp_effort.is_some(),
                 stored_acp_session_id,
@@ -2531,6 +2538,23 @@ pub struct SetConfigOptionRequest {
     pub value: String,
 }
 
+/// Body of a 202 from `acp_set_config_option`. `applied` tells a client whether
+/// the running agent took the pick now, or whether it was only persisted and
+/// will be applied by the next spawn. The structured view needs the difference:
+/// a deferred pick produces no `ConfigOptionsUpdated`, so its pending affordance
+/// has to be cleared here instead of by the agent's confirmation.
+#[derive(Debug, Serialize)]
+pub struct SetConfigOptionResponse {
+    pub applied: &'static str,
+}
+
+impl SetConfigOptionResponse {
+    const LIVE: Self = Self { applied: "live" };
+    const DEFERRED: Self = Self {
+        applied: "deferred",
+    };
+}
+
 /// Which persisted `Instance` field a successful config-option pick writes to.
 /// Carries the field name for logging and the mutation together so the two
 /// cannot drift apart.
@@ -2555,9 +2579,16 @@ impl PersistedSelector {
         }
     }
 
-    fn apply(self, inst: &mut crate::session::Instance, value: String) {
+    /// `deferred` says no agent took this pick, so a model write also arms
+    /// `agent_model_pending` for the next spawn. A live pick disarms it: the
+    /// agent has the value already, and leaving it armed would make every
+    /// later respawn re-assert a pin that may by then be stale.
+    fn apply(self, inst: &mut crate::session::Instance, value: String, deferred: bool) {
         match self {
-            Self::Model => inst.agent_model = Some(value),
+            Self::Model => {
+                inst.agent_model = Some(value);
+                inst.agent_model_pending = deferred;
+            }
             Self::Mode => inst.acp_mode_id = Some(value),
             Self::ThoughtLevel => inst.acp_effort = Some(value),
         }
@@ -2567,20 +2598,21 @@ impl PersistedSelector {
 /// Write a picked selector value back onto the instance, both in the in-memory
 /// registry (what the reconciler reads to respawn a worker this daemon
 /// lifetime) and on disk (what survives a daemon restart). Called from
-/// `acp_set_config_option` after the live pick succeeds; see the comment there
-/// for why the live call alone is not enough.
+/// `acp_set_config_option` for both outcomes of the live call; `deferred` says
+/// which one, and only a model pick reads it.
 async fn persist_selector(
     state: &Arc<AppState>,
     id: &str,
     selector: PersistedSelector,
     value: &str,
+    deferred: bool,
 ) {
     let profile = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return;
         };
-        selector.apply(inst, value.to_string());
+        selector.apply(inst, value.to_string(), deferred);
         inst.source_profile.clone()
     };
     match crate::session::Storage::new(&profile, state.file_watch.clone()) {
@@ -2589,7 +2621,7 @@ async fn persist_selector(
             let value_owned = value.to_string();
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                    selector.apply(inst, value_owned.clone());
+                    selector.apply(inst, value_owned.clone(), deferred);
                 }
                 Ok(())
             }) {
@@ -2649,6 +2681,11 @@ async fn config_option_category(
 /// through this one endpoint; rejection surfaces as a non-blocking
 /// `Event::ConfigOptionSwitchFailed` notice on the broadcast bus. See
 /// #1403.
+///
+/// With no worker running the pick is persisted rather than refused, and the
+/// 202 says `applied: "deferred"`. The spawn path then applies it after the
+/// handshake. A parked model pick off the agent's active `pin_model` is
+/// refused with 409 instead, because the pin wins at spawn.
 pub async fn acp_set_config_option(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2665,12 +2702,16 @@ pub async fn acp_set_config_option(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    match state
+    // Resolved before the live call because both outcomes need it: a pick that
+    // reaches a running worker is persisted so a respawn keeps it, and a pick
+    // made while no worker runs is persisted INSTEAD of the live call.
+    let selector = persisted_selector_for(&state, &id, &req.config_id).await;
+    let result = state
         .acp_supervisor
         .set_config_option(&id, &req.config_id, &req.value)
-        .await
-    {
-        Ok(()) => {
+        .await;
+    match (result, selector) {
+        (Ok(()), selector) => {
             // Tally plan-mode adoption. claude-agent-acp v0.37.0+ (and OpenCode)
             // advertise the mode picker as a config option of category "mode" and
             // the web picker writes directly through this endpoint, so the plan
@@ -2684,48 +2725,97 @@ pub async fn acp_set_config_option(
                     .plan_mode_seen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            // Persist a model pick so it survives a worker respawn. The live
-            // set_config_option above only reconfigures the running process; the
-            // reconciler re-reads `agent_model` on every spawn and injects it as
-            // AOE_AGENT_MODEL, so without this write-back a respawn reverts to
-            // the stale stored model and silently overrides the agent's own
-            // default. Mirrors the persist step of the agent-switch path above.
-            // ponytail: keys on the well-known "model" config id, which every
-            // current adapter and the frontend use; resolve category == Model
-            // from the session's config_options if a future adapter uses another
-            // id.
-            // A Mode-category pick is persisted for the same reason: the
-            // reconciler re-asserts `acp_mode_id` via `session/set_mode` on
-            // every (re)spawn (#2897), so without the write-back the id stays
-            // at its creation value (commonly None) and a respawn reverts the
-            // session to the adapter's prompting default. See #3086.
-            //
-            // A ThoughtLevel pick is persisted so the handshake can re-apply it
-            // through the agent's thought-level config option; without it a
-            // respawn spawns with `effort: None` and the pick reverts to the
-            // agent default.
-            let selector = if req.config_id == "model" {
-                Some(PersistedSelector::Model)
-            } else {
-                match config_option_category(&state, &id, &req.config_id).await {
-                    Some(crate::acp::state::ConfigOptionCategory::Model) => {
-                        Some(PersistedSelector::Model)
-                    }
-                    Some(crate::acp::state::ConfigOptionCategory::Mode) => {
-                        Some(PersistedSelector::Mode)
-                    }
-                    Some(crate::acp::state::ConfigOptionCategory::ThoughtLevel) => {
-                        Some(PersistedSelector::ThoughtLevel)
-                    }
-                    Some(crate::acp::state::ConfigOptionCategory::Other(_)) | None => None,
-                }
-            };
+            // Persist the pick: the live call above only reconfigures the
+            // running process. Every persisted selector is re-asserted on the
+            // next spawn, model and effort through the agent's config options
+            // and mode through `session/set_mode`, so without this write-back
+            // each reverts to the value the session was created with.
+            // See #2897, #3086.
             if let Some(selector) = selector {
-                persist_selector(&state, &id, selector, &req.value).await;
+                persist_selector(&state, &id, selector, &req.value, false).await;
             }
-            StatusCode::ACCEPTED.into_response()
+            (StatusCode::ACCEPTED, Json(SetConfigOptionResponse::LIVE)).into_response()
         }
-        Err(e) => supervisor_error_response("set_config_option failed", &e),
+        // No worker to reconfigure, but the pick is one the spawn path can
+        // re-apply, so persist it and report it as deferred instead of 404ing.
+        // Without this a session parked on a rate limit is unrecoverable: it is
+        // stopped precisely because of the model the user is trying to change,
+        // and resuming it first only re-hits the same limit. Depends on the
+        // connection task re-asserting `agent_model` after the handshake; a
+        // persisted pick that nothing applies would be a worse lie than the 404.
+        (Err(SupervisorError::UnknownSession(_)), Some(selector)) => {
+            if selector == PersistedSelector::Model {
+                if let Some(pinned) = model_pin_against(&state, &id, &req.value).await {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "model is pinned: this session's agent is pinned to {pinned:?}, \
+                             so {:?} would not apply when it starts",
+                            req.value
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+            persist_selector(&state, &id, selector, &req.value, true).await;
+            (
+                StatusCode::ACCEPTED,
+                Json(SetConfigOptionResponse::DEFERRED),
+            )
+                .into_response()
+        }
+        (Err(e), _) => supervisor_error_response("set_config_option failed", &e),
+    }
+}
+
+/// The active `pin_model` a parked model pick loses to, if any. The spawn
+/// resolves a pin over `Instance.agent_model`, so persisting the pick would
+/// promise a model the session never starts on. Mirrors the plugin path's
+/// `model_pinned` refusal: picking the pinned model itself is allowed.
+async fn model_pin_against(state: &Arc<AppState>, id: &str, value: &str) -> Option<String> {
+    let (tool, agent_override, profile, project_path) = {
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == id)?;
+        (
+            inst.tool.clone(),
+            inst.agent_name.clone(),
+            inst.source_profile.clone(),
+            std::path::PathBuf::from(&inst.project_path),
+        )
+    };
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(&tool, agent_override.as_deref(), &profile, &project_path)
+        .await;
+    let pinned = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .acp
+            .pinned_model_for(&agent)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    (pinned != value.trim()).then_some(pinned)
+}
+
+/// Which persisted selector, if any, a `config_id` maps to. `"model"` is the
+/// well-known id every current adapter and the frontend use; anything else is
+/// resolved by the category the agent advertised.
+async fn persisted_selector_for(
+    state: &Arc<AppState>,
+    id: &str,
+    config_id: &str,
+) -> Option<PersistedSelector> {
+    if config_id == "model" {
+        return Some(PersistedSelector::Model);
+    }
+    match config_option_category(state, id, config_id).await {
+        Some(crate::acp::state::ConfigOptionCategory::Model) => Some(PersistedSelector::Model),
+        Some(crate::acp::state::ConfigOptionCategory::Mode) => Some(PersistedSelector::Mode),
+        Some(crate::acp::state::ConfigOptionCategory::ThoughtLevel) => {
+            Some(PersistedSelector::ThoughtLevel)
+        }
+        Some(crate::acp::state::ConfigOptionCategory::Other(_)) | None => None,
     }
 }
 
@@ -3221,7 +3311,14 @@ mod tests {
             .unwrap();
 
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        persist_selector(&state, &id, PersistedSelector::Model, "claude-sonnet-5").await;
+        persist_selector(
+            &state,
+            &id,
+            PersistedSelector::Model,
+            "claude-sonnet-5",
+            false,
+        )
+        .await;
 
         // In-memory registry updated (what the reconciler reads to respawn).
         assert_eq!(
@@ -3270,7 +3367,14 @@ mod tests {
             .unwrap();
 
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        persist_selector(&state, &id, PersistedSelector::Mode, "agent-full-access").await;
+        persist_selector(
+            &state,
+            &id,
+            PersistedSelector::Mode,
+            "agent-full-access",
+            false,
+        )
+        .await;
 
         // In-memory registry updated (what the reconciler re-asserts on respawn).
         assert_eq!(
@@ -3322,7 +3426,7 @@ mod tests {
             .unwrap();
 
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
-        persist_selector(&state, &id, PersistedSelector::ThoughtLevel, "high").await;
+        persist_selector(&state, &id, PersistedSelector::ThoughtLevel, "high", false).await;
 
         // In-memory registry updated (what the reconciler reads to respawn).
         assert_eq!(
@@ -4487,5 +4591,179 @@ mod tests {
             "wake persist lifts the sunk row (messaging-unarchives)"
         );
         assert!(disk.last_accessed_at.is_some());
+    }
+
+    /// The rate-limit deadlock, end to end at the handler: the session is
+    /// parked so no worker exists, the live `set_config_option` cannot land,
+    /// and the pick used to come back as a 404 that left the user with no way
+    /// off the model that parked the session.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn model_pick_with_no_worker_is_persisted_and_reported_deferred() {
+        use crate::session::test_support::isolate_app_dir;
+        use axum::body::to_bytes;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        inst.agent_model = Some("claude-fable-5-1[1m]".to_string());
+        let id = inst.id.clone();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        // No worker was ever spawned for this id, so the supervisor answers
+        // UnknownSession exactly as it does for a rate-limit park.
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let resp = acp_set_config_option(
+            State(Arc::clone(&state)),
+            Path(id.clone()),
+            Ok(Json(SetConfigOptionRequest {
+                config_id: "model".to_string(),
+                value: "opus[1m]".to_string(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::json!({ "applied": "deferred" })
+        );
+
+        // Persisted both where the reconciler reads it for the next spawn...
+        {
+            let instances = state.instances.read().await;
+            assert_eq!(instances[0].agent_model.as_deref(), Some("opus[1m]"));
+            assert!(
+                instances[0].agent_model_pending,
+                "a pick no agent took must be armed, or the next spawn will not assert it"
+            );
+        }
+        // ...and where it survives a daemon restart.
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let stored = reloaded.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(stored.agent_model.as_deref(), Some("opus[1m]"));
+        assert!(stored.agent_model_pending);
+    }
+
+    /// A pick a live agent accepted must NOT be armed: the agent already has
+    /// it, and arming it would make every later respawn re-assert a pin that
+    /// can by then be older than what the user chose outside aoe.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_live_pick_disarms_the_pending_flag() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        inst.agent_model = Some("opus[1m]".to_string());
+        inst.agent_model_pending = true;
+        let id = inst.id.clone();
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_selector(&state, &id, PersistedSelector::Model, "sonnet", false).await;
+
+        let instances = state.instances.read().await;
+        assert_eq!(instances[0].agent_model.as_deref(), Some("sonnet"));
+        assert!(!instances[0].agent_model_pending);
+    }
+
+    /// The fallback is scoped to picks the spawn path can actually re-apply.
+    /// An option that maps to no persisted selector still 404s, because
+    /// silently accepting it would promise an application that never happens.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unpersistable_pick_with_no_worker_still_404s() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+
+        let inst = crate::session::Instance::new("t", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let resp = acp_set_config_option(
+            State(Arc::clone(&state)),
+            Path(id),
+            Ok(Json(SetConfigOptionRequest {
+                config_id: "something-the-catalog-never-saw".to_string(),
+                value: "x".to_string(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An active `pin_model` wins at spawn, so a parked pick off it is refused
+    /// rather than persisted as a promise the next start would break. Picking
+    /// the pinned model itself is still deferred, as on the plugin path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parked_model_pick_against_a_pin() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        std::fs::write(
+            crate::session::get_app_dir()
+                .expect("isolated app dir")
+                .join("config.toml"),
+            "[acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write config");
+
+        for (value, status, persisted) in [
+            ("opus[1m]", StatusCode::CONFLICT, None),
+            ("claude-pinned", StatusCode::ACCEPTED, Some("claude-pinned")),
+        ] {
+            let mut inst = crate::session::Instance::new("t", "/tmp");
+            inst.source_profile = "default".to_string();
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = acp_set_config_option(
+                State(Arc::clone(&state)),
+                Path(id),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "model".to_string(),
+                    value: value.to_string(),
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(resp.status(), status, "{value}");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            if status == StatusCode::CONFLICT {
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.starts_with("model is pinned"), "{body}");
+            }
+            let instances = state.instances.read().await;
+            assert_eq!(instances[0].agent_model.as_deref(), persisted, "{value}");
+            assert_eq!(
+                instances[0].agent_model_pending,
+                persisted.is_some(),
+                "{value}"
+            );
+        }
     }
 }

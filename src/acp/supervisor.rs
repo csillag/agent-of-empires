@@ -518,6 +518,11 @@ pub struct SpawnRequest {
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
+    /// Assert [`Self::model`] through the agent's model config option after the
+    /// handshake. Set only from `Instance.agent_model_pending`, i.e. when the
+    /// user's pick has not reached an agent yet. The `AOE_AGENT_MODEL` env var
+    /// is exported either way, for aoe's own agent.
+    pub assert_model: bool,
     pub effort: Option<String>,
     /// True for persisted user effort, not a resolved default. Only explicit
     /// effort survives a model-pin change without being re-resolved.
@@ -760,6 +765,10 @@ fn refresh_spawn_model_effort(
     config
         .provider_env
         .retain(|(key, _)| key != "AOE_AGENT_MODEL");
+    // A cached assert must follow a pin that moved, or it would override it.
+    if config.default_model.is_some() {
+        config.default_model = model.clone();
+    }
     if let Some(model) = model {
         config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
     }
@@ -1705,6 +1714,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             additional_dirs,
             provider_env,
             model,
+            assert_model,
             effort,
             effort_explicit,
             stored_acp_session_id,
@@ -1903,7 +1913,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         let mut env = provider_env;
-        if let Some(model) = model {
+        // Kept for aoe's own agent, which reads AOE_AGENT_MODEL. Every other
+        // adapter ignores it, so the same value also travels as
+        // `default_model` and is applied through the config option below.
+        if let Some(model) = model.clone() {
             env.push(("AOE_AGENT_MODEL".into(), model));
         }
 
@@ -1960,6 +1973,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             host_environment,
             default_effort: effort,
             default_effort_explicit: effort_explicit,
+            // `model` is already resolved, so an active pin wins the assert too.
+            default_model: assert_model.then_some(model).flatten(),
             default_mode,
             socket_path: Some(socket_path),
             stored_acp_session_id: stored_acp_session_id.clone(),
@@ -4439,6 +4454,7 @@ mod tests {
             host_environment: vec![],
             default_effort: Some("low".into()),
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -4568,6 +4584,7 @@ mod tests {
             host_environment: vec![],
             default_effort: Some("low".into()),
             default_effort_explicit: true,
+            default_model: None,
             default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
@@ -4599,6 +4616,49 @@ mod tests {
             Some("low"),
             "an explicit effort must survive the pin move"
         );
+    }
+
+    /// A cached model assert (a parked pick) follows a pin that moved between
+    /// launches instead of overriding it; without a pin the pick still applies.
+    #[test]
+    fn respawn_moves_a_cached_model_assert_with_the_pin() {
+        use crate::session::config::AcpAgentDefaults;
+        let pin = AcpAgentDefaults {
+            model: Some("model-b".into()),
+            pin_model: true,
+            ..Default::default()
+        };
+        for (defaults, cached, expected) in [
+            (None, Some("model-a"), Some("model-a")),
+            (Some(&pin), Some("model-a"), Some("model-b")),
+            (Some(&pin), None, None),
+        ] {
+            let mut config = SpawnConfig {
+                wrapper_substitution: None,
+                agent_key: "claude".into(),
+                tool: "claude".into(),
+                spec: spec("claude-agent-acp", &[]),
+                cwd: std::env::temp_dir(),
+                additional_dirs: vec![],
+                provider_env: vec![("AOE_AGENT_MODEL".into(), "model-a".into())],
+                host_environment: vec![],
+                default_effort: None,
+                default_effort_explicit: false,
+                default_model: cached.map(String::from),
+                default_mode: None,
+                socket_path: None,
+                stored_acp_session_id: None,
+                fork_from: None,
+                seed_history_replay: false,
+                artifact_dir: None,
+                sandbox_info: None,
+                source_profile: None,
+                mcp_servers: Vec::new(),
+                generation: 0,
+            };
+            refresh_spawn_model_effort(&mut config, defaults);
+            assert_eq!(config.default_model.as_deref(), expected, "{cached:?}");
+        }
     }
 
     fn ovr(tool: &str, command: &str) -> AgentCommandOverride {
@@ -5024,6 +5084,7 @@ mod tests {
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5258,6 +5319,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5293,6 +5355,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -5506,6 +5569,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(socket_path.clone()),
             stored_acp_session_id: None,
@@ -5595,6 +5659,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5700,6 +5765,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5776,6 +5842,7 @@ cursor-acp-bridge = "agent acp"
             host_environment: vec![],
             default_effort: None,
             default_effort_explicit: false,
+            default_model: None,
             default_mode: None,
             socket_path: Some(tmp.path().join("dummy.sock")),
             stored_acp_session_id: None,
@@ -5922,6 +5989,7 @@ cursor-acp-bridge = "agent acp"
                 host_environment: vec![],
                 default_effort: None,
                 default_effort_explicit: false,
+                default_model: None,
                 default_mode: None,
                 socket_path: Some(tmp.path().join("dummy.sock")),
                 stored_acp_session_id: None,
@@ -7090,6 +7158,7 @@ cursor-acp-bridge = "agent acp"
 
     fn spawn_request(session_id: &str) -> SpawnRequest {
         SpawnRequest {
+            assert_model: false,
             session_id: session_id.into(),
             agent: "claude-code".into(),
             tool: "claude-code".into(),
@@ -7112,6 +7181,7 @@ cursor-acp-bridge = "agent acp"
 
     fn runner_config(socket_path: PathBuf) -> SpawnConfig {
         SpawnConfig {
+            default_model: None,
             wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
@@ -7894,6 +7964,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,
@@ -7967,6 +8038,7 @@ cursor-acp-bridge = "agent acp"
                 additional_dirs: vec![],
                 provider_env: vec![],
                 model: None,
+                assert_model: false,
                 effort: None,
                 effort_explicit: false,
                 stored_acp_session_id: None,

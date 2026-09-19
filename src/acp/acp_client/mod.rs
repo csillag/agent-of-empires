@@ -371,6 +371,7 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
+        let default_model = config.default_model.clone();
         let default_mode = config.default_mode.clone();
         let mcp_servers = config.mcp_servers.clone();
         if let Some(socket_path) = config.socket_path.clone() {
@@ -400,6 +401,7 @@ impl AcpClient {
                 install_binary,
                 source_profile_for_task,
                 default_effort.clone(),
+                default_model.clone(),
                 default_mode.clone(),
                 mcp_servers,
             )
@@ -428,6 +430,7 @@ impl AcpClient {
             install_binary,
             source_profile_for_task,
             default_effort,
+            default_model,
             default_mode,
             mcp_servers,
         )
@@ -451,6 +454,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_model: Option<String>,
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
@@ -515,6 +519,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_model,
                 default_mode,
                 mcp_servers,
                 // Direct stdio agents have no runner and thus no control
@@ -563,6 +568,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_model: Option<String>,
         default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
@@ -673,6 +679,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_model,
                 default_mode,
                 mcp_servers,
                 external_terminal_guard,
@@ -764,8 +771,9 @@ impl AcpClient {
             None,
             // Reattach uses ConnectMode::Resume, which reuses the stored ACP
             // session id without sending session/new or session/load, so
-            // neither default effort/mode nor MCP servers are forwarded here
-            // (they were applied on first connect).
+            // neither default effort/model/mode nor MCP servers are forwarded
+            // here (they were applied on first connect).
+            None,
             None,
             Vec::new(),
         )

@@ -137,16 +137,19 @@ async function handleDeleteSession(params) {
   return {};
 }
 
-// Config-option catalog the shim advertises when SHIM_THOUGHT_LEVEL=1: one
-// thought-level select, the shape claude-agent-acp and codex use for reasoning
-// effort. `thoughtLevel` tracks the currently selected value so a
-// session/set_config_option response reflects the pick.
+// Config-option catalog the shim advertises: a thought-level select under
+// SHIM_THOUGHT_LEVEL=1 and a model select under SHIM_MODEL=1, the shapes
+// claude-agent-acp and codex use for reasoning effort and model. Each module
+// variable tracks the currently selected value so a session/set_config_option
+// response reflects the pick. The model option deliberately uses an id that is
+// not "model", so a test proves the client resolves it by category.
 let thoughtLevel = "medium";
+let model = "shim-default-model";
 
 function configOptions() {
-  if (process.env.SHIM_THOUGHT_LEVEL !== "1") return undefined;
-  return [
-    {
+  const options = [];
+  if (process.env.SHIM_THOUGHT_LEVEL === "1") {
+    options.push({
       id: "thought_level",
       name: "Thinking",
       category: "thought_level",
@@ -156,8 +159,22 @@ function configOptions() {
         { value: "medium", name: "Medium" },
         { value: "high", name: "High" },
       ],
-    },
-  ];
+    });
+  }
+  if (process.env.SHIM_MODEL === "1") {
+    options.push({
+      id: "the-model-picker",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: model,
+      options: [
+        { value: "shim-default-model", name: "Shim Default" },
+        { value: "shim-pinned-model", name: "Shim Pinned" },
+      ],
+    });
+  }
+  return options.length > 0 ? options : undefined;
 }
 
 // SHIM_CONFIG_OPTION_RECORD_FILE, when set, appends one `<configId>=<value>`
@@ -171,6 +188,9 @@ async function handleSetConfigOption(params) {
   }
   if (params.configId === "thought_level") {
     thoughtLevel = params.value;
+  }
+  if (params.configId === "the-model-picker") {
+    model = params.value;
   }
   return { configOptions: configOptions() ?? [] };
 }

@@ -321,6 +321,12 @@ interface NoticeProps {
   onDismiss: () => void;
 }
 
+interface DeferredNoticeProps {
+  deferred: AcpState["configOptionDeferred"];
+  configOptions: AcpState["configOptions"];
+  onDismiss: () => void;
+}
+
 /** Non-blocking notice rendered near the picker when the adapter
  *  rejects a `session/set_config_option`. Auto-dismisses via the
  *  reducer when a later snapshot confirms the requested value; the
@@ -347,6 +353,41 @@ export function ConfigOptionSwitchFailedNotice({ failure, configOptions, onDismi
         onClick={onDismiss}
         aria-label="Dismiss notice"
         className="rounded px-1.5 py-0.5 text-amber-100 hover:bg-amber-700/30"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
+/** Non-blocking notice for a pick the daemon persisted while the session had
+ *  no worker to apply it. The picker still shows the old value, because no
+ *  agent has confirmed anything, so without this the click looks ignored.
+ *  Auto-dismisses via the reducer once a snapshot shows the value applied. */
+export function ConfigOptionDeferredNotice({ deferred, configOptions, onDismiss }: DeferredNoticeProps) {
+  if (!deferred) return null;
+  const config = configOptions.find((c) => c.id === deferred.configId);
+  const optionLabel = config?.options.find((o) => o.value === deferred.value)?.name ?? deferred.value;
+  const configLabel = config?.name ?? deferred.configId;
+  return (
+    <div
+      data-testid="config-option-deferred-notice"
+      role="status"
+      className="flex items-start gap-3 rounded-md border border-surface-600 bg-surface-800 px-3 py-2 text-[12px] text-text-secondary"
+    >
+      <div className="flex-1">
+        <div className="font-medium text-text-primary">
+          {configLabel} will change to {optionLabel} when this session resumes
+        </div>
+        <div className="text-[11px]">
+          Saved. There is no agent running right now, so it takes effect on the next start.
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss notice"
+        className="rounded px-1.5 py-0.5 text-text-secondary hover:bg-surface-700"
       >
         Dismiss
       </button>
