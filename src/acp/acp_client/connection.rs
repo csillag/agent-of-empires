@@ -2522,16 +2522,9 @@ pub(super) async fn run_connection_task<W, R>(
                                                 //
                                                 // An accepted steer proves the
                                                 // agent is alive and took new
-                                                // work, so it counts as progress.
-                                                // Injection pre-empts the current
-                                                // generation, which can swallow an
-                                                // update the silent-orphan
-                                                // watchdog was waiting on; without
-                                                // this the watchdog could kill a
-                                                // healthy agent right after a
-                                                // successful course correction.
-                                                watchdog.apply_signal(
-                                                    LifecycleSignal::Progress,
+                                                // work, and the cost report it
+                                                // triggers is not the turn's end.
+                                                watchdog.apply_steer_injected(
                                                     tokio::time::Instant::now(),
                                                     chrono::Utc::now(),
                                                     watchdog_cfg,
