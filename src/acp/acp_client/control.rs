@@ -225,6 +225,16 @@ impl DaemonControlClient {
         }
     }
 
+    /// Drop the waiter of a turn the daemon ended itself. A late
+    /// `PromptCompleted` for it then matches nothing, and the next `prompt`
+    /// is not refused as a second pending turn.
+    pub(super) fn release_local_prompt(&self) {
+        let mut completion = self.completion.lock().expect("completion mutex poisoned");
+        if matches!(*completion, PromptCompletion::Pending { .. }) {
+            *completion = PromptCompletion::LocalIdle;
+        }
+    }
+
     /// Issue a turn: register the completion oneshot, send the `Prompt`
     /// frame, and return the receiver the prompt loop awaits. The runner
     /// assigns the `session/prompt` id in `PromptStarted` before completing it.
@@ -1950,5 +1960,22 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A turn the daemon ended itself must not leave its waiter parked: the
+    /// next prompt was refused as "already awaiting completion", which ended
+    /// the connection and lost the user's message.
+    #[tokio::test]
+    async fn released_local_prompt_lets_the_next_prompt_through() {
+        let mut peer = PromptControlPeer::new().await;
+        let _first = peer.prompt().await;
+        peer.client.release_local_prompt();
+        let mut second = tokio::time::timeout(std::time::Duration::from_secs(2), peer.prompt())
+            .await
+            .expect("the next prompt must reach the runner");
+        assert!(matches!(
+            second.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
     }
 }

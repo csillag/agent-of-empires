@@ -2535,6 +2535,11 @@ pub(super) async fn run_connection_task<W, R>(
                                         // terminal reason falls through to prompt_complete:
                                         // a clean end, no worker restart, connection task
                                         // survives for the next prompt. See #2237.
+                                        // A v3 runner still holds this turn's waiter;
+                                        // without the release the next prompt is refused.
+                                        if let Some(control) = control_client.as_ref() {
+                                            control.release_local_prompt();
+                                        }
                                         break;
                                     }
                                     if should_fire {
