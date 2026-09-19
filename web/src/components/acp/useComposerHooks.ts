@@ -94,10 +94,18 @@ export function useDraftPersistence(
     // flush: it fires after pagehide, and a plain flush last would drop the
     // rescued text. Latched so the second signal is a no-op; re-armed on return.
     let unloaded = false;
+    let unlatch: ReturnType<typeof setTimeout> | undefined;
     const unloadFlush = () => {
       if (unloaded) return;
       unloaded = true;
       setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
+      // A cancelled beforeunload never gets a later `visible` to clear the
+      // latch. A real unload fires pagehide and hidden in one task, so this
+      // macrotask cannot land between them.
+      clearTimeout(unlatch);
+      unlatch = setTimeout(() => {
+        unloaded = false;
+      }, 0);
     };
     const onHidden = () => {
       if (document.visibilityState === "hidden") unloadFlush();
@@ -110,6 +118,7 @@ export function useDraftPersistence(
       window.removeEventListener("beforeunload", unloadFlush);
       window.removeEventListener("pagehide", unloadFlush);
       document.removeEventListener("visibilitychange", onHidden);
+      clearTimeout(unlatch);
       flush();
     };
   }, [client, sessionId, draftTextRef, taRef]);
