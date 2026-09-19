@@ -383,6 +383,11 @@ pub(super) async fn run_connection_task<W, R>(
     let between_prompt_bg_agents = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
         String,
     >::new()));
+    // Background-item labels come from the tool call's own args.
+    let recent_tool_labels = Arc::new(std::sync::Mutex::new(
+        crate::acp::background::RecentToolLabels::default(),
+    ));
+    let recent_tool_labels_for_notif = recent_tool_labels.clone();
     let prompt_in_flight =
         external_prompt_in_flight.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
     let last_event_at_for_notif = last_event_at.clone();
@@ -443,6 +448,7 @@ pub(super) async fn run_connection_task<W, R>(
             let adopted_turn_active = adopted_turn_active_for_notif.clone();
             let prompt_in_flight = prompt_in_flight_for_notif.clone();
             let tool_context_cache = tool_context_cache_for_notif.clone();
+            let recent_tool_labels = recent_tool_labels_for_notif.clone();
             async move {
                 last_event_at.store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                 last_notification_at
@@ -662,7 +668,14 @@ pub(super) async fn run_connection_task<W, R>(
                     &session_label,
                 )
                 .await;
-                for event in mapped_events {
+                for mut event in mapped_events {
+                    {
+                        let mut labels = recent_tool_labels
+                            .lock()
+                            .expect("tool label mutex poisoned");
+                        labels.observe(&event);
+                        labels.fill_label(&mut event);
+                    }
                     // An async sub-agent launch: spawn a tailer that
                     // follows the agent's on-disk transcript and emits
                     // BackgroundAgent{Progress,Completed}. The tailer
@@ -1683,6 +1696,16 @@ pub(super) async fn run_connection_task<W, R>(
                 }};
             }
 
+            // Ends background items the agent never polls or stops.
+            let mut task_notifications =
+                crate::acp::task_notifications::TaskNotificationFollower::new(
+                    profile,
+                    &bg_transcript_source,
+                    &cwd,
+                    event_tx_for_block.clone(),
+                );
+            task_notifications.follow(&acp_session_id.0);
+
             // The runner normally replays PromptCompleted for the adopted
             // turn. This watchdog is the fallback when neither that completion
             // nor any further turn activity arrives, so the UI cannot remain
@@ -2500,6 +2523,10 @@ pub(super) async fn run_connection_task<W, R>(
                                     if silent_orphan_enabled && !orphan_cancel_sent =>
                                 {
                                     let now = tokio::time::Instant::now();
+                                    // The tailers track each async sub-agent until it ends.
+                                    watchdog.release_async_agent_floor(
+                                        !between_prompt_bg_agents.lock().is_ok_and(|s| s.is_empty()),
+                                    );
                                     let should_fire = watchdog.should_fire(now, watchdog_cfg);
                                     if should_fire
                                         && watchdog.cost_seen()
@@ -3004,6 +3031,7 @@ pub(super) async fn run_connection_task<W, R>(
                                     new_id = %new_id.0,
                                     "conversation reset: session/new succeeded, swapped acp_session_id"
                                 );
+                                task_notifications.follow(&new_id.0);
                                 // Keep every success boundary on the same
                                 // FIFO. SessionCleared folds the transcript
                                 // only after session/new committed, then

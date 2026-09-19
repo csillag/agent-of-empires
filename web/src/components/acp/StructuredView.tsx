@@ -49,7 +49,9 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
-import { BackgroundAgentsContext } from "./backgroundAgentsContext";
+import { BackgroundAgentsContext, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
+import { BackgroundPanel } from "./BackgroundPanel";
+import { waitingOn } from "../../lib/background";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
@@ -88,6 +90,7 @@ import type {
   ToolCall,
 } from "../../lib/acpTypes";
 import { pickMemoryRecall } from "../../lib/memoryRecall";
+import type { BackgroundSummary } from "../../lib/types";
 
 interface Props {
   sessionId: string;
@@ -155,6 +158,8 @@ interface Props {
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
+  /** Background work of this session, from the sessions API. */
+  background?: BackgroundSummary;
 }
 
 const STARTER_PROMPTS = [
@@ -179,6 +184,7 @@ export function StructuredView(props: Props) {
     fileRefSession,
     onOpenAgentsPane,
     isSandboxed,
+    background,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -217,6 +223,7 @@ export function StructuredView(props: Props) {
                   trashedAt={trashedAt}
                   onRestore={onRestore}
                   isSandboxed={isSandboxed}
+                  background={background}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -336,8 +343,10 @@ function AcpChrome({
   loadEarlierHistory,
   loadingEarlierHistory,
   isSandboxed,
+  background,
 }: AcpContext & {
   sessionId: string;
+  background?: BackgroundSummary;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   rateLimitAutoResume?: boolean;
   acpAgent: string | null;
@@ -351,6 +360,10 @@ function AcpChrome({
   onRestore?: () => Promise<boolean> | void;
   isSandboxed?: boolean;
 }) {
+  // Same opener StructuredView published into BackgroundAgentsContext, so a
+  // sub-agent row in BackgroundPanel jumps to the same pane an inline async
+  // Task card does.
+  const openAgentsPane = useOpenBackgroundAgentsPane();
   // Rows preceding the latest `/clear` divider are the hidden history, so the
   // divider's index is the count the banner reports ("12 earlier turns
   // hidden"). See #1101.
@@ -801,12 +814,12 @@ function AcpChrome({
         !state.workerRestarting && (
           <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
         )}
-      {state.monitorArmed &&
-        !state.nextWakeupAt &&
-        !state.turnActive &&
-        !state.startupError &&
-        !state.workerStopped &&
-        !state.workerRestarting && <MonitoringBanner description={state.monitorDescription} />}
+      <BackgroundPanel
+        sessionId={sessionId}
+        summary={background}
+        turnActive={state.turnActive}
+        onOpenAgentsPane={openAgentsPane}
+      />
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
@@ -874,6 +887,7 @@ function AcpChrome({
                       cancelling={state.cancelling}
                       cancelEscalatesAt={state.cancelEscalatesAt}
                       compacting={state.compacting}
+                      waitingOnBackground={background ? waitingOn(background) : null}
                       lastActivityRef={lastActivityRef}
                       onForceEndTurn={forceEndTurn}
                     />
@@ -1487,6 +1501,7 @@ export function WorkingSpinner({
   cancelling,
   cancelEscalatesAt,
   compacting,
+  waitingOnBackground = null,
   lastActivityRef,
   onForceEndTurn,
 }: {
@@ -1495,6 +1510,8 @@ export function WorkingSpinner({
   cancelling: boolean;
   cancelEscalatesAt: string | null;
   compacting: boolean;
+  /** Live sub-agents, workflows or shell commands, e.g. "1 sub-agent". */
+  waitingOnBackground?: string | null;
   lastActivityRef: React.RefObject<number>;
   onForceEndTurn: () => Promise<void>;
 }) {
@@ -1587,7 +1604,9 @@ export function WorkingSpinner({
       : showStalled
         ? toolInFlight
           ? `Waiting on tool… ${formatElapsed(stalledSecs)}`
-          : `Waiting on model… ${formatElapsed(stalledSecs)}`
+          : waitingOnBackground
+            ? `Waiting on background work (${waitingOnBackground})… ${formatElapsed(stalledSecs)}`
+            : `Waiting on model… ${formatElapsed(stalledSecs)}`
         : chooseVerb(state, seed, tool);
   // A cancel is in flight: show the escape hatch even with a tool in
   // flight (the runaway loop IS a tool in flight). The legacy
@@ -1597,7 +1616,9 @@ export function WorkingSpinner({
   // Never offer the hatch during a compaction: it publishes a synthetic
   // Stopped plus a session/cancel, which is exactly the abort #2898 fixed
   // on the daemon side. The deliberate Stop path is still available.
-  const showForceEnd = !cancelling && !compacting && showStalled && !toolInFlight;
+  // Live background work keeps the turn open on purpose, so a quiet model is
+  // not a stall there either.
+  const showForceEnd = !cancelling && !compacting && !waitingOnBackground && showStalled && !toolInFlight;
 
   return (
     <div data-testid="acp-working-spinner" className="flex flex-col gap-2 text-sm italic text-text-muted">
@@ -2111,26 +2132,6 @@ export function ScheduledWakeupBanner({ wakeAt, reason }: { wakeAt: string; reas
       <span className="truncate">
         {label}
         {reason ? <span className="text-sky-300/70">: {reason}</span> : null}
-      </span>
-    </div>
-  );
-}
-
-/** Top-of-structured view chip shown while the agent has an armed
- *  `Monitor` (a background watch). Unlike the wakeup banner there is no
- *  fire time, so this is a static "monitoring" notice with no countdown.
- *  Visible only when no turn is in flight (a firing monitor produces its
- *  own busy chrome) and no other recovery banner is up; clears on the next
- *  user prompt via `state.monitorArmed`. */
-function MonitoringBanner({ description }: { description: string | null }) {
-  return (
-    <div className="flex items-center gap-2 border-b border-violet-900/60 bg-violet-950/40 px-4 py-2 text-xs text-violet-200">
-      <span aria-hidden className="text-base leading-none">
-        👁
-      </span>
-      <span className="truncate">
-        Monitoring a background job
-        {description ? <span className="text-violet-300/70">: {description}</span> : null}
       </span>
     </div>
   );

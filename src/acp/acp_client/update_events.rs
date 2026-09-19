@@ -14,7 +14,7 @@ use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
-    background_agent_launched_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_agent_launched_from_value, background_item_event_from_hook, wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -453,14 +453,21 @@ pub(super) fn map_update_to_events(
                     content: content_text,
                 });
             } else if events.is_empty() {
-                // The async sub-agent launch rides a metadata-only
-                // ToolCallUpdate (`_meta.claudeCode.toolName == "Agent"`,
-                // status "async_launched", no status/content/title), so it
-                // lands here rather than the unknown-variant catch-all
-                // below. Promote it to a typed BackgroundAgentLaunched so
-                // the daemon tails the agent's transcript; otherwise pass
-                // the raw payload through unchanged.
+                // Metadata-only ToolCallUpdates (`_meta.claudeCode`, no
+                // status/content/title) land here rather than the
+                // unknown-variant catch-all below: an async sub-agent
+                // launch, or (Claude only) a PostToolUse hook frame
+                // starting or ending a background item. Promote either to
+                // its typed event; otherwise pass the raw payload through
+                // unchanged.
                 let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                if profile.supports_wakeup_tools {
+                    if let Some(event) =
+                        background_item_event_from_hook(&payload, chrono::Utc::now())
+                    {
+                        events.push(event);
+                    }
+                }
                 match background_agent_launched_from_value(&payload) {
                     Some(event) => events.push(event),
                     None => events.push(Event::RawAgentUpdate { payload }),
@@ -479,24 +486,6 @@ pub(super) fn map_update_to_events(
             {
                 if let Some(raw) = update.fields.raw_input.as_ref() {
                     if let Some(event) = wakeup_event_from_raw(raw) {
-                        events.push(event);
-                    }
-                }
-            }
-            // The Claude SDK's `Monitor` tool is fire-and-forget: the tool
-            // call completes immediately while the background watch keeps
-            // running off-protocol, so the turn ends and the session sits
-            // Idle while the monitor is still armed. Like ScheduleWakeup the
-            // initial `tool_call` frame carries empty args; the real
-            // `command` / `description` land on this update. Emit MonitorArmed
-            // so the sidebar can flag the session instead of showing a plain
-            // grey "idle" dot that looks dead. Gated on the same claude-only
-            // profile flag as the wakeup tools.
-            if profile.supports_wakeup_tools
-                && matches!(update.fields.title.as_deref(), Some("Monitor"))
-            {
-                if let Some(raw) = update.fields.raw_input.as_ref() {
-                    if let Some(event) = monitor_event_from_raw(raw) {
                         events.push(event);
                     }
                 }
@@ -957,6 +946,32 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::RawAgentUpdate { .. })),
             "async launch should not also pass through as RawAgentUpdate"
+        );
+    }
+
+    #[test]
+    fn map_hook_frame_emits_background_item_started_for_claude_only() {
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
+        let meta_frame = || {
+            let mut update = ToolCallUpdate::new("toolu_m", ToolCallUpdateFields::new());
+            update.meta = Some(serde_json::from_value(serde_json::json!({
+                "claudeCode": { "toolName": "Monitor", "toolResponse": { "taskId": "m1", "timeoutMs": 0, "persistent": true } }
+            })).unwrap());
+            SessionUpdate::ToolCallUpdate(update)
+        };
+        let events = map_update_to_events(meta_frame(), &agent_profiles::CLAUDE);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::BackgroundItemStarted { id, .. } if id == "m1")),
+            "{events:?}"
+        );
+        let other = map_update_to_events(meta_frame(), &agent_profiles::CODEX);
+        assert!(
+            other
+                .iter()
+                .all(|e| !matches!(e, Event::BackgroundItemStarted { .. })),
+            "{other:?}"
         );
     }
 
@@ -1450,60 +1465,6 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::WakeupScheduled { .. })),
             "no WakeupScheduled should fire without delaySeconds",
-        );
-    }
-
-    #[test]
-    fn map_tool_call_update_emits_monitor_armed_when_title_and_args_land() {
-        // Mirrors the ScheduleWakeup path: the Monitor tool's initial
-        // `ToolCall` frame has empty args; the real `command` /
-        // `description` arrive on a follow-up `ToolCallUpdate`. That update
-        // must emit MonitorArmed so the sidebar shows a "monitoring" badge
-        // instead of a plain grey idle dot.
-        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
-        let fields = ToolCallUpdateFields::new()
-            .title("Monitor".to_string())
-            .raw_input(serde_json::json!({
-                "command": "until cargo clippy; do sleep 5; done",
-                "description": "clippy passes",
-                "timeout_ms": 600000,
-                "persistent": false,
-            }));
-        let update = ToolCallUpdate::new("toolu_test", fields);
-        let events = map_update_to_events(
-            SessionUpdate::ToolCallUpdate(update),
-            &agent_profiles::CLAUDE,
-        );
-        let armed = events
-            .iter()
-            .find(|e| matches!(e, Event::MonitorArmed { .. }))
-            .expect("ToolCallUpdate with title=Monitor + args must emit MonitorArmed");
-        match armed {
-            Event::MonitorArmed { description } => {
-                assert_eq!(description.as_deref(), Some("clippy passes"));
-            }
-            other => panic!("expected MonitorArmed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn map_tool_call_update_skips_monitor_when_args_empty() {
-        // The initial title-only / empty-args frame must NOT arm the badge;
-        // only the populated follow-up update does.
-        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
-        let fields = ToolCallUpdateFields::new()
-            .title("Monitor".to_string())
-            .raw_input(serde_json::json!({}));
-        let update = ToolCallUpdate::new("toolu_test", fields);
-        let events = map_update_to_events(
-            SessionUpdate::ToolCallUpdate(update),
-            &agent_profiles::CLAUDE,
-        );
-        assert!(
-            !events
-                .iter()
-                .any(|e| matches!(e, Event::MonitorArmed { .. })),
-            "no MonitorArmed should fire without command or description",
         );
     }
 

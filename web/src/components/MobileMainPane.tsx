@@ -121,6 +121,7 @@ export function MobileMainPane({
                 onOpenFileRef={onOpenFileRef}
                 fileRefSession={activeSession}
                 isSandboxed={activeSession.is_sandboxed}
+                background={activeSession.background}
               />
             </Suspense>
           ) : (

@@ -1271,6 +1271,9 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
+        Event::BackgroundItemStarted { .. } => "background_item_started",
+        Event::BackgroundItemEnded { .. } => "background_item_ended",
+        Event::BackgroundLossNoted { .. } => "background_loss_noted",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
     }

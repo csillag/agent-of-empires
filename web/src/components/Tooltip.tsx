@@ -22,7 +22,8 @@ export function Tooltip({
   children: ReactNode;
   // Single-line callers (sidebar, sort picker) keep the default `whitespace-nowrap`
   // pill. Set `multiline` for a sentence-length explanation that should wrap inside
-  // a width cap instead of stretching off-screen.
+  // a width cap instead of stretching off-screen; literal `\n`s in `text` render as
+  // line breaks (e.g. a per-item hover list) instead of collapsing into one line.
   multiline?: boolean;
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
@@ -82,7 +83,7 @@ export function Tooltip({
             role="tooltip"
             style={{ left: pos?.x ?? 0, top: pos?.y ?? 0, visibility: pos ? "visible" : "hidden" }}
             className={`pointer-events-none fixed z-50 px-2 py-1 rounded bg-surface-950 border border-surface-700 text-[11px] text-text-secondary ${
-              multiline ? "max-w-xs whitespace-normal" : "whitespace-nowrap"
+              multiline ? "max-w-xs whitespace-pre-line" : "whitespace-nowrap"
             }`}
           >
             {text}

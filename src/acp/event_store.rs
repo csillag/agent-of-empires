@@ -51,7 +51,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use tracing::{debug, trace, warn};
 
 use super::approvals::Nonce;
-use super::state::{Event, Plan, RateLimitInfo};
+use super::state::{
+    BackgroundEndReason, BackgroundItem, BackgroundLossCause, Event, Plan, RateLimitInfo,
+};
 use crate::events::{self, Order, SeqBound};
 
 /// Externally-tagged JSON discriminants for non-substantive structured view
@@ -857,97 +859,114 @@ impl EventStore {
         }
     }
 
-    /// Whether the session has an armed `Monitor` (background watch). Returns
-    /// the latest `MonitorArmed` description when active, `None` otherwise.
-    ///
-    /// A `Monitor` is fire-and-forget with no fixed end time, so unlike
-    /// `latest_pending_wakeup` there is no timestamp to gate on, and the
-    /// `Monitor` tool call itself completes at arm time (it returns "monitor
-    /// started"), so its completion is not the disarm signal either. The
-    /// badge stays up from the arm until either the user takes over
-    /// (`UserPromptSent` at a higher seq) or the monitor fires and that turn
-    /// ends. The fire is observed as a tool call started after the arm (the
-    /// agent acting on the wake); the badge then retires on the next
-    /// `Stopped`. This covers both shapes: the agent ending the arming turn
-    /// and resuming later between prompts (closed by `agent_idle`), and the
-    /// monitor blocking the arming turn in-band (closed by `prompt_complete`).
-    /// A `Stopped` with no post-arm tool work is the arming turn ending while
-    /// the monitor is still pending, so it leaves the badge up. See #2325.
-    pub fn latest_active_monitor(&self, session_id: &str) -> Option<Option<String>> {
+    /// The session's background items, folded from its log at `now`.
+    pub fn background_items(&self, session_id: &str, now: DateTime<Utc>) -> Vec<BackgroundItem> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        // Latest MonitorArmed and its seq.
-        let (armed_seq, json) =
-            events::latest_by_discriminant(&conn, &self.schema, session_id, "MonitorArmed")?;
-        let armed_seq = armed_seq as i64;
-        // The user taking over clears the badge immediately. No log on the
-        // common "no monitor" branch above (this query fans out per
-        // structured session on every ~2-3s sessions poll).
-        let user_took_over: Option<i64> = conn
-            .query_row(
-                "SELECT 1 FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq > ?2
-                   AND discriminant = 'UserPromptSent'
-                 LIMIT 1",
-                params![session_id, armed_seq],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if user_took_over.is_some() {
-            return None;
-        }
-        // Otherwise the badge clears once the monitor fired (a tool call
-        // started after the arm) AND that turn has since ended (a Stopped
-        // past that tool start). Without the post-work gate, the arming
-        // turn's own Stopped while the monitor is still pending would clear
-        // it prematurely.
-        let first_work_seq: Option<i64> = conn
-            .query_row(
-                "SELECT MIN(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND seq > ?2
-                   AND discriminant = 'ToolCallStarted'",
-                params![session_id, armed_seq],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        if let Some(work_seq) = first_work_seq {
-            let turn_ended: Option<i64> = conn
-                .query_row(
-                    "SELECT 1 FROM acp_events
-                     WHERE session_id = ?1
-                       AND seq > ?2
-                       AND discriminant = 'Stopped'
-                     LIMIT 1",
-                    params![session_id, work_seq],
-                    |row| row.get(0),
-                )
-                .optional()
-                .ok()
-                .flatten();
-            if turn_ended.is_some() {
-                return None;
+        // `BackgroundAgentLaunched`/`Completed` carry the full sub-agent
+        // prompt and tool list, which `fold_background` never reads (only
+        // `agent_id`, `description`, `started_at`, `ended_at`). One live
+        // session measured 421 KB of that dead weight per `/api/sessions`
+        // poll; strip it in SQL so it never leaves the database.
+        let rows = match conn
+            .prepare(&background_items_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(mut rows) => {
+                drop(conn);
+                rows.sort_unstable_by_key(|(seq, _, _)| *seq);
+                rows
             }
-        }
-        match serde_json::from_str::<Event>(&json) {
-            Ok(Event::MonitorArmed { description }) => Some(description),
-            Ok(_) => None,
             Err(e) => {
-                warn!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    "latest_active_monitor: deserialise failed: {e}"
-                );
-                None
+                warn!(target: "acp.event_store", session = %session_id, "background_items: {e}");
+                return Vec::new();
             }
+        };
+        let events = rows.into_iter().filter_map(|(_, ms, json)| {
+            let at = DateTime::from_timestamp_millis(ms)?;
+            serde_json::from_str::<Event>(&json).ok().map(|e| (at, e))
+        });
+        crate::acp::background::fold_background(events, now)
+    }
+
+    /// Items lost to a cause that wakes the agent, after the last
+    /// `BackgroundLossNoted`. Gated on `at`, not `seq`: the reconciler's
+    /// note pass reads this, awaits `enqueue_prompt`, then publishes
+    /// `BackgroundLossNoted` with the newest loss `at` it saw. A further
+    /// loss can land during that await with a *lower* seq than the Noted
+    /// event but a *later* `at`; a seq gate would wrongly treat it as
+    /// already noted. The `at` gate itself needs every `BackgroundItemEnded`
+    /// row, not just the highest-seq one: two losses recorded on different
+    /// threads can take their `at` before their seq, so seq order and `at`
+    /// order can diverge. `BackgroundLossNoted` stays a single-index lookup
+    /// since it has one writer, appending monotonically.
+    pub fn unnoted_background_losses(&self, session_id: &str) -> Vec<BackgroundItem> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let up_to = match events::latest_by_discriminant(
+            &conn,
+            &self.schema,
+            session_id,
+            "BackgroundLossNoted",
+        ) {
+            Some((_, json)) => match serde_json::from_str::<Event>(&json) {
+                Ok(Event::BackgroundLossNoted { up_to }) => Some(up_to),
+                _ => None,
+            },
+            None => None,
+        };
+        let is_waking_loss =
+            |reason: BackgroundEndReason, cause: Option<BackgroundLossCause>, at: DateTime<Utc>| {
+                reason == BackgroundEndReason::Lost
+                    && cause.is_some_and(|c| c.wakes_agent())
+                    && up_to.is_none_or(|up_to| at > up_to)
+            };
+        let any_new_loss = match conn
+            .prepare(&background_ends_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows
+                .iter()
+                .any(|json| match serde_json::from_str::<Event>(json) {
+                    Ok(Event::BackgroundItemEnded {
+                        reason, cause, at, ..
+                    }) => is_waking_loss(reason, cause, at),
+                    _ => false,
+                }),
+            Err(e) => {
+                warn!(target: "acp.event_store", session = %session_id, "unnoted_background_losses: {e}");
+                return Vec::new();
+            }
+        };
+        drop(conn);
+        if !any_new_loss {
+            return Vec::new();
         }
+        // The fold decides which end wins when an item has more than one
+        // `BackgroundItemEnded`, so the authoritative check is against the
+        // folded `ended`, not the raw row that tripped `any_new_loss`.
+        self.background_items(session_id, Utc::now())
+            .into_iter()
+            .filter(|i| {
+                i.ended
+                    .as_ref()
+                    .is_some_and(|e| is_waking_loss(e.reason, e.cause, e.at))
+            })
+            .collect()
     }
 
     /// Given the seq of a just-published `UserPromptSent`, return the
@@ -2465,6 +2484,29 @@ fn make_snippet(text: &str, needle: &str) -> String {
     snippet
 }
 
+/// `INDEXED BY` with the sort left to the caller: under `ORDER BY seq`
+/// SQLite walked every row of the session via `session_seq` (137 MB for one
+/// session, per sessions poll, under the store mutex; the 2026-09-19 stall).
+fn background_items_sql(table: &str) -> String {
+    format!(
+        "SELECT seq, created_at, CASE discriminant \
+         WHEN 'BackgroundAgentLaunched' THEN json_set(event_json, '$.BackgroundAgentLaunched.prompt', '') \
+         WHEN 'BackgroundAgentCompleted' THEN json_set(event_json, '$.BackgroundAgentCompleted.tools', json('[]')) \
+         ELSE event_json END \
+         FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant IN \
+         ('BackgroundItemStarted','BackgroundItemEnded','WakeupScheduled',\
+          'BackgroundAgentLaunched','BackgroundAgentCompleted')"
+    )
+}
+
+fn background_ends_sql(table: &str) -> String {
+    format!(
+        "SELECT event_json FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant = 'BackgroundItemEnded'"
+    )
+}
+
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
@@ -2513,6 +2555,9 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ConversationSummary { .. } => "conversation_summary",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
         Event::MonitorArmed { .. } => "monitor_armed",
+        Event::BackgroundItemStarted { .. } => "background_item_started",
+        Event::BackgroundItemEnded { .. } => "background_item_ended",
+        Event::BackgroundLossNoted { .. } => "background_loss_noted",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
     }
@@ -4004,171 +4049,261 @@ mod tests {
         assert_eq!(pending.1.as_deref(), Some("rescheduled"));
     }
 
+    /// Every registry query seeks the discriminant index. Walking the
+    /// session's rows instead stalled the daemon (2026-09-19).
     #[test]
-    fn latest_active_monitor_returns_description_when_armed() {
+    fn background_queries_seek_the_discriminant_index() {
         let (_tmp, store) = open_store(1000);
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::MonitorArmed {
-                    description: Some("clippy passes".into()),
-                },
-            )
-            .unwrap();
-        let armed = store.latest_active_monitor("s-1").expect("armed");
-        assert_eq!(armed.as_deref(), Some("clippy passes"));
-    }
-
-    #[test]
-    fn latest_active_monitor_persists_without_a_user_prompt() {
-        // A monitor firing re-invokes the agent with activity but no
-        // UserPromptSent, so the badge must persist across those re-fires.
-        let (_tmp, store) = open_store(1000);
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::MonitorArmed {
-                    description: Some("build".into()),
-                },
-            )
-            .unwrap();
-        // Trailing agent activity (no user prompt) does not clear it.
-        store.record("s-1", 2, &Event::ThinkingStarted).unwrap();
-        store
-            .record(
-                "s-1",
-                3,
-                &Event::AgentMessageChunk {
-                    text: "resuming".into(),
-                },
-            )
-            .unwrap();
-        assert!(store.latest_active_monitor("s-1").is_some());
-    }
-
-    #[test]
-    fn latest_active_monitor_clears_on_user_prompt() {
-        // The user typing a follow-up means they took over; the badge clears.
-        let (_tmp, store) = open_store(1000);
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::MonitorArmed {
-                    description: Some("watch".into()),
-                },
-            )
-            .unwrap();
-        store
-            .record(
-                "s-1",
-                2,
-                &Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "stop watching".into(),
-                    attachments: Vec::new(),
-                },
-            )
-            .unwrap();
-        assert!(store.latest_active_monitor("s-1").is_none());
-    }
-
-    #[test]
-    fn latest_active_monitor_persists_on_arming_turn_stop() {
-        // The arming turn ending while the monitor is still pending (no
-        // post-arm tool work yet) must NOT clear the badge (#2325).
-        let (_tmp, store) = open_store(1000);
-        store
-            .record(
-                "s-1",
-                1,
-                &Event::MonitorArmed {
-                    description: Some("watch".into()),
-                },
-            )
-            .unwrap();
-        store
-            .record(
-                "s-1",
-                2,
-                &Event::Stopped {
-                    reason: "prompt_complete".into(),
-                },
-            )
-            .unwrap();
-        assert!(store.latest_active_monitor("s-1").is_some());
-    }
-
-    #[test]
-    fn latest_active_monitor_clears_after_fired_work_and_stop() {
-        // The monitor fired (a tool call started after the arm) and that turn
-        // then ended: the badge clears regardless of the Stopped reason, so
-        // both the in-band (`prompt_complete`) and between-prompt
-        // (`agent_idle`) monitor shapes are covered (#2325).
-        for reason in ["prompt_complete", "agent_idle"] {
-            let (_tmp, store) = open_store(1000);
-            store
-                .record(
-                    "s-1",
-                    1,
-                    &Event::MonitorArmed {
-                        description: Some("watch".into()),
-                    },
-                )
+        let conn = store.conn.lock().unwrap();
+        let table = store.schema.events_table();
+        for sql in [background_items_sql(table), background_ends_sql(table)] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params!["s-1"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
                 .unwrap();
-            store
-                .record(
-                    "s-1",
-                    2,
-                    &Event::ToolCallStarted {
-                        tool_call: crate::acp::state::ToolCall {
-                            id: "tc-1".into(),
-                            name: "Read".into(),
-                            kind: "read".into(),
-                            args_preview: String::new(),
-                            started_at: Utc::now(),
-                            parent_tool_call_id: None,
-                            memory_recall: None,
-                            diffs: Vec::new(),
-                        },
-                    },
-                )
-                .unwrap();
-            // Tool started but turn not yet ended: badge still up.
-            assert!(store.latest_active_monitor("s-1").is_some());
-            store
-                .record(
-                    "s-1",
-                    3,
-                    &Event::Stopped {
-                        reason: reason.into(),
-                    },
-                )
-                .unwrap();
+            assert_eq!(plan.len(), 1, "{plan:?}");
             assert!(
-                store.latest_active_monitor("s-1").is_none(),
-                "badge should clear after fired work + Stopped({reason})"
+                plan[0].contains(&format!(
+                    "USING INDEX idx_{table}_session_discriminant_seq (session_id=? AND discriminant=?)"
+                )),
+                "{plan:?}"
             );
         }
     }
 
     #[test]
-    fn latest_active_monitor_none_without_monitor() {
+    fn background_items_folds_the_session_log() {
+        use crate::acp::state::BackgroundKind;
         let (_tmp, store) = open_store(1000);
+        let now = chrono::Utc::now();
         store
             .record(
                 "s-1",
                 1,
-                &Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "hi".into(),
-                    attachments: Vec::new(),
+                &Event::BackgroundItemStarted {
+                    kind: BackgroundKind::Monitor,
+                    id: "m1".into(),
+                    tool_call_id: None,
+                    label: Some("watch".into()),
+                    started_at: now,
+                    expires_at: None,
                 },
             )
             .unwrap();
-        assert!(store.latest_active_monitor("s-1").is_none());
+        store
+            .record(
+                "s-2",
+                1,
+                &Event::BackgroundItemStarted {
+                    kind: BackgroundKind::Shell,
+                    id: "other".into(),
+                    tool_call_id: None,
+                    label: None,
+                    started_at: now,
+                    expires_at: None,
+                },
+            )
+            .unwrap();
+        // A sub-agent launch and completion, with a heavy prompt/tool list
+        // the SQL strips before it ever reaches the fold: the item and its
+        // label must still come out right from the fields it keeps
+        // (agent_id, description, started_at, ended_at).
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "a1".into(),
+                    tool_call_id: "tc1".into(),
+                    description: "review the diff".into(),
+                    prompt: "x".repeat(400_000),
+                    model: "claude".into(),
+                    output_file: String::new(),
+                    started_at: now,
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: vec![crate::acp::state::BackgroundAgentTool {
+                        name: "Read".into(),
+                        title: Some("x".repeat(400_000)),
+                        ok: Some(true),
+                    }],
+                    result: None,
+                    warning: None,
+                    ended_at: now,
+                },
+            )
+            .unwrap();
+        let items = store.background_items("s-1", now);
+        assert_eq!(items.len(), 2);
+        let m1 = items.iter().find(|i| i.id == "m1").expect("m1 present");
+        assert!(m1.is_live());
+        let a1 = items.iter().find(|i| i.id == "a1").expect("a1 present");
+        assert_eq!(a1.label.as_deref(), Some("review the diff"));
+        assert_eq!(
+            a1.ended.as_ref().map(|e| e.reason),
+            Some(crate::acp::state::BackgroundEndReason::Finished)
+        );
+    }
+
+    /// The sessions API's `background` field is the contract the web's
+    /// chip, panel and `waitingOn()` read: a sub-agent launched through
+    /// upstream's event is a live `subagent` row with no `ended`, and its
+    /// completion takes it off the list.
+    #[test]
+    fn a_launched_sub_agent_is_live_background_work_until_it_completes() {
+        use crate::acp::background::BackgroundSummary;
+        let (_tmp, store) = open_store(1000);
+        let now = chrono::Utc::now();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::BackgroundAgentLaunched {
+                    agent_id: "a1".into(),
+                    tool_call_id: "tc1".into(),
+                    description: "review the diff".into(),
+                    prompt: "p".into(),
+                    model: "claude".into(),
+                    output_file: "/tmp/a1.output".into(),
+                    started_at: now,
+                },
+            )
+            .unwrap();
+        let summary = BackgroundSummary::from_items(store.background_items("s-1", now)).unwrap();
+        assert_eq!(summary.live, 1);
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["items"][0]["kind"], "subagent");
+        assert_eq!(wire["items"][0]["label"], "review the diff");
+        assert!(wire["items"][0].get("ended").is_none(), "{wire}");
+
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: now,
+                },
+            )
+            .unwrap();
+        assert!(BackgroundSummary::from_items(store.background_items("s-1", now)).is_none());
+    }
+
+    #[test]
+    fn unnoted_losses_are_the_waking_losses_after_the_last_note() {
+        use crate::acp::state::{BackgroundEndReason, BackgroundKind, BackgroundLossCause};
+        let (_tmp, store) = open_store(1000);
+        let base = chrono::Utc::now();
+        let t = |min: i64| base + chrono::Duration::minutes(min);
+        let start = |seq, id: &str, at| {
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &Event::BackgroundItemStarted {
+                        kind: BackgroundKind::Monitor,
+                        id: id.into(),
+                        tool_call_id: None,
+                        label: None,
+                        started_at: at,
+                        expires_at: None,
+                    },
+                )
+                .unwrap()
+        };
+        let lose = |seq, id: &str, cause, at| {
+            store
+                .record(
+                    "s-1",
+                    seq,
+                    &Event::BackgroundItemEnded {
+                        id: id.into(),
+                        reason: BackgroundEndReason::Lost,
+                        cause: Some(cause),
+                        at,
+                    },
+                )
+                .unwrap()
+        };
+        start(1, "a", t(0));
+        start(2, "b", t(0));
+        start(3, "c", t(0));
+        lose(4, "a", BackgroundLossCause::NewBuild, t(1));
+        lose(5, "b", BackgroundLossCause::UserStop, t(1));
+        assert_eq!(
+            store
+                .unnoted_background_losses("s-1")
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+        store
+            .record("s-1", 6, &Event::BackgroundLossNoted { up_to: t(1) })
+            .unwrap();
+        assert!(store.unnoted_background_losses("s-1").is_empty());
+        lose(7, "c", BackgroundLossCause::Respawn, t(2));
+        assert_eq!(
+            store
+                .unnoted_background_losses("s-1")
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"]
+        );
+
+        // Race: the reconciler's note pass reads this query, awaits
+        // `enqueue_prompt`, then publishes `BackgroundLossNoted` with the
+        // newest `at` it saw (t(2), from "c"). A new loss ("d") can land
+        // during that await at a later `at` (t(4)) but a lower seq than
+        // the eventual Noted event; the time gate must still surface it.
+        start(8, "d", t(2));
+        lose(9, "d", BackgroundLossCause::Respawn, t(4));
+        store
+            .record("s-1", 10, &Event::BackgroundLossNoted { up_to: t(2) })
+            .unwrap();
+        assert_eq!(
+            store
+                .unnoted_background_losses("s-1")
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d"]
+        );
+
+        // Diverging orders: two losses can take `at` on different threads
+        // before either takes its seq, so the highest-seq `BackgroundItemEnded`
+        // is not necessarily the one with the latest `at`. "z" gets a later
+        // `at` (t(3), past `up_to` t(2)) but a lower seq than "y", whose `at`
+        // (t(1)) is before `up_to`. Scanning only the highest-seq row would
+        // read "y" and wrongly conclude nothing is new; "z" must still surface.
+        start(11, "z", t(2));
+        start(12, "y", t(2));
+        lose(13, "z", BackgroundLossCause::NewBuild, t(3));
+        lose(14, "y", BackgroundLossCause::NewBuild, t(1));
+        assert_eq!(
+            store
+                .unnoted_background_losses("s-1")
+                .iter()
+                .map(|i| i.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d", "z"]
+        );
     }
 
     #[test]

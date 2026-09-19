@@ -359,6 +359,19 @@ impl SilentOrphanWatchdog {
     pub(super) fn saw_progress(&self) -> bool {
         self.saw_first_progress
     }
+
+    /// Clears the async-agent floor once every tracked sub-agent has ended
+    /// (`sub_agents_running == false`) and the turn's end-of-turn cost has
+    /// been reported. Leaves the latch in place otherwise, including when
+    /// it holds a different `OffProtocolWorkKind`.
+    pub(super) fn release_async_agent_floor(&mut self, sub_agents_running: bool) {
+        if self.cost_seen
+            && !sub_agents_running
+            && self.off_protocol_work_seen == Some(OffProtocolWorkKind::AsyncAgent)
+        {
+            self.off_protocol_work_seen = None;
+        }
+    }
 }
 
 /// Resolve the terminal `Stopped` reason for a prompt turn from the
@@ -1023,6 +1036,73 @@ mod tests {
         );
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
+    }
+
+    #[tokio::test]
+    async fn release_async_agent_floor_gates_on_cost_and_live_sub_agents() {
+        // Each case latches the floor the same way (a completed tool call
+        // reporting AsyncAgent), then varies whether the turn's cost marker
+        // arrived and whether a sub-agent is still running, and checks
+        // `should_fire` at a duration chosen to separate "floor released"
+        // from "floor held" under each of the three gating conditions.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+
+        for (label, cost_seen, sub_agents_running, check_after, fires) in [
+            // "Fix optio claude rendering", 2026-09-12: three async
+            // sub-agents finished within a second of launch, but the latch
+            // held the turn open for the 30-minute floor after the agent
+            // had wrapped up.
+            (
+                "all sub-agents finished and cost seen: releases, fires on fast grace",
+                true,
+                false,
+                cfg.fast_grace + std::time::Duration::from_secs(1),
+                true,
+            ),
+            (
+                "a sub-agent still running: floor holds past fast grace",
+                true,
+                true,
+                cfg.fast_grace + std::time::Duration::from_secs(1),
+                false,
+            ),
+            (
+                "finished but no cost marker yet: floor holds",
+                false,
+                false,
+                std::time::Duration::from_secs(150),
+                false,
+            ),
+        ] {
+            let mut w = SilentOrphanWatchdog::new();
+            w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+            w.apply_signal(
+                LifecycleSignal::ToolStarted {
+                    id: "tc".into(),
+                    is_background_task: false,
+                },
+                t0,
+                wall,
+                cfg,
+            );
+            w.apply_signal(
+                LifecycleSignal::ToolCompleted {
+                    id: "tc".into(),
+                    succeeded: true,
+                    off_protocol_work: Some(OffProtocolWorkKind::AsyncAgent),
+                },
+                t0,
+                wall,
+                cfg,
+            );
+            if cost_seen {
+                w.apply_signal(LifecycleSignal::TerminalUsage, t0, wall, cfg);
+            }
+            w.release_async_agent_floor(sub_agents_running);
+            assert_eq!(w.should_fire(t0 + check_after, cfg), fires, "{label}");
+        }
     }
 
     #[tokio::test]

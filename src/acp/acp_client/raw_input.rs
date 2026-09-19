@@ -1,7 +1,8 @@
-//! Events synthesized from a tool call's raw input: wakeups, monitors, and
-//! background agent launches.
+//! Events synthesized from a tool call's raw input: wakeups and background
+//! agent launches.
 
-use crate::acp::state::Event;
+use crate::acp::state::{BackgroundEndReason, BackgroundKind, Event};
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 /// Build a `WakeupScheduled` event from a `ScheduleWakeup` tool's
@@ -62,28 +63,6 @@ pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Eve
     Some(Event::WakeupScheduled { at, reason })
 }
 
-/// Build a `MonitorArmed` event from a `Monitor` tool's raw_input. Reads
-/// the optional `description` for the badge label. Returns `None` when the
-/// frame carries neither `description` nor `command`: claude-agent-acp emits
-/// the initial `tool_call` frame with empty args (the real args land on a
-/// later `ToolCallUpdate`), and an empty frame should not arm the badge.
-pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
-    let description = raw_input
-        .get("description")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let has_command = raw_input.get("command").and_then(|v| v.as_str()).is_some();
-    if description.is_none() && !has_command {
-        return None;
-    }
-    info!(
-        target: "acp.protocol.wakeup",
-        description = ?description,
-        "emitting MonitorArmed from Monitor tool args"
-    );
-    Some(Event::MonitorArmed { description })
-}
-
 /// Detect a Claude async sub-agent launch in an otherwise-unmapped ACP
 /// update and build a typed `BackgroundAgentLaunched`. The launch arrives
 /// as `{ _meta: { claudeCode: { toolName: "Agent", toolResponse: {
@@ -122,9 +101,80 @@ pub(super) fn background_agent_launched_from_value(v: &serde_json::Value) -> Opt
     })
 }
 
+/// Background work from claude-agent-acp's PostToolUse hook frame
+/// (`_meta.claudeCode.{toolName, toolResponse}`): a started Monitor,
+/// backgrounded Bash or async Workflow, or a TaskStop / finished TaskOutput.
+pub(super) fn background_item_event_from_hook(
+    payload: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Option<Event> {
+    let claude = payload.get("_meta")?.get("claudeCode")?;
+    let resp = claude.get("toolResponse")?;
+    let tool_call_id = payload
+        .get("toolCallId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let text =
+        |v: &serde_json::Value, k: &str| v.get(k).and_then(|s| s.as_str()).map(str::to_string);
+    let start = |kind, id: String, label: Option<String>, expires_at| {
+        Some(Event::BackgroundItemStarted {
+            kind,
+            id,
+            tool_call_id: tool_call_id.clone(),
+            label,
+            started_at: now,
+            expires_at,
+        })
+    };
+    match claude.get("toolName")?.as_str()? {
+        "Monitor" => {
+            let id = text(resp, "taskId")?;
+            let persistent = resp
+                .get("persistent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let timeout_ms = resp.get("timeoutMs").and_then(|v| v.as_i64()).unwrap_or(0);
+            let expires = (!persistent && timeout_ms > 0)
+                .then(|| now + chrono::Duration::milliseconds(timeout_ms));
+            start(BackgroundKind::Monitor, id, None, expires)
+        }
+        "Bash" => start(
+            BackgroundKind::Shell,
+            text(resp, "backgroundTaskId")?,
+            None,
+            None,
+        ),
+        "Workflow" if resp.get("status").and_then(|v| v.as_str()) == Some("async_launched") => {
+            let label = text(resp, "summary").or_else(|| text(resp, "workflowName"));
+            start(BackgroundKind::Workflow, text(resp, "taskId")?, label, None)
+        }
+        "TaskStop" => Some(Event::BackgroundItemEnded {
+            id: text(resp, "task_id")?,
+            reason: BackgroundEndReason::Stopped,
+            cause: None,
+            at: now,
+        }),
+        "TaskOutput" => {
+            let task = resp.get("task")?;
+            let status = task.get("status")?.as_str()?;
+            if matches!(status, "running" | "pending") {
+                return None;
+            }
+            Some(Event::BackgroundItemEnded {
+                id: text(task, "task_id")?,
+                reason: BackgroundEndReason::Finished,
+                cause: None,
+                at: now,
+            })
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn wakeup_from_raw_rejects_unusable_delays() {
@@ -210,5 +260,117 @@ mod tests {
         });
         assert!(background_agent_launched_from_value(&sync).is_none());
         assert!(background_agent_launched_from_value(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn hook_frames_start_and_end_background_items() {
+        let now = chrono::Utc::now();
+        let hook = |tool: &str, resp: serde_json::Value| {
+            serde_json::json!({
+                "toolCallId": "toolu_1", "_meta": { "claudeCode": { "toolName": tool, "toolResponse": resp } }
+            })
+        };
+        match background_item_event_from_hook(
+            &hook(
+                "Monitor",
+                json!({"taskId":"m1","timeoutMs":60000,"persistent":false}),
+            ),
+            now,
+        ) {
+            Some(Event::BackgroundItemStarted {
+                kind: BackgroundKind::Monitor,
+                id,
+                tool_call_id,
+                expires_at,
+                ..
+            }) => {
+                assert_eq!(id, "m1");
+                assert_eq!(tool_call_id.as_deref(), Some("toolu_1"));
+                assert_eq!(
+                    expires_at,
+                    Some(now + chrono::Duration::milliseconds(60000))
+                );
+            }
+            other => panic!("expected monitor start, got {other:?}"),
+        }
+        match background_item_event_from_hook(
+            &hook(
+                "Monitor",
+                json!({"taskId":"m2","timeoutMs":0,"persistent":true}),
+            ),
+            now,
+        ) {
+            Some(Event::BackgroundItemStarted {
+                expires_at: None, ..
+            }) => {}
+            other => panic!("persistent monitor has no expiry, got {other:?}"),
+        }
+        assert!(matches!(
+            background_item_event_from_hook(
+                &hook("Bash", json!({"backgroundTaskId":"bg1","stdout":""})),
+                now
+            ),
+            Some(Event::BackgroundItemStarted {
+                kind: BackgroundKind::Shell,
+                ..
+            })
+        ));
+        match background_item_event_from_hook(
+            &hook(
+                "Workflow",
+                json!({"status":"async_launched","taskId":"w1","summary":"fix wave"}),
+            ),
+            now,
+        ) {
+            Some(Event::BackgroundItemStarted {
+                kind: BackgroundKind::Workflow,
+                label,
+                ..
+            }) => assert_eq!(label.as_deref(), Some("fix wave")),
+            other => panic!("expected workflow start, got {other:?}"),
+        }
+        assert!(matches!(
+            background_item_event_from_hook(
+                &hook("TaskStop", json!({"task_id":"m1","message":"ok"})),
+                now
+            ),
+            Some(Event::BackgroundItemEnded {
+                reason: BackgroundEndReason::Stopped,
+                ..
+            })
+        ));
+        assert!(matches!(
+            background_item_event_from_hook(
+                &hook(
+                    "TaskOutput",
+                    json!({"task":{"task_id":"bg1","status":"completed"}})
+                ),
+                now
+            ),
+            Some(Event::BackgroundItemEnded {
+                reason: BackgroundEndReason::Finished,
+                ..
+            })
+        ));
+        for (label, frame) in [
+            (
+                "running poll",
+                hook(
+                    "TaskOutput",
+                    json!({"task":{"task_id":"bg1","status":"running"}}),
+                ),
+            ),
+            ("foreground bash", hook("Bash", json!({"stdout":"hi"}))),
+            (
+                "sync workflow",
+                hook("Workflow", json!({"status":"completed","taskId":"w2"})),
+            ),
+            ("other tool", hook("Read", json!({"file":"x"}))),
+        ] {
+            assert!(
+                background_item_event_from_hook(&frame, now).is_none(),
+                "{label}"
+            );
+        }
     }
 }

@@ -378,6 +378,10 @@ pub async fn reconcile_acp_workers(
     // between a plugin create and its first successful delivery.
     drain_pending_initial_turns(state).await;
 
+    // Queue a wake note for any background work a worker restart just lost,
+    // before this tick's queue drain delivers it.
+    note_background_losses(state).await;
+
     // Drain each session's server-owned prompt queue when its turn has ended,
     // with no client tab open. Same shape as the pending-turn drain above.
     drain_queued_prompts(state).await;
@@ -870,6 +874,16 @@ fn should_auto_stop(
     }
 }
 
+/// How long background work alone may keep an agent awake without events.
+const BACKGROUND_KEEPALIVE_CAP_MS: i64 = 86_400_000;
+
+/// A live background item keeps the worker up until the session has been
+/// silent for the cap; the idle stop then loses the items (`IdleCap`).
+fn background_holds(has_live: bool, last_event_ms: Option<i64>, now_ms: i64) -> bool {
+    has_live
+        && last_event_ms.is_none_or(|ms| now_ms.saturating_sub(ms) < BACKGROUND_KEEPALIVE_CAP_MS)
+}
+
 /// Idle auto-stop pass (#1689). Shuts down structured view workers that have seen
 /// no activity for `idle_secs` and are not mid-turn, marking their
 /// session dormant so the resume pass does not respawn them. The next
@@ -959,6 +973,27 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
             return;
         }
     };
+    // A session with a live background item stays up regardless of the
+    // idle threshold, up to BACKGROUND_KEEPALIVE_CAP_MS: the item is the
+    // agent's own signal that it expects to be woken by it, not by a user
+    // turn. Past the cap the idle stop reaps it anyway and the item is
+    // lost with cause `IdleCap`.
+    let with_live: HashSet<String> = {
+        let store = Arc::clone(&state.acp_event_store);
+        let ids: Vec<String> = live.iter().map(|(id, _, _)| id.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now();
+            ids.into_iter()
+                .filter(|id| store.background_items(id, now).iter().any(|i| i.is_live()))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let held_at = chrono::Utc::now().timestamp_millis();
+    live.retain(|(id, _, _)| {
+        !background_holds(with_live.contains(id), latest.get(id).copied(), held_at)
+    });
     let now_ms = chrono::Utc::now().timestamp_millis();
     for (id, profile, idle_secs) in live {
         // Cheap pre-check (no in-flight probe yet): skips sessions with no
@@ -1160,8 +1195,55 @@ async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         if let Some(generation) = generation {
             crate::process::worker_registry::mark_restart_pending(&id, generation);
         }
+        state
+            .acp_supervisor
+            .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
         crate::process::worker_registry::terminate_and_wait(&id).await;
         state.acp_supervisor.clear_respawn_pending(&id);
+    }
+}
+
+/// Tell an agent which background items it lost with its worker, once per
+/// loss. The note goes through the prompt queue, so it waits behind a
+/// running turn and wakes nothing that is dormant by choice.
+async fn note_background_losses(state: &Arc<AppState>) {
+    let ids: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_structured() && !i.is_archived() && !i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in ids {
+        let store = Arc::clone(&state.acp_event_store);
+        let probe = id.clone();
+        let lost = tokio::task::spawn_blocking(move || store.unnoted_background_losses(&probe))
+            .await
+            .unwrap_or_default();
+        let Some(up_to) = lost
+            .iter()
+            .filter_map(|i| i.ended.as_ref().map(|e| e.at))
+            .max()
+        else {
+            continue;
+        };
+        let text = crate::acp::background::loss_note(&lost);
+        let now = chrono::Utc::now().to_rfc3339();
+        let queued = state
+            .session_service
+            .enqueue_prompt(
+                &id,
+                uuid::Uuid::new_v4().to_string(),
+                text,
+                Vec::new(),
+                None,
+                now,
+            )
+            .await;
+        if queued.is_some() {
+            state.acp_supervisor.note_background_losses(&id, up_to);
+        }
     }
 }
 
@@ -1736,6 +1818,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     new_runner_version = crate::process::worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
+                state
+                    .acp_supervisor
+                    .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
                 crate::process::worker_registry::terminate_and_wait(&id).await;
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -1746,6 +1831,9 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
+                state
+                    .acp_supervisor
+                    .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
                 crate::process::worker_registry::terminate_and_wait(&id).await;
             }
             AdoptDecision::Attach | AdoptDecision::AdoptStaleForDrain => {
@@ -2393,7 +2481,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_decision, publish_orphaned_turn_stop, rate_limit_resume_at,
+        adopt_decision, background_holds, publish_orphaned_turn_stop, rate_limit_resume_at,
         rate_limit_unknown_reset_retry_at, should_auto_stop, should_readopt_orphan_runner,
         AdoptDecision, RATE_LIMIT_AUTO_RESUME_MAX_REDELIVERIES,
         RATE_LIMIT_EXHAUSTED_RETRIES_REASON, RATE_LIMIT_MIN_PARK_SECS,
@@ -2801,6 +2889,27 @@ mod tests {
     fn unknown_worker_age_falls_back_to_event_age() {
         assert!(should_auto_stop(HOUR_MS * 24, Some(0), None, 3600, false));
         assert!(!should_auto_stop(HOUR_MS * 24, None, None, 3600, false));
+    }
+
+    #[test]
+    fn background_holds_an_agent_awake_up_to_the_cap() {
+        const H: i64 = 3_600_000;
+        assert!(
+            background_holds(true, Some(0), 2 * H),
+            "a live item holds within the cap"
+        );
+        assert!(
+            !background_holds(true, Some(0), 24 * H),
+            "the cap releases it"
+        );
+        assert!(
+            !background_holds(false, Some(0), 2 * H),
+            "no live item, no hold"
+        );
+        assert!(
+            background_holds(true, None, 2 * H),
+            "live items without a clock hold"
+        );
     }
 
     // --- CapacityFull as a first-class transient (#1027) ---
@@ -3743,6 +3852,139 @@ mod tests {
         assert!(
             woken,
             "a dormant session with a queue must be woken so the resume pass respawns it"
+        );
+    }
+
+    /// Background items lost to a waking cause (`NewBuild`) queue exactly
+    /// one wake note naming them and mark the loss noted; a second pass with
+    /// nothing new must not enqueue again.
+    #[tokio::test]
+    async fn note_background_losses_wakes_once_then_stays_quiet() {
+        use super::note_background_losses;
+        use crate::acp::state::{BackgroundEndReason, BackgroundKind, BackgroundLossCause, Event};
+        use crate::server::test_support::build_test_app_state;
+        use crate::session::{Instance, View};
+
+        let mut inst = Instance::new("loss", "/tmp/aoe-note-loss");
+        inst.id = "sess-loss".to_string();
+        inst.view = View::Structured;
+
+        let state = build_test_app_state(vec![inst]);
+        let now = chrono::Utc::now();
+        // Seqs start well above 1: the supervisor's own `next_seqs` counter
+        // for this session starts unseeded at 0 and will allocate 1 for the
+        // `BackgroundLossNoted` event the pass publishes below, which would
+        // silently collide with (and no-op against) a seq 1 written here.
+        state
+            .acp_event_store
+            .record(
+                "sess-loss",
+                10,
+                &Event::BackgroundItemStarted {
+                    kind: BackgroundKind::Monitor,
+                    id: "m1".into(),
+                    tool_call_id: None,
+                    label: Some("watch-log".into()),
+                    started_at: now,
+                    expires_at: None,
+                },
+            )
+            .unwrap();
+        state
+            .acp_event_store
+            .record(
+                "sess-loss",
+                11,
+                &Event::BackgroundItemEnded {
+                    id: "m1".into(),
+                    reason: BackgroundEndReason::Lost,
+                    cause: Some(BackgroundLossCause::NewBuild),
+                    at: now,
+                },
+            )
+            .unwrap();
+
+        // A sub-agent lost in the same restart: its end is upstream's
+        // `Detached`, paired with the registry's cause by `at`.
+        for (seq, event) in [
+            (
+                12,
+                Event::BackgroundAgentLaunched {
+                    agent_id: "a1".into(),
+                    tool_call_id: "tc1".into(),
+                    description: "review-diff".into(),
+                    prompt: String::new(),
+                    model: String::new(),
+                    output_file: String::new(),
+                    started_at: now,
+                },
+            ),
+            (
+                13,
+                Event::BackgroundItemEnded {
+                    id: "a1".into(),
+                    reason: BackgroundEndReason::Lost,
+                    cause: Some(BackgroundLossCause::NewBuild),
+                    at: now,
+                },
+            ),
+            (
+                14,
+                Event::BackgroundAgentCompleted {
+                    agent_id: "a1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: now,
+                },
+            ),
+        ] {
+            state
+                .acp_event_store
+                .record("sess-loss", seq, &event)
+                .unwrap();
+        }
+
+        note_background_losses(&state).await;
+
+        let queued = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == "sess-loss")
+                .unwrap()
+                .queued_prompts
+                .clone()
+        };
+        assert_eq!(queued.len(), 1, "exactly one wake note must be queued");
+        assert!(
+            queued[0].text.contains("watch-log") && queued[0].text.contains("review-diff"),
+            "the note must name every lost item: {}",
+            queued[0].text
+        );
+        assert!(
+            state
+                .acp_event_store
+                .unnoted_background_losses("sess-loss")
+                .is_empty(),
+            "the pass must record BackgroundLossNoted"
+        );
+
+        note_background_losses(&state).await;
+        let queued_again = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == "sess-loss")
+                .unwrap()
+                .queued_prompts
+                .clone()
+        };
+        assert_eq!(
+            queued_again.len(),
+            1,
+            "a second pass with nothing new must not enqueue again"
         );
     }
 

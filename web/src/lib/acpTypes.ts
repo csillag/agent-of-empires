@@ -586,6 +586,18 @@ export type AcpEvent =
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
+  | {
+      BackgroundItemStarted: {
+        kind: "monitor" | "shell" | "wakeup" | "subagent" | "workflow";
+        id: string;
+        tool_call_id?: string | null;
+        label?: string | null;
+        started_at: string;
+        expires_at?: string | null;
+      };
+    }
+  | { BackgroundItemEnded: { id: string; reason: string; cause?: string; at: string } }
+  | { BackgroundLossNoted: { up_to: string } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } }
   | { ConversationSummary: { text: string; summarized_until_seq: number } };
@@ -836,24 +848,6 @@ export interface AcpState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the structured view banner next to the countdown. */
   nextWakeupReason: string | null;
-  /** True when the agent has an armed `Monitor` (a background watch).
-   *  Unlike a scheduled wakeup it has no fire time, so the UI shows a
-   *  static "monitoring" badge, not a countdown. A monitor firing
-   *  re-invokes the agent with activity but never a `UserPromptSent`, so
-   *  this persists across the wait and clears when the user takes over
-   *  (`UserPromptSent`) or the monitor fires and that turn ends: a tool
-   *  call started after the arm (`monitorWorkSeen`) followed by a
-   *  `Stopped`. See #2325. */
-  monitorArmed: boolean;
-  /** True once a tool call has started after the latest `MonitorArmed`,
-   *  i.e. the monitor fired and the agent acted on it. Gates the badge
-   *  clear on the next `Stopped` so the arming turn ending while the
-   *  monitor is still pending does not clear it. Reset by `MonitorArmed`
-   *  and `UserPromptSent`. See #2325. */
-  monitorWorkSeen: boolean;
-  /** The `description` the agent gave the `Monitor` tool, shown as the
-   *  badge tooltip. Null when none was provided or no monitor is armed. */
-  monitorDescription: string | null;
   /** True between a `CancelRequested` event (aoe sent `session/cancel`
    *  and armed the escalation watchdog) and the next `Stopped`. Drives
    *  the "Stopping..." spinner label and reveals the Force-stop
@@ -1269,9 +1263,6 @@ export function emptyAcpState(): AcpState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
-    monitorArmed: false,
-    monitorWorkSeen: false,
-    monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
     compacting: false,
@@ -1352,12 +1343,6 @@ function applyNewTurnResets(next: AcpState): void {
       next.nextWakeupReason = null;
     }
   }
-  // A monitor has no fire time to gate on. Unlike a wakeup it never
-  // self-fires a prompt, so any UserPromptSent reaching here is the user
-  // taking over: clear the "monitoring" badge unconditionally.
-  next.monitorArmed = false;
-  next.monitorWorkSeen = false;
-  next.monitorDescription = null;
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
@@ -1393,15 +1378,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       const priorBaseline = state.usageBaseline?.cost ?? 0;
       next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
-    }
-    return next;
-  }
-  if ("ToolCallStarted" in event) {
-    // A tool call after the monitor armed means the monitor fired and the
-    // agent is acting on it; gate the badge clear on the next Stopped. See
-    // #2325. The in-flight pointer itself is server-owned (Tier 1.2).
-    if (next.monitorArmed) {
-      next.monitorWorkSeen = true;
     }
     return next;
   }
@@ -1503,13 +1479,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // closeTurn.
     next.cancelEscalatesAt = null;
     closeTurn(next);
-    // Clear the "monitoring" badge once the monitor has fired and that turn
-    // ends. See #2325.
-    if (next.monitorArmed && next.monitorWorkSeen) {
-      next.monitorArmed = false;
-      next.monitorWorkSeen = false;
-      next.monitorDescription = null;
-    }
     // A stop for any reason but the limit itself ends the park, matching the
     // daemon's durable park the sidebar badge reads.
     if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
@@ -1666,13 +1635,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("WakeupScheduled" in event) {
     next.nextWakeupAt = event.WakeupScheduled.at;
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
-    return next;
-  }
-  if ("MonitorArmed" in event) {
-    next.monitorArmed = true;
-    // Reset the fired-work gate: work only counts once it follows THIS arm.
-    next.monitorWorkSeen = false;
-    next.monitorDescription = event.MonitorArmed.description ?? null;
     return next;
   }
   if ("CancelRequested" in event) {
