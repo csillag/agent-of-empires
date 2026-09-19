@@ -60,6 +60,11 @@ function HarnessComposer({ sessionId, queuedPrompts = [] }: { sessionId: string;
   );
 }
 
+function setVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
 function mountComposer(sessionId: string, queuedPrompts: QueuedPrompt[] = []) {
   const utils = render(<HarnessComposer sessionId={sessionId} queuedPrompts={queuedPrompts} />);
   const textarea = utils.container.querySelector("textarea");
@@ -111,6 +116,7 @@ afterEach(() => {
   // Unmount before restoring real timers so the unmount flush in the
   // draft effect does not race the next test's storage assertions.
   cleanup();
+  Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
   vi.useRealTimers();
   vi.unstubAllGlobals();
   window.localStorage.clear();
@@ -199,6 +205,51 @@ describe("Composer per-session draft persistence", () => {
       window.dispatchEvent(new Event("pagehide"));
     });
     expect(window.localStorage.getItem("acp:draft:sess-rescue")).toBe("server never took this\n\nstill typing");
+  });
+
+  // The unload sequence fires pagehide first and flips visibility to hidden
+  // after it, so a plain flush on hidden would land last and drop the rescue.
+  it("keeps the rescue when visibility flips to hidden after pagehide", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-order", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-order")).toBe("server never took this\n\nstill typing");
+  });
+
+  // iOS Safari fires pagehide only on a real unload, so an app switch that
+  // ends in the tab being evicted gets no other warning.
+  it("rescues on hidden alone, with no pagehide (the iOS shape)", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-ios", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-ios")).toBe("server never took this\n\nstill typing");
+  });
+
+  it("re-arms on return to the foreground so a second hide still flushes", () => {
+    const { textarea } = mountComposer("sess-rearm");
+    fireEvent.change(textarea, { target: { value: "first" } });
+    act(() => {
+      setVisibility("hidden");
+      setVisibility("visible");
+    });
+    fireEvent.change(textarea, { target: { value: "first and second" } });
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-rearm")).toBe("first and second");
   });
 
   it("leaves the queue out of the plain unmount flush, where the rows survive", () => {

@@ -189,10 +189,13 @@ function dropAllPersistedState(): void {
 }
 
 let sweptStorage = false;
-// One localStorage scan per page load: expire stale badge entries and
-// delete every pre-#4021 `v1` entry outright, so a browser that still
-// holds a frozen AcpState snapshot can never rehydrate one.
-function sweepExpiredStorage(): void {
+/** One localStorage scan per page load: expire stale badge entries and delete
+ *  every pre-#4021 `v1` entry outright, so a browser that still holds a frozen
+ *  AcpState snapshot can never rehydrate one and stops losing quota to it.
+ *  Called from the app entry point, because a browser that never opens a
+ *  session would otherwise keep a multi-megabyte entry forever, and again on
+ *  the first hook mount, which the guard makes free. */
+export function sweepAcpStateStorage(): void {
   if (sweptStorage) return;
   sweptStorage = true;
   if (typeof window === "undefined") return;
@@ -836,10 +839,9 @@ export function useAcpSession(
    *  `{ minutes: null }`. See #1581. */
   snoozedUntil: string | null = null,
 ) {
-  // Sweep expired badge entries and every legacy v1 snapshot on the first
-  // hook mount in this module's lifetime. Idempotent (guarded by
-  // `sweptStorage`) so the cost is one full localStorage scan per page load.
-  sweepExpiredStorage();
+  // Backstop for the app-entry sweep: guarded, so this is free when it has
+  // already run.
+  sweepAcpStateStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   // Mirror the triage timestamps onto refs so `sendPrompt`'s wake
@@ -1101,8 +1103,7 @@ export function useAcpSession(
         // baseline, rejected prompts, the optimistic turn counters).
         // `?view=rows` returns the folded rows with an EMPTY `frames`, so pull
         // both projections of the SAME page in parallel: default frames feed
-        // the control reducer, `view=rows` feeds the transcript. Identical
-        // pagination metadata, so the frames response drives the cursors.
+        // the control reducer, `view=rows` feeds the transcript.
         const tailParams = `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`;
         const [tailRes, tailRowsRes] = await Promise.all([
           fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${tailParams}`, { credentials: "same-origin" }),
@@ -1121,7 +1122,8 @@ export function useAcpSession(
         // rows dropped here would never be resent. Returning leaves the
         // cursors untouched so the next hydrate retries the same page.
         if (!tailRowsRes.ok) return;
-        const tailRows = ((await tailRowsRes.json()) as ReplayPageResponse).rows ?? [];
+        const tailRowsPage = (await tailRowsRes.json()) as ReplayPageResponse;
+        const tailRows = tailRowsPage.rows ?? [];
         dispatch({
           kind: "frames",
           frames: tail.frames ?? [],
@@ -1134,8 +1136,15 @@ export function useAcpSession(
         // awaited call subscribes with `since = highest_seq` and the
         // server drains only live events, not the whole transcript we
         // just rendered recent-first. See #2236.
-        if (tail.highest_seq > lastSeqRef.current) {
-          lastSeqRef.current = tail.highest_seq;
+        //
+        // The two legs are independent requests, so one can read the store
+        // later than the other. Take the LOWER head: dialling above a seq
+        // whose rows this page never carried would leave a hole the WS never
+        // resends, and every load is this path now (#4021). The overlap the
+        // lower cursor costs is deduped by seq in the reducer.
+        const tailHead = Math.min(tail.highest_seq, tailRowsPage.highest_seq);
+        if (tailHead > lastSeqRef.current) {
+          lastSeqRef.current = tailHead;
         }
         // Long session: the tail skipped the seq-0 handshake (prompt
         // capabilities, slash palette, agent/model/mode), pinned near the

@@ -843,25 +843,38 @@ export function Composer({
     // OS evicting the tab. Without these listeners, whatever the debounce
     // below is still holding at the moment the page dies is lost; on a fast
     // typer that's the last sentence or two of the draft (#1358).
-    // visibilitychange covers iOS Safari, which fires pagehide only on
-    // real unload, not on app-switch.
     const flush = () => setDraft(sessionId, draftTextRef.current);
-    // A real unload additionally rescues queued prompts the server never
-    // confirmed: nothing persists them any more, and re-posting one on the
-    // next load can re-send a prompt the server already drained (#4021).
-    // Unmount and app-switch keep the plain flush, because the queue rows
-    // are still in memory and on screen there.
-    const unloadFlush = () => setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
-    const onHidden = () => {
-      if (document.visibilityState === "hidden") flush();
+    // Every listener that can be the last writer before the page dies has to
+    // rescue queued prompts the server never confirmed: nothing persists them
+    // any more, and re-posting one on the next load can re-send a prompt the
+    // server already drained (#4021). That includes the hidden handler,
+    // because visibility flips to hidden *after* pagehide on a same-tab
+    // navigation, so a plain flush there would land last and drop the rescue;
+    // on iOS Safari, where pagehide fires only on a real unload, hidden is the
+    // only warning an evicted tab ever gets. The latch keeps the second one a
+    // no-op. Only the unmount cleanup stays plain: the queue rows survive it
+    // in memory and are still on screen.
+    let unloaded = false;
+    const unloadFlush = () => {
+      unloaded = true;
+      setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
+    };
+    const onVisibility = () => {
+      if (document.visibilityState !== "hidden") {
+        // Foreground again (app switch back, bfcache restore): re-arm, or a
+        // later hide would skip the flush #1358 needs.
+        unloaded = false;
+        return;
+      }
+      if (!unloaded) unloadFlush();
     };
     window.addEventListener("beforeunload", unloadFlush);
     window.addEventListener("pagehide", unloadFlush);
-    document.addEventListener("visibilitychange", onHidden);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("beforeunload", unloadFlush);
       window.removeEventListener("pagehide", unloadFlush);
-      document.removeEventListener("visibilitychange", onHidden);
+      document.removeEventListener("visibilitychange", onVisibility);
       flush();
     };
   }, [composerRuntime, sessionId]);
