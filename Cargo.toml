@@ -78,7 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # UUID generation
 uuid = { version = "1.23", features = ["v4"] }
-zstd = "0.13"
+zstd = { version = "0.13", features = ["pkg-config"] }
 
 # Random
 rand = "0.10"
@@ -117,7 +117,7 @@ rattles = "0.3"
 regex = "1.10"
 
 # Git operations
-git2 = { version = "0.21", features = ["vendored-openssl"] }
+git2 = { version = "0.21" }
 
 # Diff computation
 similar = "3.1"
@@ -141,7 +141,7 @@ which = "8.0"
 # system libsqlite3 dependency. Used to read session state without spawning
 # `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
 # via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40" }
 
 # Daemon HTTP/WS server. Core: the daemon is the product, the dashboard is one
 # surface on it (see the `web` feature).
