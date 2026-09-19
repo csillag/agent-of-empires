@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAui, useAuiState } from "@assistant-ui/react";
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from "@assistant-ui/core";
 
-import { getDraft, setDraft } from "../../lib/acpDrafts";
+import { getDraft, setDraft, unsentDraftOnUnload } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { fitTextarea, fileToBase64, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
@@ -75,7 +75,12 @@ export function useDraftPersistence(
   composerText: string,
   draftTextRef: React.RefObject<string>,
   taRef: TextareaRef,
+  queuedPrompts: readonly QueuedPrompt[],
 ) {
+  const queuedPromptsRef = useRef(queuedPrompts);
+  useEffect(() => {
+    queuedPromptsRef.current = queuedPrompts;
+  }, [queuedPrompts]);
   useEffect(() => {
     const saved = getDraft(sessionId);
     if (saved && client.getState().text === "") {
@@ -85,16 +90,20 @@ export function useDraftPersistence(
       });
     }
     const flush = () => setDraft(sessionId, draftTextRef.current);
+    // A real unload also rescues queued prompts the server never confirmed.
+    // Hide and unmount keep the plain flush: those rows are still on screen.
+    const unloadFlush = () =>
+      setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
     // iOS Safari fires pagehide only on real unload, not on app switch.
     const onHidden = () => {
       if (document.visibilityState === "hidden") flush();
     };
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", unloadFlush);
+    window.addEventListener("pagehide", unloadFlush);
     document.addEventListener("visibilitychange", onHidden);
     return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", unloadFlush);
+      window.removeEventListener("pagehide", unloadFlush);
       document.removeEventListener("visibilitychange", onHidden);
       flush();
     };

@@ -2,7 +2,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
-import type { PromptAttachmentInput } from "./acpTypes";
+import type { PromptAttachmentInput, QueuedPrompt } from "./acpTypes";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
@@ -75,6 +75,18 @@ export function setDraft(sessionId: string, text: string): void {
 
 export function clearDraft(sessionId: string): void {
   setDraft(sessionId, "");
+}
+
+/** Text a page unload must not lose: the live draft plus queued prompts the
+ *  server never confirmed. Oldest first, so the text being typed stays last. */
+export function unsentDraftOnUnload(draft: string, queued: readonly QueuedPrompt[]): string {
+  const unconfirmed = queued
+    .filter((q) => q.pending)
+    .map((q) => q.text.trim())
+    .filter((t) => t.length > 0);
+  if (unconfirmed.length === 0) return draft;
+  const tail = draft.trim();
+  return (tail.length > 0 ? [...unconfirmed, tail] : unconfirmed).join("\n\n");
 }
 
 function isPromptAttachmentKind(kind: unknown): kind is PromptAttachmentInput["kind"] {
