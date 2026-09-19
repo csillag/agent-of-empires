@@ -141,6 +141,34 @@ async fn persist_selector(
     }
 }
 
+/// The active pin a parked model pick loses to, if it differs. Picking the
+/// pinned model itself is allowed.
+async fn model_pin_against(state: &Arc<AppState>, id: &str, value: &str) -> Option<String> {
+    let (tool, agent_override, profile, project_path) = {
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == id)?;
+        (
+            inst.tool.clone(),
+            inst.agent_name.clone(),
+            inst.source_profile.clone(),
+            std::path::PathBuf::from(&inst.project_path),
+        )
+    };
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(&tool, agent_override.as_deref(), &profile, &project_path)
+        .await;
+    let pinned = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .acp
+            .pinned_model_for(&agent)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    (pinned != value.trim()).then_some(pinned)
+}
+
 /// The category the session's agent advertised for `config_id`, from the
 /// option catalog (the daemon keeps no live per-session option state).
 async fn config_option_category(
@@ -216,6 +244,19 @@ pub async fn acp_set_config_option(
         }
         Err(SupervisorError::UnknownSession(_)) if selector.is_some() => {
             let selector = selector.unwrap();
+            if selector == PersistedSelector::Model {
+                if let Some(pinned) = model_pin_against(&state, &id, &req.value).await {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "model is pinned: this session's agent is pinned to {pinned:?}, \
+                             so {:?} would not apply when it starts",
+                            req.value
+                        ),
+                    )
+                        .into_response();
+                }
+            }
             persist_selector(&state, &id, selector, &req.value, true).await;
             (StatusCode::ACCEPTED, Json(SetConfigOptionResponse::DEFERRED)).into_response()
         }

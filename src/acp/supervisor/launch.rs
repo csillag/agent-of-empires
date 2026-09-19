@@ -223,7 +223,6 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
 
         let acp_defaults = resolved_cfg.acp.acp_defaults_for(&req.agent);
-        let pinned = acp_defaults.is_some_and(|defaults| defaults.pin_model);
         let (model, effort) = crate::session::config::resolve_spawn_model_effort(
             acp_defaults,
             req.model.clone(),
@@ -350,9 +349,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
-                // A pin is re-asserted. A stored model is re-asserted only while
-                // `assert_model` says no agent has seen it yet.
-                default_model: (req.assert_model || pinned).then_some(model).flatten(),
+                // `model` is already pin-resolved, so an assert carries the pin.
+                // Without an assert, a stored model is not re-applied.
+                default_model: req.assert_model.then_some(model).flatten(),
                 socket_path: Some(socket_path),
                 stored_acp_session_id,
                 fork_from,
@@ -861,15 +860,19 @@ pub(super) fn refresh_spawn_model_effort(
     config.default_effort = effort;
 }
 
-/// Point both model channels of a cached respawn config at `model`.
+/// Point the env channel at `model`. An existing config-option assert follows
+/// it, so a pin that moved cannot be overridden by a stale assert. A config
+/// with no assert stays without one.
 pub(super) fn set_spawn_model(config: &mut SpawnConfig, model: Option<String>) {
     config
         .provider_env
         .retain(|(key, _)| key != "AOE_AGENT_MODEL");
-    if let Some(model) = model.clone() {
+    if config.default_model.is_some() {
+        config.default_model = model.clone();
+    }
+    if let Some(model) = model {
         config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
     }
-    config.default_model = model;
 }
 
 #[cfg(test)]
