@@ -855,8 +855,19 @@ export function Composer({
     // no-op. Only the unmount cleanup stays plain: the queue rows survive it
     // in memory and are still on screen.
     let unloaded = false;
+    let unlatch: ReturnType<typeof setTimeout> | undefined;
     const unloadFlush = () => {
       unloaded = true;
+      // Self-heal the latch. A real unload fires pagehide and the hidden
+      // transition inside one task, so no macrotask can land between them,
+      // but a beforeunload the user then cancels never reaches a `visible`
+      // transition to clear the latch: browsers hold visibility while the
+      // dialog is up. Without this the next genuine hide would be dropped
+      // and anything typed after the false alarm would have no rescue.
+      clearTimeout(unlatch);
+      unlatch = setTimeout(() => {
+        unloaded = false;
+      }, 0);
       setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
     };
     const onVisibility = () => {
@@ -875,6 +886,7 @@ export function Composer({
       window.removeEventListener("beforeunload", unloadFlush);
       window.removeEventListener("pagehide", unloadFlush);
       document.removeEventListener("visibilitychange", onVisibility);
+      clearTimeout(unlatch);
       flush();
     };
   }, [composerRuntime, sessionId]);

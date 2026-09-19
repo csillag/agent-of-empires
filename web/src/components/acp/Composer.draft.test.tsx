@@ -238,6 +238,32 @@ describe("Composer per-session draft persistence", () => {
     expect(window.localStorage.getItem("acp:draft:sess-ios")).toBe("server never took this\n\nstill typing");
   });
 
+  // A beforeunload the user cancels never reaches a `visible` transition, so
+  // the latch has to time out or the next real hide is dropped silently.
+  it("recovers from a cancelled unload so a later hide still rescues", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-cancelled", queued);
+    fireEvent.change(textarea, { target: { value: "before the false alarm" } });
+    act(() => {
+      window.dispatchEvent(new Event("beforeunload"));
+    });
+    // The navigation is cancelled: the page lives on and never goes visible
+    // again, because it never stopped being visible.
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+
+    fireEvent.change(textarea, { target: { value: "typed after the false alarm" } });
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-cancelled")).toBe(
+      "server never took this\n\ntyped after the false alarm",
+    );
+  });
+
   it("re-arms on return to the foreground so a second hide still flushes", () => {
     const { textarea } = mountComposer("sess-rearm");
     fireEvent.change(textarea, { target: { value: "first" } });
