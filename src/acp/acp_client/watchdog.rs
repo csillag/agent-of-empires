@@ -1130,7 +1130,7 @@ mod tests {
     // Steer-orphan suspects (STEER_ORPHAN_AFTER). Evidence: over 4 days, 95
     // cost-populated reports arrived while a tool was in flight outside any
     // steer window, and 83 of those tools completed afterward (median 1.6s,
-    // max 596s) -- so a cost report alone is never proof a tool is done and
+    // max 596s), so a cost report alone is never proof a tool is done and
     // the plain TerminalUsage arm must not clear tool_calls_in_flight (see
     // watchdog_tool_in_flight_suppresses_even_after_terminal_usage below,
     // unmodified). But of 14 steers with 21 tools in flight at the moment of
