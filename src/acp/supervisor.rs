@@ -3228,6 +3228,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
+                self.cancel_dead_requests(session_id);
                 // Publish `Stopped` so the UI clears any "thinking" state
                 // now rather than on the next reap tick. Stdio fixtures have
                 // no UI and share the seq counter with budget tests.
@@ -3643,6 +3644,44 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// No-op when there are no stale nonces.
     fn cancel_orphaned_elicitations(&self, session_id: &str) {
         cancel_orphaned_elicitations_on(&*self.sink, &self.next_seqs, session_id);
+    }
+
+    /// Resolve as cancelled every approval and question still open for a
+    /// worker that is gone. Its agent can no longer receive the answer, so a
+    /// card left standing would 404 on submit. Unlike the restart sweeps it
+    /// publishes no `Stopped`: the caller owns the turn state.
+    fn cancel_dead_requests(&self, session_id: &str) {
+        let approvals = self.sink.unresolved_approval_nonces(session_id);
+        let elicitations = self.sink.unresolved_elicitation_nonces(session_id);
+        if approvals.is_empty() && elicitations.is_empty() {
+            return;
+        }
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            approvals = approvals.len(),
+            elicitations = elicitations.len(),
+            "cancelling requests left open by a stopped worker"
+        );
+        for nonce in approvals {
+            self.publish_next(
+                session_id,
+                &Event::ApprovalResolved {
+                    nonce,
+                    decision: ApprovalDecision::Cancelled,
+                },
+            );
+        }
+        for nonce in elicitations {
+            self.publish_next(
+                session_id,
+                &Event::ElicitationResolved {
+                    nonce,
+                    outcome: ElicitationOutcome::Cancelled,
+                    answers: Vec::new(),
+                },
+            );
+        }
     }
 
     /// Whether this session has a structured view worker up or coming up.
@@ -8663,6 +8702,25 @@ cursor-acp-bridge = "agent acp"
         let sup = Supervisor::new(sink.clone());
         sup.cancel_orphaned_elicitations("s-attach");
         assert!(sink.frames.lock().unwrap().is_empty());
+    }
+
+    /// A worker's open question dies with it, so stopping the worker must
+    /// clear the card instead of leaving an answer to 404.
+    #[tokio::test]
+    async fn shutdown_cancels_the_questions_of_the_stopped_worker() {
+        let sink = VecSink::with_stale_elicitation_nonces(vec![Nonce("e-open".into())]);
+        let sup = Supervisor::new(sink.clone());
+        sup.test_insert_worker("s-ask").await;
+        sup.shutdown_idle("s-ask").await.expect("shutdown ok");
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(
+            frames.iter().any(|f| matches!(
+                &f.2,
+                Event::ElicitationResolved { nonce, outcome: ElicitationOutcome::Cancelled, .. }
+                    if nonce.0 == "e-open"
+            )),
+            "expected the open question cancelled, got {frames:?}"
+        );
     }
 
     /// Empty stale-nonce list must be a no-op: do NOT publish a stray
