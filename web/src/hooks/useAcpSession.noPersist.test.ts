@@ -16,9 +16,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState, type AcpState } from "../lib/acpTypes";
 import { getQueuedCount } from "../lib/acpStateStorage";
-import { __test, clearAcpCache, useAcpSession } from "./useAcpSession";
+import { __test, clearAcpCache, sweepAcpStateStorage, useAcpSession } from "./useAcpSession";
 
 const { persistState, resetStorageSweep, STORAGE_KEY_PREFIX, LEGACY_KEY_PREFIX } = __test;
+const TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 interface FakeSocket {
   url: string;
@@ -158,6 +159,42 @@ describe("useAcpSession / no persisted server-owned state (#4021)", () => {
     expect(window.localStorage.getItem(LEGACY_KEY_PREFIX + "sess-frozen")).toBeNull();
   });
 
+  it("dials the WS at the lower of the tail's two legs, never above the rows it has", async () => {
+    // The frames and `view=rows` legs are independent requests, so one can
+    // read the store later than the other. Dialling at the frames head would
+    // skip rows the rows leg never carried, and nothing refetches them.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/api/login/status")) {
+          return new Response(JSON.stringify({ required: false, authenticated: true, elevated: true }), {
+            status: 200,
+          });
+        }
+        const rowsLeg = url.includes("view=rows");
+        return new Response(
+          JSON.stringify({
+            frames: [],
+            rows: rowsLeg ? [serverRow] : [],
+            lost: false,
+            highest_seq: rowsLeg ? 8900 : 9000,
+            lowest_seq: 1,
+            next_cursor: 8000,
+            has_more: true,
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+
+    renderHook(() => useAcpSession("sess-race"));
+    await flush();
+
+    expect(sockets).toHaveLength(1);
+    expect(sockets[0]!.url).toContain("/acp/ws?since=8900");
+  });
+
   it("sweeps every v1 entry, not just the mounted session's", async () => {
     writeV1Entry("sess-frozen", frozenV1State());
     writeV1Entry("sess-other", frozenV1State());
@@ -221,5 +258,40 @@ describe("useAcpSession / no persisted server-owned state (#4021)", () => {
       ],
     });
     expect(getQueuedCount("sess-badge")).toBe(2);
+  });
+});
+
+// The sweep runs from the app entry point too (`main.tsx`), so a browser that
+// never opens a session still loses its frozen v1 entry instead of carrying
+// megabytes that fail every other localStorage write.
+describe("sweepAcpStateStorage", () => {
+  const live = (savedAt: number) => JSON.stringify({ savedAt, queuedCount: 1 });
+
+  it("drops v1 snapshots, expired and unreadable v2 entries, and keeps the rest", () => {
+    writeV1Entry("sess-frozen", frozenV1State());
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + "sess-fresh", live(Date.now()));
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + "sess-expired", live(Date.now() - TTL_MS - 1000));
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + "sess-corrupt", "not valid json{{{");
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + "sess-undated", JSON.stringify({ queuedCount: 1 }));
+    window.localStorage.setItem(STORAGE_KEY_PREFIX + "sess-empty", "");
+    window.localStorage.setItem("acp:draft:sess-frozen", "unsent text");
+
+    sweepAcpStateStorage();
+
+    expect(window.localStorage.getItem(LEGACY_KEY_PREFIX + "sess-frozen")).toBeNull();
+    expect(window.localStorage.getItem(STORAGE_KEY_PREFIX + "sess-expired")).toBeNull();
+    expect(window.localStorage.getItem(STORAGE_KEY_PREFIX + "sess-corrupt")).toBeNull();
+    expect(window.localStorage.getItem(STORAGE_KEY_PREFIX + "sess-undated")).toBeNull();
+    expect(window.localStorage.getItem(STORAGE_KEY_PREFIX + "sess-empty")).toBeNull();
+    // A live badge entry and client-owned keys are never touched.
+    expect(window.localStorage.getItem(STORAGE_KEY_PREFIX + "sess-fresh")).not.toBeNull();
+    expect(window.localStorage.getItem("acp:draft:sess-frozen")).toBe("unsent text");
+  });
+
+  it("scans once per page load", () => {
+    sweepAcpStateStorage();
+    writeV1Entry("sess-late", frozenV1State());
+    sweepAcpStateStorage();
+    expect(window.localStorage.getItem(LEGACY_KEY_PREFIX + "sess-late")).not.toBeNull();
   });
 });

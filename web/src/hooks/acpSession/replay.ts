@@ -62,10 +62,14 @@ async function fetchTail(
     return;
   }
   if (!tailRowsRes.ok) return;
-  const rows = toActivityRows(await readRows(tailRowsRes), sid);
+  const tailRowsPage = (await tailRowsRes.json()) as ReplayPageResponse;
+  const rows = toActivityRows(tailRowsPage.rows ?? [], sid);
   dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: tail.next_cursor ?? 0 });
   setHasMoreOlder(tail.has_more ?? false);
-  if (tail.highest_seq > lastSeq.current) lastSeq.current = tail.highest_seq;
+  // The two legs are independent, so one can read the store later. Take the
+  // lower head: dialling above a seq this page never carried leaves a hole.
+  const tailHead = Math.min(tail.highest_seq, tailRowsPage.highest_seq);
+  if (tailHead > lastSeq.current) lastSeq.current = tailHead;
   if ((tail.has_more ?? false) && (tail.next_cursor ?? 0) > 1) {
     const hsRes = await getReplay(sid, `since=0&limit=${HANDSHAKE_PREFIX_SIZE}`);
     if (hsRes.ok) {

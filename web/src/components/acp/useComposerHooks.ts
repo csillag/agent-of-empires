@@ -90,13 +90,18 @@ export function useDraftPersistence(
       });
     }
     const flush = () => setDraft(sessionId, draftTextRef.current);
-    // A real unload also rescues queued prompts the server never confirmed.
-    // Hide and unmount keep the plain flush: those rows are still on screen.
-    const unloadFlush = () =>
+    // Rescue queued prompts the server never confirmed. Hidden runs the same
+    // flush: it fires after pagehide, and a plain flush last would drop the
+    // rescued text. Latched so the second signal is a no-op; re-armed on return.
+    let unloaded = false;
+    const unloadFlush = () => {
+      if (unloaded) return;
+      unloaded = true;
       setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
-    // iOS Safari fires pagehide only on real unload, not on app switch.
+    };
     const onHidden = () => {
-      if (document.visibilityState === "hidden") flush();
+      if (document.visibilityState === "hidden") unloadFlush();
+      else unloaded = false;
     };
     window.addEventListener("beforeunload", unloadFlush);
     window.addEventListener("pagehide", unloadFlush);

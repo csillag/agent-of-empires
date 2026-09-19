@@ -225,4 +225,8 @@ describe("persist-failure toast dedupe (#1345)", () => {
     setDraft("sess-a", "");
     expect(errors).toEqual([]);
   });
+
+  it("keeps the live draft verbatim, including whitespace the owner typed", () => {
+    expect(unsentDraftOnUnload("  indented\n", [q("b", "rescue me", true)])).toBe("rescue me\n\n  indented\n");
+  });
 });

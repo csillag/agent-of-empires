@@ -38,6 +38,11 @@ export { clearAcpCache, useBackgroundAgents } from "./acpSession/stateCache";
 
 export const __test = { persistState, resetStorageSweep, STORAGE_KEY_PREFIX, LEGACY_KEY_PREFIX };
 
+/** Drop expired badge entries and every frozen `aoe:acp-state:v1:` snapshot. */
+export function sweepAcpStateStorage(): void {
+  sweepExpiredStorage();
+}
+
 type PromptSendResult =
   | { kind: "dispatched" }
   | { kind: "queued"; queuedId: string }

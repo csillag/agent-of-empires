@@ -85,8 +85,9 @@ export function unsentDraftOnUnload(draft: string, queued: readonly QueuedPrompt
     .map((q) => q.text.trim())
     .filter((t) => t.length > 0);
   if (unconfirmed.length === 0) return draft;
-  const tail = draft.trim();
-  return (tail.length > 0 ? [...unconfirmed, tail] : unconfirmed).join("\n\n");
+  // The live draft goes through verbatim: its leading and trailing whitespace
+  // is text the owner typed, and only a blank one is dropped.
+  return (draft.trim().length > 0 ? [...unconfirmed, draft] : unconfirmed).join("\n\n");
 }
 
 function isPromptAttachmentKind(kind: unknown): kind is PromptAttachmentInput["kind"] {
