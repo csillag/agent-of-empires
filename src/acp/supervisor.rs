@@ -2364,6 +2364,15 @@ impl<S: BroadcastSink> Supervisor<S> {
                         "drain channel closed (agent connection task ended); evaluating respawn"
                     );
                     if agent_unresponsive {
+                        // The runner deletes its own registry record as it exits,
+                        // and `restart_decision` reads a missing record as
+                        // `aoe acp stop`. Mark this generation restart-pending
+                        // first, so the kill reads as the restart it is whichever
+                        // of this task and the reaper observes it first.
+                        crate::process::worker_registry::mark_restart_pending(
+                            &session_id,
+                            lease.epoch(),
+                        );
                         kill_wedged_runner(&*process_control, &session_id).await;
                     }
                     // Removes this epoch's handle; a no-op if a newer epoch
@@ -2399,65 +2408,91 @@ impl<S: BroadcastSink> Supervisor<S> {
                         drop_handle(&lease).await;
                         return;
                     }
-                    let mut respawn_config: SpawnConfig =
-                        match restart_decision(&workers, &session_id).await {
-                            RestartDecision::Respawn(cfg) => {
-                                info!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    command = %cfg.spec.command,
-                                    stored_id = ?cfg.stored_acp_session_id,
-                                    "respawn approved; sleeping {}ms before restart",
-                                    RESPAWN_BACKOFF.as_millis()
-                                );
-                                *cfg
-                            }
-                            RestartDecision::BudgetBurned => {
-                                warn!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    max_respawns = MAX_RESPAWNS_IN_WINDOW,
-                                    window_secs = RESTART_WINDOW.as_secs(),
-                                    "restart budget burned; parking session"
-                                );
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
-                                    &session_id,
-                                    seq,
-                                    &Event::AgentStartupError {
-                                        message: format!(
-                                            "ACP agent crashed more than {} times in {}s; \
+                    let mut respawn_config: SpawnConfig = match restart_decision(
+                        &workers,
+                        &session_id,
+                        agent_unresponsive,
+                    )
+                    .await
+                    {
+                        RestartDecision::Respawn(cfg) => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                command = %cfg.spec.command,
+                                stored_id = ?cfg.stored_acp_session_id,
+                                "respawn approved; sleeping {}ms before restart",
+                                RESPAWN_BACKOFF.as_millis()
+                            );
+                            *cfg
+                        }
+                        RestartDecision::BudgetBurned => {
+                            warn!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                max_respawns = MAX_RESPAWNS_IN_WINDOW,
+                                window_secs = RESTART_WINDOW.as_secs(),
+                                "restart budget burned; parking session"
+                            );
+                            let seq = next_seq(&next_seqs, &session_id);
+                            sink.publish(
+                                &session_id,
+                                seq,
+                                &Event::AgentStartupError {
+                                    message: format!(
+                                        "ACP agent crashed more than {} times in {}s; \
                                      not respawning. Use the web dashboard to retry.",
-                                            MAX_RESPAWNS_IN_WINDOW,
-                                            RESTART_WINDOW.as_secs()
-                                        ),
-                                    },
-                                );
-                                drop_handle(&lease).await;
-                                return;
-                            }
-                            RestartDecision::Gone => {
-                                return;
-                            }
-                            RestartDecision::UserStopped => {
-                                info!(
-                                    target: "acp.supervisor",
-                                    session = %session_id,
-                                    "worker registry deleted by user (`aoe acp stop|kill`); \
-                                     dropping WorkerHandle without respawn"
-                                );
-                                let seq = next_seq(&next_seqs, &session_id);
-                                sink.publish(
-                                    &session_id,
-                                    seq,
-                                    &Event::Stopped {
-                                        reason: "user_stopped".into(),
-                                    },
-                                );
-                                drop_handle(&lease).await;
-                                return;
-                            }
-                        };
+                                        MAX_RESPAWNS_IN_WINDOW,
+                                        RESTART_WINDOW.as_secs()
+                                    ),
+                                },
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                        RestartDecision::Gone => {
+                            return;
+                        }
+                        RestartDecision::DaemonRestart => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "daemon-ordered restart; dropping the handle for the resume pass"
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                        RestartDecision::NoSpawnConfig => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "attached worker ended; re-armed for the reconciler's resume pass, not a crash"
+                            );
+                            // Unpins it from the reconciler's `attempted` set;
+                            // otherwise nothing ever respawns it.
+                            lock_recover(&startup_failures).insert(session_id.clone());
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                        RestartDecision::UserStopped => {
+                            info!(
+                                target: "acp.supervisor",
+                                session = %session_id,
+                                "worker registry deleted by user (`aoe acp stop|kill`); \
+                                 dropping WorkerHandle without respawn"
+                            );
+                            let seq = next_seq(&next_seqs, &session_id);
+                            sink.publish(
+                                &session_id,
+                                seq,
+                                &Event::Stopped {
+                                    reason: "user_stopped".into(),
+                                },
+                            );
+                            drop_handle(&lease).await;
+                            return;
+                        }
+                    };
 
                     // The respawn runs under its own epoch: a shutdown that
                     // lands from here on is recorded as a cancel against it
@@ -4009,6 +4044,11 @@ enum RestartDecision {
     // respawn flow.
     Respawn(Box<SpawnConfig>),
     BudgetBurned,
+    /// The daemon ordered this restart (a drained build-stale respawn,
+    /// `aoe acp restart`): a restart marker names this generation. The
+    /// reaper and the resume pass own it, so the drain task only drops its
+    /// handle, with no crash banner and no stop.
+    DaemonRestart,
     /// The worker entry was removed (e.g. shutdown).
     Gone,
     /// The on-disk worker registry entry for this session was deleted
@@ -4018,11 +4058,15 @@ enum RestartDecision {
     /// and emits a soft `Stopped` event instead of burning the restart
     /// budget with respawns of an agent the user just terminated.
     UserStopped,
+    /// An attached worker ended: no spawn config, so the reconciler
+    /// respawns it. Not a crash.
+    NoSpawnConfig,
 }
 
 async fn restart_decision(
     workers: &Arc<Mutex<HashMap<String, WorkerHandle>>>,
     session_id: &str,
+    killed_as_unresponsive: bool,
 ) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
@@ -4051,15 +4095,44 @@ async fn restart_decision(
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
+    // Checked before the registry: the runner may not have removed its
+    // record yet, and a restart the daemon ordered is never a crash.
+    if runner_managed
+        && !killed_as_unresponsive
+        && crate::process::worker_registry::peek_restart_marker(session_id)
+            == Some(handle.lease.epoch())
+    {
+        debug!(
+            target: "acp.supervisor",
+            session = %session_id,
+            "restart_decision: the daemon ordered this restart; leaving it to the resume pass"
+        );
+        return RestartDecision::DaemonRestart;
+    }
     if runner_managed {
         let registry_gone = matches!(crate::process::worker_registry::load(session_id), Ok(None));
         if registry_gone {
-            debug!(
-                target: "acp.supervisor",
-                session = %session_id,
-                "restart_decision: registry entry gone, treating as user-initiated stop"
-            );
-            return RestartDecision::UserStopped;
+            // After the wedged-agent kill, this generation's marker says the
+            // missing record is that kill: consume it and respawn.
+            if killed_as_unresponsive
+                && crate::process::worker_registry::take_restart_marker(
+                    session_id,
+                    handle.lease.epoch(),
+                )
+            {
+                debug!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "restart_decision: registry entry gone under this generation's restart marker; respawning"
+                );
+            } else {
+                debug!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "restart_decision: registry entry gone, treating as user-initiated stop"
+                );
+                return RestartDecision::UserStopped;
+            }
         }
     }
     let now = Instant::now();
@@ -4083,11 +4156,10 @@ async fn restart_decision(
     }
     match &handle.kind {
         WorkerKind::Runner { spawn_config } => RestartDecision::Respawn(spawn_config.clone()),
-        // Attached: the previous daemon owned the runner and we have
-        // no spawn config to respawn from. The reconciler will pick
-        // this session back up on the next tick if it's still
-        // `structured_view = true`.
-        WorkerKind::Attached => RestartDecision::BudgetBurned,
+        // Attached: this daemon only reattached to a runner another daemon
+        // started, so there is no spawn config to respawn from; the drain
+        // task re-arms the session for the reconciler's resume pass instead.
+        WorkerKind::Attached => RestartDecision::NoSpawnConfig,
         // Stdio: in-proc test fixture with no subprocess to respawn.
         #[cfg(test)]
         WorkerKind::Stdio => RestartDecision::BudgetBurned,
@@ -5611,14 +5683,14 @@ cursor-acp-bridge = "agent acp"
         }
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-1").await;
+            let decision = restart_decision(&sup.workers, "s-1", false).await;
             assert!(
                 matches!(decision, RestartDecision::Respawn(_)),
                 "decision #{i} should be Respawn",
             );
         }
         // One more push past the threshold should burn the budget.
-        let decision = restart_decision(&sup.workers, "s-1").await;
+        let decision = restart_decision(&sup.workers, "s-1", false).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
@@ -5637,7 +5709,7 @@ cursor-acp-bridge = "agent acp"
     /// production code path fires.
     #[tokio::test]
     #[serial_test::serial]
-    async fn restart_decision_returns_user_stopped_when_registry_deleted() {
+    async fn restart_decision_reads_a_missing_registry_entry_by_its_restart_marker() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _home = crate::session::test_support::isolate_home(tmp.path());
         let sink = VecSink::new();
@@ -5671,7 +5743,7 @@ cursor-acp-bridge = "agent acp"
             source_profile: None,
             mcp_servers: Vec::new(),
         };
-        {
+        let lease = {
             let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
             sup.test_install_handle(
                 "s-stop",
@@ -5681,14 +5753,145 @@ cursor-acp-bridge = "agent acp"
                 },
                 None,
             )
-            .await;
-        }
+            .await
+        };
         // No registry entry for "s-stop" — production code reads this
         // as a user-initiated stop signal.
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+        // A marker for another generation is stale and changes nothing.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
+        assert!(
+            matches!(decision, RestartDecision::UserStopped),
+            "a stale-generation marker must not authorize a restart, got {decision:?}"
+        );
+        // A marker the daemon wrote for its own respawn of a drained
+        // build-stale worker is the resume pass's: no crash, no stop, marker
+        // left alone. Reading it as a crash showed a false "crashed more than
+        // 3 times" banner.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", false).await;
+        assert!(
+            matches!(decision, RestartDecision::DaemonRestart),
+            "a restart the daemon ordered must not be read as a crash, got {decision:?}"
+        );
+        assert!(
+            crate::process::worker_registry::take_restart_marker("s-stop", lease.epoch()),
+            "the marker must be left for the reaper"
+        );
+        // The wedged-agent watchdog marks this generation before it kills the
+        // runner, so the same missing record now reads as the restart it is.
+        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
+        assert!(
+            matches!(decision, RestartDecision::Respawn(_)),
+            "this generation's marker must turn a missing record into a respawn, got {decision:?}"
+        );
+    }
+
+    /// An attached worker's end is not a budget burn until the window is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn restart_decision_treats_an_attached_worker_end_as_no_spawn_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; the fixture pattern above.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sup = Supervisor::new(VecSink::new());
+        // A live registry record, as an attached runner has: the drain
+        // task reaches the kind match instead of reading a stop signal.
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-attached".into(),
+            std::process::id(),
+            tmp.path().join("attached.sock"),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-attached".into()));
+        sup.test_install_handle("s-attached", client, WorkerKind::Attached, None)
+            .await;
+
+        for i in 0..MAX_RESPAWNS_IN_WINDOW {
+            let decision = restart_decision(&sup.workers, "s-attached", true).await;
+            assert!(
+                matches!(decision, RestartDecision::NoSpawnConfig),
+                "decision #{i} should be NoSpawnConfig, got {decision:?}"
+            );
+        }
+        // Past the threshold, a real budget burn still wins.
+        let decision = restart_decision(&sup.workers, "s-attached", true).await;
+        assert!(matches!(decision, RestartDecision::BudgetBurned));
+    }
+
+    /// The drain task re-arms an attached worker's session and shows no
+    /// crash banner.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn drain_re_arms_an_attached_worker_end_as_a_startup_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `#[serial]`; the fixture pattern above.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+        let sink = VecSink::new();
+        let sup = Supervisor::new(sink.clone());
+        let record = crate::process::worker_registry::WorkerRecord::new(
+            "s-attached-drain".into(),
+            std::process::id(),
+            tmp.path().join("attached.sock"),
+            "claude-agent-acp".into(),
+            "claude-code".into(),
+            std::env::temp_dir(),
+            None,
+            vec![],
+            vec![],
+            None,
+            None,
+        );
+        crate::process::worker_registry::save(&record).unwrap();
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::channel::<Event>(16);
+        let (client, _client_tx) =
+            AcpClient::fake_for_test(AcpSessionId("s-attached-drain".into()));
+        let lease = sup
+            .test_install_handle("s-attached-drain", client, WorkerKind::Attached, None)
+            .await;
+        let drain = sup.start_drain_task("s-attached-drain".into(), lease, inbound_rx);
+
+        drop(inbound_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), drain)
+            .await
+            .expect("drain task should exit within 2s of inbound close");
+
+        assert!(
+            !sup.workers.lock().await.contains_key("s-attached-drain"),
+            "the handle must be dropped"
+        );
+        assert_eq!(
+            sup.take_startup_failures(),
+            vec!["s-attached-drain".to_string()],
+            "an attached worker's end must be re-armed like a startup failure"
+        );
+        let frames = sink.frames.lock().unwrap();
+        assert!(
+            !frames.iter().any(|(_, _, ev)| matches!(
+                ev,
+                Event::AgentStartupError { message } if message.contains("crashed more than")
+            )),
+            "no crash banner for a reattached worker ending"
         );
     }
 
