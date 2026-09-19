@@ -23,9 +23,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 
+import type { QueuedPrompt } from "../../lib/acpTypes";
 import { Composer } from "./Composer";
 
-function HarnessComposer({ sessionId }: { sessionId: string }) {
+function HarnessComposer({ sessionId, queuedPrompts = [] }: { sessionId: string; queuedPrompts?: QueuedPrompt[] }) {
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages: [],
     isRunning: false,
@@ -52,13 +53,15 @@ function HarnessComposer({ sessionId }: { sessionId: string }) {
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
+        queuedPrompts={queuedPrompts}
+        editQueuedPrompt={() => {}}
       />
     </AssistantRuntimeProvider>
   );
 }
 
-function mountComposer(sessionId: string) {
-  const utils = render(<HarnessComposer sessionId={sessionId} />);
+function mountComposer(sessionId: string, queuedPrompts: QueuedPrompt[] = []) {
+  const utils = render(<HarnessComposer sessionId={sessionId} queuedPrompts={queuedPrompts} />);
   const textarea = utils.container.querySelector("textarea");
   if (!textarea) throw new Error("composer textarea not rendered");
   return { ...utils, textarea };
@@ -179,6 +182,33 @@ describe("Composer per-session draft persistence", () => {
     const back = mountComposer("sess-send");
     await flushComposer();
     expect(back.textarea.value).toBe("");
+  });
+
+  // #4021: queued prompts are no longer persisted and are never re-posted,
+  // so an unload is the last chance to keep a prompt the server never
+  // confirmed. It comes back as draft text, not as a silent re-send.
+  it("folds an unconfirmed queued prompt into the draft on page unload", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q1", text: "server took this", queuedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-rescue", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-rescue")).toBe("server never took this\n\nstill typing");
+  });
+
+  it("leaves the queue out of the plain unmount flush, where the rows survive", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea, unmount } = mountComposer("sess-switch", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+    unmount();
+    expect(window.localStorage.getItem("acp:draft:sess-switch")).toBe("still typing");
   });
 
   it("flushes the pending debounced write on unmount so a fast switch loses nothing", () => {

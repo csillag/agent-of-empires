@@ -11,20 +11,9 @@ function entryKey(id: string): string {
 }
 
 // Write a persisted acp-state entry shaped like useAcpSession's
-// persistState output, with `queuedPrompts` of the given length.
+// persistState output: a savedAt stamp and the queued-prompt count.
 function writeEntry(id: string, queued: number, savedAt = Date.now()): void {
-  const queuedPrompts = Array.from({ length: queued }, (_, i) => ({
-    id: `${id}-${i}`,
-    text: `q${i}`,
-    queuedAt: new Date(savedAt).toISOString(),
-  }));
-  localStorage.setItem(
-    entryKey(id),
-    JSON.stringify({
-      savedAt,
-      state: { lastSeq: 0, activity: [], queuedPrompts },
-    }),
-  );
+  localStorage.setItem(entryKey(id), JSON.stringify({ savedAt, queuedCount: queued }));
 }
 
 beforeEach(() => {
@@ -80,17 +69,7 @@ describe("useQueuedCountForSessions", () => {
     const { result } = renderHook(() => useQueuedCountForSessions(["a"]));
     expect(result.current).toBe(0);
 
-    const newValue = JSON.stringify({
-      savedAt: Date.now(),
-      state: {
-        lastSeq: 0,
-        activity: [],
-        queuedPrompts: [
-          { id: "a-0", text: "q0", queuedAt: "t" },
-          { id: "a-1", text: "q1", queuedAt: "t" },
-        ],
-      },
-    });
+    const newValue = JSON.stringify({ savedAt: Date.now(), queuedCount: 2 });
     act(() => {
       window.dispatchEvent(
         new StorageEvent("storage", {
@@ -109,14 +88,7 @@ describe("useQueuedCountForSessions", () => {
       window.dispatchEvent(
         new StorageEvent("storage", {
           key: entryKey("b"),
-          newValue: JSON.stringify({
-            savedAt: Date.now(),
-            state: {
-              lastSeq: 0,
-              activity: [],
-              queuedPrompts: [{ id: "b-0", text: "x", queuedAt: "t" }],
-            },
-          }),
+          newValue: JSON.stringify({ savedAt: Date.now(), queuedCount: 1 }),
           storageArea: localStorage,
         }),
       );
@@ -147,14 +119,7 @@ describe("useQueuedCountForSessions", () => {
       window.dispatchEvent(
         new StorageEvent("storage", {
           key: entryKey("a"),
-          newValue: JSON.stringify({
-            savedAt: Date.now(),
-            state: {
-              lastSeq: 0,
-              activity: [],
-              queuedPrompts: [{ id: "a-0", text: "x", queuedAt: "t" }],
-            },
-          }),
+          newValue: JSON.stringify({ savedAt: Date.now(), queuedCount: 1 }),
           storageArea: localStorage,
         }),
       );

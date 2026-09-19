@@ -10,8 +10,10 @@
 //    fires on every keystroke and a naive toast would storm. Each session
 //    toasts at most once per page lifetime, until a later successful write
 //    clears its dedupe entry. Two failing sessions toast independently.
-//    State-cache writes stay silent (handled in useStructuredView.ts); only
-//    drafts trip this toast.
+//    State-cache writes stay silent; only drafts trip this toast.
+// 3. `unsentDraftOnUnload`, which folds queued prompts the server never
+//    confirmed back into the draft on unload. Since #4021 nothing re-posts
+//    them, so the draft is the only thing keeping that text.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -27,8 +29,9 @@ import {
   setDraftAttachments,
   subscribeDrafts,
   sweepOrphanDrafts,
+  unsentDraftOnUnload,
 } from "./acpDrafts";
-import type { PromptAttachmentInput } from "./acpTypes";
+import type { PromptAttachmentInput, QueuedPrompt } from "./acpTypes";
 import { toastBus, type ToastApi } from "./toastBus";
 
 function img(dataB64 = "AAAA", name?: string): PromptAttachmentInput {
@@ -493,5 +496,27 @@ describe("acpDrafts toast dedupe (#1345)", () => {
     setDraft("sess-a", "hello");
     expect(window.localStorage.getItem("acp:draft:sess-a")).toBe("hello");
     expect(spy.errors).toHaveLength(0);
+  });
+});
+
+describe("unsentDraftOnUnload (#4021)", () => {
+  const q = (id: string, text: string, pending?: boolean): QueuedPrompt => ({
+    id,
+    text,
+    queuedAt: "2026-01-01T00:00:00.000Z",
+    ...(pending ? { pending: true } : {}),
+  });
+
+  it("returns the draft untouched when every queued row is confirmed", () => {
+    expect(unsentDraftOnUnload("typing", [q("a", "on the server")])).toBe("typing");
+  });
+
+  it("prepends unconfirmed rows, oldest first, keeping the live draft last", () => {
+    const queued = [q("a", "confirmed"), q("b", "never landed", true), q("c", "also stuck", true)];
+    expect(unsentDraftOnUnload("typing", queued)).toBe("never landed\n\nalso stuck\n\ntyping");
+  });
+
+  it("rescues an unconfirmed row with no draft, and ignores blank text", () => {
+    expect(unsentDraftOnUnload("  ", [q("b", "rescue me", true), q("c", "   ", true)])).toBe("rescue me");
   });
 });

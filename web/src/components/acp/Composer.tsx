@@ -38,7 +38,7 @@ import type {
   PromptCapabilities,
   QueuedPrompt,
 } from "../../lib/acpTypes";
-import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
+import { clearDraft, clearDraftAttachments, getDraft, setDraft, unsentDraftOnUnload } from "../../lib/acpDrafts";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
@@ -548,6 +548,12 @@ export function Composer({
   useEffect(() => {
     draftTextRef.current = composerText;
   }, [composerText]);
+  // Mirrored so the unload listeners read the current queue without being
+  // re-registered on every queue change.
+  const queuedPromptsRef = useRef(queuedPrompts);
+  useEffect(() => {
+    queuedPromptsRef.current = queuedPrompts;
+  }, [queuedPrompts]);
   const composerRuntime = useMemo<ComposerClient>(
     () => ({
       getState: () => composerRef.current.getState(),
@@ -840,15 +846,21 @@ export function Composer({
     // visibilitychange covers iOS Safari, which fires pagehide only on
     // real unload, not on app-switch.
     const flush = () => setDraft(sessionId, draftTextRef.current);
+    // A real unload additionally rescues queued prompts the server never
+    // confirmed: nothing persists them any more, and re-posting one on the
+    // next load can re-send a prompt the server already drained (#4021).
+    // Unmount and app-switch keep the plain flush, because the queue rows
+    // are still in memory and on screen there.
+    const unloadFlush = () => setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
     const onHidden = () => {
       if (document.visibilityState === "hidden") flush();
     };
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
+    window.addEventListener("beforeunload", unloadFlush);
+    window.addEventListener("pagehide", unloadFlush);
     document.addEventListener("visibilitychange", onHidden);
     return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", unloadFlush);
+      window.removeEventListener("pagehide", unloadFlush);
       document.removeEventListener("visibilitychange", onHidden);
       flush();
     };

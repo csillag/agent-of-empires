@@ -18,7 +18,6 @@ import {
   emptyAcpState,
   hasActiveBackgroundAgent,
   isVisiblyBusy,
-  normaliseTurnState,
   type AcpFrame,
   type AcpState,
   type BackgroundAgent,
@@ -1602,55 +1601,6 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
   });
 });
 
-describe("normaliseTurnState (#3417 persisted-state backfill)", () => {
-  it("seeds serverTurnActive from a cached turnActive=true", () => {
-    const cached = {
-      ...emptyAcpState(),
-      turnActive: true,
-    } as AcpState & { serverTurnActive?: boolean };
-    delete cached.serverTurnActive;
-    const normalised = normaliseTurnState(cached);
-    expect(normalised.serverTurnActive).toBe(true);
-    expect(normalised.turnActive).toBe(true);
-  });
-
-  it("seeds serverTurnActive from a cached turnActive=false", () => {
-    const cached = {
-      ...emptyAcpState(),
-      turnActive: false,
-    } as AcpState & { serverTurnActive?: boolean };
-    delete cached.serverTurnActive;
-    const normalised = normaliseTurnState(cached);
-    expect(normalised.serverTurnActive).toBe(false);
-    expect(normalised.turnActive).toBe(false);
-  });
-
-  it("never restores in-flight prompt ids: no POST survives a reload", () => {
-    const cached = {
-      ...emptyAcpState(),
-      serverTurnActive: false,
-      turnActive: true,
-      inflightPromptIds: ["cmp-stale"],
-    } as AcpState;
-    const normalised = normaliseTurnState(cached);
-    expect(normalised.inflightPromptIds).toEqual([]);
-    expect(normalised.turnActive).toBe(false);
-  });
-
-  it("backfills promptSeq from the persisted prompt rows on a pre-#3417 entry", () => {
-    const cached = {
-      ...emptyAcpState(),
-      activity: [
-        { id: "a", kind: "user_prompt", text: "one", at: "" },
-        { id: "b", kind: "message", text: "hi", at: "" },
-        { id: "c", kind: "user_prompt", text: "two", at: "" },
-      ],
-    } as AcpState & { promptSeq?: number };
-    delete cached.promptSeq;
-    expect(normaliseTurnState(cached).promptSeq).toBe(2);
-  });
-});
-
 describe("compaction reminder dismissal", () => {
   const usageFrame = (seq: number, used: number, size = 200_000): AcpFrame => ({
     session_id: "s-1",
@@ -1703,14 +1653,6 @@ describe("compaction reminder dismissal", () => {
       state = applyEvent(state, usageFrame(3, 170_000));
       expect(state.compactionReminderDismissed, JSON.stringify(event)).toBeNull();
     }
-  });
-
-  it("backfills the dismissal on entries persisted before it existed", () => {
-    const persisted = { ...emptyAcpState() } as AcpState & {
-      compactionReminderDismissed?: AcpState["compactionReminderDismissed"];
-    };
-    delete persisted.compactionReminderDismissed;
-    expect(normaliseTurnState(persisted).compactionReminderDismissed).toBeNull();
   });
 });
 
@@ -1878,46 +1820,6 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
     expect(state.agentOrphaned).toBe(true);
     state = applyEvent(state, stoppedFrame("user_stopped", 2));
     expect(state.agentOrphaned).toBe(false);
-  });
-
-  it("backfills agentOrphaned=false on pre-#1240 persisted state", () => {
-    // Simulate a localStorage entry written before #1240: agentOrphaned
-    // absent. normaliseTurnState must default it to false so the
-    // reducer and banner code see a well-typed value.
-    const stale = {
-      ...emptyAcpState(),
-      promptSeq: 0,
-    } as AcpState & { agentOrphaned?: boolean };
-    delete stale.agentOrphaned;
-    const normalised = normaliseTurnState(stale);
-    expect(normalised.agentOrphaned).toBe(false);
-  });
-
-  it("backfills usageBaseline=null on pre-#1354 persisted state", () => {
-    // Simulate a localStorage entry written before #1354: usageBaseline
-    // absent. normaliseTurnState must default it to null so the
-    // UsageUpdated reducer arm's `next.usageBaseline && ...` check sees
-    // a well-typed value rather than `undefined`.
-    const stale = {
-      ...emptyAcpState(),
-      promptSeq: 0,
-    } as AcpState & { usageBaseline?: { cost: number } | null };
-    delete stale.usageBaseline;
-    const normalised = normaliseTurnState(stale);
-    expect(normalised.usageBaseline).toBeNull();
-  });
-
-  it("preserves a non-null usageBaseline through normaliseTurnState", () => {
-    // A session that ran /clear before reload writes a baseline into
-    // localStorage. Hydration must keep it so post-reload UsageUpdate
-    // frames continue subtracting the boundary cumulative.
-    const cached: AcpState = {
-      ...emptyAcpState(),
-      promptSeq: 3,
-      usageBaseline: { cost: 0.42 },
-    };
-    const normalised = normaliseTurnState(cached);
-    expect(normalised.usageBaseline?.cost).toBeCloseTo(0.42, 6);
   });
 
   it("clears agentOrphaned on restart_pending", () => {

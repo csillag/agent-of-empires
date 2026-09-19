@@ -2337,6 +2337,24 @@
       "components": ["web/src/lib/acpDrafts.ts"]
     },
     {
+      "id": "acp.no-persisted-server-state",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useAcpSession.noPersist.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/lib/acpStateStorage.test.ts",
+        "src/lib/acpDrafts.test.ts",
+        "src/components/acp/Composer.draft.test.tsx"
+      ],
+      "components": [
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/lib/acpStateStorage.ts",
+        "web/src/lib/acpDrafts.ts",
+        "web/src/components/acp/Composer.tsx"
+      ]
+    },
+    {
       "id": "acp.server-queue-overlay",
       "kind": "vitest",
       "risk": "high",

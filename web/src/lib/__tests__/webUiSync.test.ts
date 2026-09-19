@@ -54,7 +54,7 @@ describe("isSyncedKey", () => {
       "aoe-pane-layout",
       "aoe-resolved-theme",
       "aoe-tour-seen",
-      "aoe:acp-state:v1:abc",
+      "aoe:acp-state:v2:abc",
       "aoe-acp-draft-abc",
       "unrelated",
     ]) {
