@@ -198,29 +198,31 @@ impl EventStore {
         let conn = self.conn();
         // Sub-agent rows carry the prompt and tool list, which the fold never
         // reads. Strip them in SQL so a sessions poll does not pull that weight.
-        let sql = format!(
-            "SELECT created_at, CASE discriminant \
-             WHEN 'BackgroundAgentLaunched' THEN json_set(event_json, '$.BackgroundAgentLaunched.prompt', '') \
-             WHEN 'BackgroundAgentCompleted' THEN json_set(event_json, '$.BackgroundAgentCompleted.tools', json('[]')) \
-             ELSE event_json END \
-             FROM {} WHERE session_id = ?1 AND discriminant IN \
-             ('BackgroundItemStarted','BackgroundItemEnded','WakeupScheduled',\
-              'BackgroundAgentLaunched','BackgroundAgentCompleted') ORDER BY seq",
-            self.schema.events_table()
-        );
-        let rows = match conn.prepare(&sql).and_then(|mut stmt| {
-            stmt.query_map(params![session_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()
-        }) {
-            Ok(rows) => rows,
+        // The discriminant index is named explicitly and the seq sort happens
+        // after the lock drops: `ORDER BY seq` made SQLite walk every row.
+        let rows = match conn
+            .prepare(&background_items_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
+                stmt.query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(mut rows) => {
+                drop(conn);
+                rows.sort_unstable_by_key(|(seq, _, _)| *seq);
+                rows
+            }
             Err(e) => {
                 warn!(target: "acp.event_store", session = %session_id, "background_items: {e}");
                 return Vec::new();
             }
         };
-        let events = rows.into_iter().filter_map(|(ms, json)| {
+        let events = rows.into_iter().filter_map(|(_, ms, json)| {
             let at = DateTime::from_timestamp_millis(ms)?;
             serde_json::from_str::<Event>(&json).ok().map(|e| (at, e))
         });
@@ -250,11 +252,9 @@ impl EventStore {
                     && cause.is_some_and(|c| c.wakes_agent())
                     && up_to.is_none_or(|noted| at > noted)
             };
-        let sql = format!(
-            "SELECT event_json FROM {} WHERE session_id = ?1 AND discriminant = 'BackgroundItemEnded'",
-            self.schema.events_table()
-        );
-        let any_new_loss = match conn.prepare(&sql).and_then(|mut stmt| {
+        let any_new_loss = match conn
+            .prepare(&background_ends_sql(self.schema.events_table()))
+            .and_then(|mut stmt| {
             stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()
         }) {
@@ -282,6 +282,28 @@ impl EventStore {
             })
             .collect()
     }
+}
+
+/// `INDEXED BY` with the sort left to the caller. `ORDER BY seq` made
+/// SQLite walk every row of the session (the 2026-09-19 stall).
+fn background_items_sql(table: &str) -> String {
+    format!(
+        "SELECT seq, created_at, CASE discriminant \
+         WHEN 'BackgroundAgentLaunched' THEN json_set(event_json, '$.BackgroundAgentLaunched.prompt', '') \
+         WHEN 'BackgroundAgentCompleted' THEN json_set(event_json, '$.BackgroundAgentCompleted.tools', json('[]')) \
+         ELSE event_json END \
+         FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant IN \
+         ('BackgroundItemStarted','BackgroundItemEnded','WakeupScheduled',\
+          'BackgroundAgentLaunched','BackgroundAgentCompleted')"
+    )
+}
+
+fn background_ends_sql(table: &str) -> String {
+    format!(
+        "SELECT event_json FROM {table} INDEXED BY idx_{table}_session_discriminant_seq \
+         WHERE session_id = ?1 AND discriminant = 'BackgroundItemEnded'"
+    )
 }
 
 fn decode_logged(json: &str, session_id: &str, what: &str) -> Option<Event> {
