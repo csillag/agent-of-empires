@@ -86,6 +86,105 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "PromptCapabilities",
 ];
 
+/// `Stopped` reasons that carry the agent's own end of a turn: the stop
+/// reason of its `PromptResponse`, or `prompt_complete` synthesized only
+/// after the turn's cost-populated usage report.
+const END_OF_TURN_STOP_REASONS: &[&str] = &[
+    "prompt_complete",
+    "cancelled",
+    "max_tokens",
+    "refusal",
+    "max_turn_requests",
+];
+
+/// What one event says about the agent's own turn.
+enum TurnRole {
+    /// The agent's own end of turn: proof that it is idle.
+    End,
+    /// A stop the daemon synthesized or forced. It closes an open turn but
+    /// proves nothing, since the agent may still be working.
+    Stop,
+    Work,
+    /// A background item finished at `at` (ms); the agent is told, and may
+    /// start a turn for it.
+    Woken {
+        at: i64,
+    },
+    /// Bookkeeping and background state that says nothing about a turn.
+    Neutral,
+}
+
+impl TurnRole {
+    /// Exhaustive on purpose: a new variant must be classified here.
+    fn of(event: &Event) -> Self {
+        match event {
+            Event::UsageUpdated { usage } if usage.cost.is_some() => Self::End,
+            Event::Stopped { reason } if END_OF_TURN_STOP_REASONS.contains(&reason.as_str()) => {
+                Self::End
+            }
+            Event::Stopped { .. }
+            | Event::AgentStartupError { .. }
+            | Event::IncompatibleAgent { .. }
+            | Event::PromptRuntimeError { .. } => Self::Stop,
+            Event::BackgroundItemEnded { reason, at, .. } => {
+                if *reason == BackgroundEndReason::Lost {
+                    Self::Neutral
+                } else {
+                    Self::Woken {
+                        at: at.timestamp_millis(),
+                    }
+                }
+            }
+            Event::UsageUpdated { .. }
+            | Event::PlanUpdated { .. }
+            | Event::TodoListUpdated { .. }
+            | Event::ToolCallStarted { .. }
+            | Event::ToolCallCompleted { .. }
+            | Event::ToolCallContent { .. }
+            | Event::ToolCallUpdated { .. }
+            | Event::ApprovalRequested { .. }
+            | Event::ElicitationRequested { .. }
+            | Event::DiffEmitted { .. }
+            | Event::ThinkingStarted
+            | Event::ThinkingEnded
+            | Event::AgentMessageChunk { .. }
+            | Event::AgentThoughtChunk { .. }
+            | Event::CancelRequested { .. }
+            | Event::UserPromptSent { .. }
+            | Event::UserDiffCommentsPrompt { .. }
+            | Event::ConversationCompactionStarted
+            | Event::ConversationCompacted
+            | Event::RawAgentUpdate { .. } => Self::Work,
+            Event::SessionTitleSuggested { .. }
+            | Event::ApprovalResolved { .. }
+            | Event::ElicitationResolved { .. }
+            | Event::RateLimit { .. }
+            | Event::RateLimitAutoResumed { .. }
+            | Event::ModeChanged { .. }
+            | Event::ModesAvailable { .. }
+            | Event::CurrentModeChanged { .. }
+            | Event::ModeSwitchFailed { .. }
+            | Event::AvailableCommandsUpdated { .. }
+            | Event::ConfigOptionsUpdated { .. }
+            | Event::ConfigOptionSwitchFailed { .. }
+            | Event::BackgroundAgentLaunched { .. }
+            | Event::BackgroundAgentProgress { .. }
+            | Event::BackgroundAgentCompleted { .. }
+            | Event::PromptCapabilities { .. }
+            | Event::PromptRejected { .. }
+            | Event::AcpSessionAssigned { .. }
+            | Event::SessionContextReset { .. }
+            | Event::WakeupScheduled { .. }
+            | Event::MonitorArmed { .. }
+            | Event::BackgroundItemStarted { .. }
+            | Event::BackgroundLossNoted { .. }
+            | Event::SessionCleared
+            | Event::AgentSwitched { .. }
+            | Event::ConversationSummary { .. } => Self::Neutral,
+        }
+    }
+}
+
 /// What the terminal-repair pass needs to decide, and to publish safely.
 ///
 /// `substantive` decides: it is the newest event that is not ambient
@@ -1904,83 +2003,117 @@ impl EventStore {
         open.is_some()
     }
 
-    /// True while the session works on a turn the agent started itself, which
-    /// `has_in_flight_turn` cannot see: that probe only counts turns opened by
-    /// a `UserPromptSent`, and an agent woken by a peer message, a monitor or a
-    /// scheduled wakeup starts one with no prompt behind it.
+    /// True while the session works on a turn, including one the agent
+    /// started itself, which `has_in_flight_turn` cannot see: that probe only
+    /// counts turns opened by a `UserPromptSent`, and an agent woken by a
+    /// peer message, a monitor or a scheduled wakeup starts one with no
+    /// prompt behind it.
     ///
-    /// Reads the newest substantive event after the latest terminator
-    /// (`Stopped` / `AgentStartupError`). A cost-populated `UsageUpdated` is
-    /// the end-of-turn marker, so it means the turn wrapped up; any other event
-    /// means work is under way. Activity older than `AGENT_TURN_STALE_AFTER_MS`
-    /// stops counting. Fails closed: an unreadable log must not license
-    /// killing a worker.
+    /// Open means the newest event that bears on a turn is turn work: an end
+    /// of turn or any stop closes it, and bookkeeping (config and mode
+    /// snapshots, replayed background ends) is passed over. Work older than
+    /// `AGENT_TURN_STALE_AFTER_MS` stops counting. Fails closed: an
+    /// unreadable log must not license killing a worker.
     pub fn has_agent_turn_in_flight(&self, session_id: &str) -> bool {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let found = self.scan_turn_roles(session_id, |created_at, role| match role {
+            TurnRole::Work => Some(now_ms.saturating_sub(created_at) <= AGENT_TURN_STALE_AFTER_MS),
+            TurnRole::End | TurnRole::Stop => Some(false),
+            TurnRole::Woken { .. } | TurnRole::Neutral => None,
+        });
+        match found {
+            Ok(open) => open.unwrap_or(false),
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_agent_turn_in_flight for {session_id}: {e}");
+                true
+            }
+        }
+    }
+
+    /// When the agent last proved itself idle, in ms: the `created_at` of its
+    /// latest own end of turn (a cost-populated `UsageUpdated`, or a
+    /// `Stopped` carrying the adapter's stop reason), moved to the `at` of
+    /// any background item that finished after it, since the agent is told
+    /// and may start a turn for it. A catch-up re-emission keeps its old
+    /// `at` and moves nothing.
+    ///
+    /// `None` when turn work follows that proof, or when the latest turn was
+    /// closed only by a stop the daemon synthesized or forced. A log with no
+    /// turn work at all is idle since 0. Fails closed: an unreadable log
+    /// proves nothing.
+    pub fn agent_idle_since(&self, session_id: &str) -> Option<i64> {
+        let mut woken_at = 0;
+        let found = self.scan_turn_roles(session_id, |created_at, role| match role {
+            TurnRole::End => Some(Some(created_at.max(woken_at))),
+            TurnRole::Work => Some(None),
+            TurnRole::Woken { at } => {
+                woken_at = woken_at.max(at);
+                None
+            }
+            TurnRole::Stop | TurnRole::Neutral => None,
+        });
+        match found {
+            Ok(Some(idle_since)) => idle_since,
+            Ok(None) => Some(woken_at),
+            Err(e) => {
+                warn!(target: "acp.event_store", "agent_idle_since for {session_id}: {e}");
+                None
+            }
+        }
+    }
+
+    /// Walk the session's log newest first until `visit` decides, passing
+    /// each row's `created_at` and `TurnRole`. A row that fails to decode is
+    /// turn work, so a probe fails closed on it.
+    fn scan_turn_roles<T>(
+        &self,
+        session_id: &str,
+        mut visit: impl FnMut(i64, TurnRole) -> Option<T>,
+    ) -> rusqlite::Result<Option<T>> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let epoch_start: i64 = match conn
-            .query_row(
-                "SELECT MAX(seq) FROM acp_events
-                 WHERE session_id = ?1
-                   AND (json_extract(event_json, '$.Stopped') IS NOT NULL
-                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)",
-                params![session_id],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .optional()
-        {
-            Ok(v) => v.flatten().unwrap_or(0),
-            Err(e) => {
-                warn!(target: "acp.event_store", "has_agent_turn_in_flight epoch query for {session_id}: {e}");
-                return true;
-            }
-        };
-        let clauses = NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-            .iter()
-            .map(|_| "AND event_json NOT LIKE ?")
-            .collect::<Vec<_>>()
-            .join("\n                   ");
+        // A running sub-agent leaves a progress row every few seconds, each
+        // with its whole tool list, none of which bears on the turn.
         let sql = format!(
-            "SELECT event_json, created_at FROM acp_events
-                 WHERE session_id = ?
-                   AND seq > ?
-                   {clauses}
-                 ORDER BY seq DESC
-                 LIMIT 1"
+            "SELECT created_at, CASE discriminant \
+             WHEN 'BackgroundAgentProgress' THEN json_set(event_json, '$.BackgroundAgentProgress.tools', json('[]')) \
+             ELSE event_json END \
+             FROM {} WHERE session_id = ?1 ORDER BY seq DESC",
+            self.schema.events_table()
         );
-        let mut bind: Vec<rusqlite::types::Value> =
-            vec![session_id.to_string().into(), epoch_start.into()];
-        bind.extend(
-            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-                .iter()
-                .map(|name| format!("{{\"{name}\":%").into()),
-        );
-        let (json, created_at) = match conn
-            .query_row(&sql, rusqlite::params_from_iter(bind), |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .optional()
-        {
-            Ok(Some(row)) => row,
-            Ok(None) => return false,
-            Err(e) => {
-                warn!(target: "acp.event_store", "has_agent_turn_in_flight latest event for {session_id}: {e}");
-                return true;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(params![session_id])?;
+        // A prompt refused as `agent_busy` never reached the agent, so its
+        // `UserPromptSent` is no work. Paired by text across neutral rows
+        // only, so a refusal inside a busy turn leaves that turn open.
+        let mut refused: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            let created_at: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            let role = match serde_json::from_str::<Event>(&json) {
+                Err(_) => TurnRole::Work,
+                Ok(Event::PromptRejected { text, .. }) => {
+                    refused = Some(text);
+                    TurnRole::Neutral
+                }
+                Ok(Event::UserPromptSent { text, .. })
+                    if refused.as_deref() == Some(text.as_str()) =>
+                {
+                    refused = None;
+                    TurnRole::Neutral
+                }
+                Ok(event) => TurnRole::of(&event),
+            };
+            if !matches!(role, TurnRole::Neutral | TurnRole::Woken { .. }) {
+                refused = None;
             }
-        };
-        if chrono::Utc::now()
-            .timestamp_millis()
-            .saturating_sub(created_at)
-            > AGENT_TURN_STALE_AFTER_MS
-        {
-            return false;
+            if let Some(decided) = visit(created_at, role) {
+                return Ok(Some(decided));
+            }
         }
-        match serde_json::from_str::<Event>(&json) {
-            Ok(Event::UsageUpdated { usage }) => usage.cost.is_none(),
-            Ok(_) | Err(_) => true,
-        }
+        Ok(None)
     }
 
     /// Latest `created_at` (ms since epoch) per session for the given
@@ -3662,6 +3795,29 @@ mod tests {
                 }),
             },
         };
+        let bookkeeping = [
+            Event::ConfigOptionsUpdated {
+                options: Vec::new(),
+            },
+            Event::ModeChanged {
+                mode: crate::acp::state::SessionMode::Default,
+            },
+            Event::BackgroundItemEnded {
+                id: "b1".into(),
+                reason: BackgroundEndReason::Finished,
+                cause: None,
+                at: Utc::now() - chrono::Duration::hours(1),
+            },
+        ];
+        let prompt = |text: &str| Event::UserPromptSent {
+            text: text.into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        let refused = |text: &str| Event::PromptRejected {
+            reason: "agent_busy".into(),
+            text: text.into(),
+        };
         let cases: Vec<(&str, Vec<Event>, bool)> = vec![
             ("s-empty", vec![], false),
             ("s-idle", vec![stopped()], false),
@@ -3674,6 +3830,29 @@ mod tests {
             ),
             ("s-mid-usage", vec![stopped(), tool(), usage(None)], true),
             ("s-closed", vec![stopped(), tool(), stopped()], false),
+            // Bookkeeping after a respawn, a replayed end included, opens
+            // nothing; it used to pin the probe for two hours.
+            (
+                "s-respawned",
+                [
+                    vec![tool(), usage(Some(0.1)), stopped()],
+                    bookkeeping.to_vec(),
+                ]
+                .concat(),
+                false,
+            ),
+            // A reset refused between prompts never reached the agent.
+            (
+                "s-refused-reset",
+                vec![usage(Some(0.1)), prompt("/clear"), refused("/clear")],
+                false,
+            ),
+            // A prompt refused during a busy turn leaves that turn open.
+            (
+                "s-refused-busy",
+                vec![prompt("go"), tool(), prompt("more"), refused("more")],
+                true,
+            ),
         ];
         for (sid, events, want) in cases {
             for (i, event) in events.iter().enumerate() {
@@ -3688,6 +3867,126 @@ mod tests {
             .record_at("s-stale", 2, &tool(), three_hours_ago)
             .unwrap();
         assert!(!store.has_agent_turn_in_flight("s-stale"));
+    }
+
+    /// The drain's idle proof: only the agent's own end of turn counts, a
+    /// background item finishing after it restarts the idle clock (the
+    /// agent is told and may start a turn), and neither bookkeeping nor a
+    /// stop the daemon synthesized proves anything.
+    #[test]
+    fn agent_idle_since_needs_the_agents_own_end_of_turn() {
+        let (_tmp, store) = open_store(1000);
+        let base = Utc::now().timestamp_millis() - 600_000;
+        let marker = || Event::UsageUpdated {
+            usage: crate::acp::state::SessionUsage {
+                used: 1,
+                size: 2,
+                cost: Some(crate::acp::state::UsageCost {
+                    amount: 0.1,
+                    currency: "USD".into(),
+                }),
+            },
+        };
+        let stopped = |reason: &str| Event::Stopped {
+            reason: reason.into(),
+        };
+        let ended = |reason, at_ms| Event::BackgroundItemEnded {
+            id: "b1".into(),
+            reason,
+            cause: (reason == BackgroundEndReason::Lost).then_some(BackgroundLossCause::Respawn),
+            at: DateTime::from_timestamp_millis(at_ms).unwrap(),
+        };
+        let tool_result = || Event::ToolCallCompleted {
+            tool_call_id: "tc-1".into(),
+            is_error: false,
+            content: String::new(),
+            output: Vec::new(),
+            completed_at: Utc::now(),
+            async_subagent: false,
+        };
+        let prompt = || Event::UserPromptSent {
+            text: "go".into(),
+            attachments: Vec::new(),
+            prompt_id: None,
+        };
+        let config = || Event::ConfigOptionsUpdated {
+            options: Vec::new(),
+        };
+        let mode = || Event::ModeChanged {
+            mode: crate::acp::state::SessionMode::Default,
+        };
+        let refused = || Event::PromptRejected {
+            reason: "agent_busy".into(),
+            text: "go".into(),
+        };
+        use BackgroundEndReason::{Finished, Lost};
+        // (session, rows as (ms after `base`, event), want)
+        let cases = vec![
+            (
+                "s-marker",
+                vec![(0, tool_result()), (1_000, marker())],
+                Some(base + 1_000),
+            ),
+            (
+                "s-prompt-complete",
+                vec![(0, prompt()), (1_000, stopped("prompt_complete"))],
+                Some(base + 1_000),
+            ),
+            (
+                "s-fresh-end",
+                vec![(0, marker()), (2_000, ended(Finished, base + 1_500))],
+                Some(base + 1_500),
+            ),
+            (
+                "s-replayed-end",
+                vec![(0, marker()), (2_000, ended(Finished, base - 60_000))],
+                Some(base),
+            ),
+            (
+                "s-lost-end",
+                vec![(0, marker()), (2_000, ended(Lost, base + 1_500))],
+                Some(base),
+            ),
+            (
+                "s-bookkeeping",
+                vec![(0, marker()), (1_000, config()), (2_000, mode())],
+                Some(base),
+            ),
+            (
+                "s-watchdog-after-marker",
+                vec![(0, marker()), (3_000, stopped("agent_idle"))],
+                Some(base),
+            ),
+            (
+                "s-synthesized-stop",
+                vec![(0, tool_result()), (1_000, stopped("reattach_idle"))],
+                None,
+            ),
+            (
+                "s-open-prompt",
+                vec![(0, marker()), (1_000, prompt())],
+                None,
+            ),
+            (
+                "s-refused-prompt",
+                vec![(0, marker()), (1_000, prompt()), (1_100, refused())],
+                Some(base),
+            ),
+            (
+                "s-refused-in-a-busy-turn",
+                vec![(0, tool_result()), (1_000, prompt()), (1_100, refused())],
+                None,
+            ),
+            ("s-no-work", vec![(0, config())], Some(0)),
+        ];
+        for (sid, rows, want) in cases {
+            for (seq, (offset, event)) in rows.iter().enumerate() {
+                store
+                    .record_at(sid, seq as u64 + 1, event, base + offset)
+                    .unwrap();
+            }
+            assert_eq!(store.agent_idle_since(sid), want, "{sid}");
+        }
     }
 
     #[test]

@@ -460,6 +460,15 @@ impl<S: BroadcastSink> SessionPublisher<S> {
     }
 }
 
+/// A drained build-stale worker awaiting its respawn, by the lease epoch it
+/// was flagged under, so a replacement is never retired in its place.
+#[derive(Debug, Clone, Copy)]
+struct PendingRespawn {
+    epoch: u64,
+    /// Wall-clock ms of the flag; the drain's deferral caps run from it.
+    since_ms: i64,
+}
+
 impl From<WorkerPhase> for AcpWorkerState {
     fn from(phase: WorkerPhase) -> Self {
         match phase {
@@ -519,9 +528,13 @@ pub struct Supervisor<S: BroadcastSink> {
     worker_notify: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     worker_waits: tokio::sync::broadcast::Sender<String>,
-    /// Build-stale sessions whose in-flight turn is draining before the
-    /// reconciler respawns them on the current binary.
-    respawn_pending: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Build-stale workers draining before the reconciler respawns them on
+    /// the current binary. Lock order: after `lifecycle`.
+    respawn_pending: Arc<std::sync::Mutex<HashMap<String, PendingRespawn>>>,
+    /// When each session's stale runner, by generation, was first flagged.
+    /// Unlike `respawn_pending` it outlives a broken connection, so
+    /// re-adopting the same runner does not restart its deferral caps.
+    respawn_since: Arc<std::sync::Mutex<HashMap<String, (u64, i64)>>>,
     /// Sessions currently parked on a per-adapter compatibility rejection,
     /// mapped to the binary that failed the check. Populated at every
     /// `IncompatibleAgent` publish site, cleared on a successful (re)spawn.
@@ -896,7 +909,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             worker_notify: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             worker_waits: tokio::sync::broadcast::channel(64).0,
-            respawn_pending: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            respawn_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            respawn_since: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incompatible_binaries: Arc::new(std::sync::Mutex::new(HashMap::new())),
             force_respawn: Arc::new(std::sync::Mutex::new(HashSet::new())),
             startup_failures: Arc::new(std::sync::Mutex::new(HashSet::new())),
@@ -916,32 +930,49 @@ impl<S: BroadcastSink> Supervisor<S> {
         self
     }
 
-    /// Flag a session whose build-stale worker was adopted to drain an
-    /// in-flight turn; the reconciler respawns it on the current binary
-    /// at the next idle boundary. Idempotent. See #1754.
-    pub fn mark_build_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.respawn_pending).insert(session_id.to_string());
+    /// Flag the running worker of a session adopted on a stale build; the
+    /// reconciler retires it at the next idle boundary. The flag belongs to
+    /// that worker: a stop or a replacement ends it. See #1754.
+    pub fn mark_build_respawn_pending(&self, session_id: &str, now_ms: i64) {
+        let Some((lease, identity)) = lock_recover(&self.lifecycle).running(session_id) else {
+            return;
+        };
+        // Re-adopting the same runner keeps the time it was first flagged.
+        let since_ms = match identity {
+            Some(runner) => {
+                let mut since = lock_recover(&self.respawn_since);
+                let first = since
+                    .entry(session_id.to_string())
+                    .or_insert((runner.generation, now_ms));
+                if first.0 != runner.generation {
+                    *first = (runner.generation, now_ms);
+                }
+                first.1
+            }
+            None => now_ms,
+        };
+        let flag = PendingRespawn {
+            epoch: lease.epoch(),
+            since_ms,
+        };
+        lock_recover(&self.respawn_pending).insert(session_id.to_string(), flag);
     }
 
-    /// Snapshot sessions awaiting a post-drain respawn.
-    pub fn respawn_pending_ids(&self) -> Vec<String> {
-        lock_recover(&self.respawn_pending)
+    /// Sessions whose flagged worker is still the running one, each with
+    /// when it was flagged; flags whose worker has gone are dropped. Only the
+    /// reconciler tick may call this: the prune is a write.
+    pub fn respawn_pending(&self) -> Vec<(String, i64)> {
+        let table = lock_recover(&self.lifecycle);
+        let mut pending = lock_recover(&self.respawn_pending);
+        pending.retain(|id, flag| {
+            table
+                .running(id)
+                .is_some_and(|(lease, _)| lease.epoch() == flag.epoch)
+        });
+        pending
             .iter()
-            .cloned()
+            .map(|(id, flag)| (id.clone(), flag.since_ms))
             .collect()
-    }
-
-    /// Drop a session from the pending set once it has been respawned (or
-    /// is gone). Idempotent.
-    pub fn clear_respawn_pending(&self, session_id: &str) {
-        lock_recover(&self.respawn_pending).remove(session_id);
-    }
-
-    /// The identity of the session's running runner, when one is installed.
-    pub fn running_identity(&self, session_id: &str) -> Option<RunnerIdentity> {
-        lock_recover(&self.lifecycle)
-            .running(session_id)
-            .and_then(|(_, identity)| identity)
     }
 
     /// Record that a session is parked on a compatibility rejection for
@@ -2464,12 +2495,12 @@ impl<S: BroadcastSink> Supervisor<S> {
                     if agent_unresponsive {
                         // The runner deletes its own registry record as it exits,
                         // and `restart_decision` reads a missing record as
-                        // `aoe acp stop`. Mark this generation restart-pending
+                        // `aoe acp stop`. Mark this runner restart-pending
                         // first, so the kill reads as the restart it is whichever
                         // of this task and the reaper observes it first.
                         crate::process::worker_registry::mark_restart_pending(
                             &session_id,
-                            lease.epoch(),
+                            installed_marker_key(&lifecycle, &lease),
                         );
                         kill_wedged_runner(&*process_control, &session_id).await;
                     }
@@ -2508,6 +2539,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                     }
                     let mut respawn_config: SpawnConfig = match restart_decision(
                         &workers,
+                        &lifecycle,
                         &session_id,
                         agent_unresponsive,
                     )
@@ -3296,6 +3328,12 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Lock order matches `begin_resume`: workers, then the table, so a
         // resume cannot slip between the decision and the handle removal.
         let mut workers = self.workers.lock().await;
+        // A deliberate stop ends any pending build-stale respawn. Taken under
+        // `workers`, as the retire takes it, so exactly one of them wins.
+        let was_pending = lock_recover(&self.respawn_pending)
+            .remove(session_id)
+            .is_some();
+        lock_recover(&self.respawn_since).remove(session_id);
         let decision = lock_recover(&self.lifecycle).begin_stop(session_id, stop_reason);
         // Shared by both settle arms below: a stop is always deliberate,
         // never `Respawn`/`WedgeKill`/`NewBuild`.
@@ -3374,7 +3412,23 @@ impl<S: BroadcastSink> Supervisor<S> {
                 );
                 Ok(())
             }
-            StopDecision::AlreadyStopping => Ok(()),
+            StopDecision::AlreadyStopping => {
+                drop(workers);
+                // The teardown in flight was going to end in a restart (a
+                // build-stale retire, or a marker left for a runner that
+                // outlived its kill); this stop overrides it.
+                let cancelled_restart =
+                    crate::process::worker_registry::claim_restart_marker(session_id).is_some();
+                if was_pending || cancelled_restart {
+                    self.publish_next(
+                        session_id,
+                        &Event::Stopped {
+                            reason: stop_reason.into(),
+                        },
+                    );
+                }
+                Ok(())
+            }
             StopDecision::NotOwned => {
                 // No in-memory worker, but a runner from a previous daemon
                 // may still be on disk. Own its teardown so it is proven.
@@ -3406,6 +3460,113 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         }
     }
+
+    /// Retire a drained build-stale worker so the reconciler respawns its
+    /// session on the current binary. The supervisor owns the teardown, so
+    /// it reads as the restart it is: one `Stopped{restart_pending}`, the
+    /// connection closed before the runner is signalled, and the background
+    /// items lost to `NewBuild`.
+    ///
+    /// Returns whether the session should be re-armed. `false` when the
+    /// flagged worker is no longer the running one, when `aoe acp
+    /// stop|kill|restart` removed its record first (the reaper reports
+    /// that), or when a stop landed during the teardown and so wins.
+    pub async fn retire_build_stale(&self, session_id: &str) -> bool {
+        let mut workers = self.workers.lock().await;
+        let flagged = lock_recover(&self.respawn_pending)
+            .get(session_id)
+            .map(|flag| flag.epoch);
+        let running = lock_recover(&self.lifecycle).running(session_id);
+        let Some((_, identity)) = running.filter(|(lease, _)| Some(lease.epoch()) == flagged)
+        else {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
+            return false;
+        };
+        if registry_disowns(session_id, identity) {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
+            return false;
+        }
+        let StopDecision::TearDown { lease, identity } =
+            lock_recover(&self.lifecycle).begin_stop(session_id, "restart_pending")
+        else {
+            lock_recover(&self.respawn_pending).remove(session_id);
+            lock_recover(&self.respawn_since).remove(session_id);
+            return false;
+        };
+        let handle = workers.remove(session_id);
+        drop(workers);
+        crate::process::worker_registry::clear_restart_marker(session_id);
+        self.publish_next(
+            session_id,
+            &Event::Stopped {
+                reason: "restart_pending".into(),
+            },
+        );
+        if let Some(handle) = handle {
+            // Closed and drained before the runner is signalled, so its dying
+            // transport cannot surface as an `AgentStartupError`.
+            let _ = handle.client.shutdown().await;
+            handle.drain_task.abort();
+            let _ = handle.drain_task.await;
+        }
+        // `aoe acp stop` may have removed the record while the connection
+        // closed; its stop wins, unless it was `aoe acp restart`, whose marker
+        // names this runner. Checked before the signal, since a runner
+        // removes its own record as it exits.
+        let stopped_meanwhile = registry_disowns(session_id, identity)
+            && !crate::process::worker_registry::take_restart_marker(
+                session_id,
+                restart_marker_key(&lease, identity),
+            )
+            && {
+                let _workers = self.workers.lock().await;
+                let took_flag = lock_recover(&self.respawn_pending)
+                    .remove(session_id)
+                    .is_some();
+                took_flag
+            };
+        let settlement = tear_down_runner(&*self.process_control, session_id, identity).await;
+        // Settled and decided under `workers`: a stop either lands during the
+        // teardown, takes the flag and publishes itself, or comes after the
+        // restart is decided.
+        let retired = {
+            let _workers = self.workers.lock().await;
+            self.settle(&lease, settlement);
+            let retired = lock_recover(&self.respawn_pending)
+                .remove(session_id)
+                .is_some();
+            if let (true, Settlement::Unproven(runner)) = (retired, settlement) {
+                // Re-arms the session once the retry pass proves the runner gone.
+                crate::process::worker_registry::mark_restart_pending(
+                    session_id,
+                    runner.generation,
+                );
+            }
+            retired
+        };
+        lock_recover(&self.respawn_since).remove(session_id);
+        self.cancel_dead_requests(session_id);
+        self.mark_background_lost(
+            session_id,
+            if retired {
+                crate::acp::state::BackgroundLossCause::NewBuild
+            } else {
+                crate::acp::state::BackgroundLossCause::UserStop
+            },
+        );
+        if stopped_meanwhile {
+            self.publish_next(
+                session_id,
+                &Event::Stopped {
+                    reason: "user_stopped".into(),
+                },
+            );
+        }
+        retired
+    }
+
     /// Shutdown every worker. Called when the user explicitly terminates
     /// all structured view workers (e.g. `aoe acp stop --all`); sends ACP
     /// shutdown to each connected client, aborts the drain task, AND
@@ -3910,8 +4071,14 @@ impl<S: BroadcastSink> Supervisor<S> {
         let mut workers = self.workers.lock().await;
         let lease = {
             let mut table = lock_recover(&self.lifecycle);
+            // As in production, an attach does not note its epoch as the
+            // runner's generation.
+            let resume_kind = match &kind {
+                WorkerKind::Attached => ResumeKind::Attach,
+                _ => ResumeKind::Spawn,
+            };
             let lease = table
-                .admit(session_id, ResumeKind::Spawn)
+                .admit(session_id, resume_kind)
                 .expect("test fixture admits a fresh session");
             table
                 .install(&lease, identity)
@@ -4019,10 +4186,12 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
             workers.remove(&id)?
         };
-        // The marker only authorizes a restart of the generation that was
+        // The marker only authorizes a restart of the runner that was
         // stopped; any other marker is stale and is discarded.
-        let generation = identity.map(|i| i.generation).unwrap_or(0);
-        let is_restart = crate::process::worker_registry::take_restart_marker(&id, generation);
+        let is_restart = crate::process::worker_registry::take_restart_marker(
+            &id,
+            restart_marker_key(&lease, identity),
+        );
         let reason = if is_restart {
             "restart_pending"
         } else {
@@ -4203,6 +4372,22 @@ async fn kill_wedged_runner(control: &dyn ProcessControl, session_id: &str) {
     }
 }
 
+/// The generation a restart marker names for the runner behind `lease`: the
+/// one stamped at its spawn. An attached handle's lease epoch was minted by
+/// this daemon and never matches it.
+fn restart_marker_key(lease: &Lease, identity: Option<RunnerIdentity>) -> u64 {
+    identity.map_or(lease.epoch(), |runner| runner.generation)
+}
+
+/// `restart_marker_key` for the runner installed under `lease`.
+fn installed_marker_key(lifecycle: &std::sync::Mutex<LifecycleTable>, lease: &Lease) -> u64 {
+    let identity = lock_recover(lifecycle)
+        .running(lease.session_id())
+        .filter(|(running, _)| running == lease)
+        .and_then(|(_, identity)| identity);
+    restart_marker_key(lease, identity)
+}
+
 #[derive(Debug)]
 enum RestartDecision {
     // Boxed because `SpawnConfig` is significantly larger than the
@@ -4211,8 +4396,8 @@ enum RestartDecision {
     // respawn flow.
     Respawn(Box<SpawnConfig>),
     BudgetBurned,
-    /// The daemon ordered this restart (a drained build-stale respawn,
-    /// `aoe acp restart`): a restart marker names this generation. The
+    /// The daemon ordered this restart (`aoe acp restart`, `aoe session
+    /// add-project`): a restart marker names this runner. The
     /// reaper and the resume pass own it, so the drain task only drops its
     /// handle, with no crash banner and no stop.
     DaemonRestart,
@@ -4232,6 +4417,7 @@ enum RestartDecision {
 
 async fn restart_decision(
     workers: &Arc<Mutex<HashMap<String, WorkerHandle>>>,
+    lifecycle: &std::sync::Mutex<LifecycleTable>,
     session_id: &str,
     killed_as_unresponsive: bool,
 ) -> RestartDecision {
@@ -4262,12 +4448,12 @@ async fn restart_decision(
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
+    let marker_key = installed_marker_key(lifecycle, &handle.lease);
     // Checked before the registry: the runner may not have removed its
     // record yet, and a restart the daemon ordered is never a crash.
     if runner_managed
         && !killed_as_unresponsive
-        && crate::process::worker_registry::peek_restart_marker(session_id)
-            == Some(handle.lease.epoch())
+        && crate::process::worker_registry::peek_restart_marker(session_id) == Some(marker_key)
     {
         debug!(
             target: "acp.supervisor",
@@ -4282,10 +4468,7 @@ async fn restart_decision(
             // After the wedged-agent kill, this generation's marker says the
             // missing record is that kill: consume it and respawn.
             if killed_as_unresponsive
-                && crate::process::worker_registry::take_restart_marker(
-                    session_id,
-                    handle.lease.epoch(),
-                )
+                && crate::process::worker_registry::take_restart_marker(session_id, marker_key)
             {
                 debug!(
                     target: "acp.supervisor",
@@ -6293,114 +6476,128 @@ cursor-acp-bridge = "agent acp"
         }
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-1", false).await;
+            let decision = restart_decision(&sup.workers, &sup.lifecycle, "s-1", false).await;
             assert!(
                 matches!(decision, RestartDecision::Respawn(_)),
                 "decision #{i} should be Respawn",
             );
         }
         // One more push past the threshold should burn the budget.
-        let decision = restart_decision(&sup.workers, "s-1", false).await;
+        let decision = restart_decision(&sup.workers, &sup.lifecycle, "s-1", false).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
-    /// Regression: `aoe acp stop|kill` deletes the registry entry,
-    /// then SIGTERMs the runner. The daemon's drain task sees socket EOF
-    /// and consults `restart_decision`. With the registry entry gone but
-    /// the in-memory `WorkerHandle` still installed, `restart_decision`
-    /// must return `UserStopped` so the drain task drops the handle and
-    /// emits a soft `Stopped` event — NOT `Respawn` (which would race
-    /// the SIGTERM and crash-loop until the budget burned) and NOT
-    /// `BudgetBurned` (which would surface the scary red banner the
-    /// user originally hit).
-    ///
-    /// The gate is `WorkerKind::Runner | Attached` (runner-managed)
-    /// + registry entry absent; we install a `Runner` kind here so the
-    /// production code path fires.
+    /// `aoe acp stop|kill` deletes the registry entry and then SIGTERMs the
+    /// runner, so `restart_decision` reads a missing record as a user stop,
+    /// not a crash to respawn or a burned budget, unless a restart marker
+    /// names the runner that ended. The marker is keyed on the runner's own
+    /// generation; each handle here carries one that differs from its lease
+    /// epoch, as an attached handle's always does, so only that key matches.
     #[tokio::test]
     #[serial_test::serial]
     async fn restart_decision_reads_a_missing_registry_entry_by_its_restart_marker() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let _home = crate::session::test_support::isolate_home(tmp.path());
-        let sink = VecSink::new();
-        let sup = Supervisor::new(sink);
-        let dummy_spec = AgentSpec {
-            command: "/bin/true".into(),
-            args: vec![],
-            description: "test fixture".into(),
-            env_allowlist: None,
-        };
-        let dummy_config = SpawnConfig {
-            wrapper_substitution: None,
-            agent_key: "claude".into(),
-            tool: "claude".into(),
-            spec: dummy_spec,
-            cwd: std::env::temp_dir(),
-            additional_dirs: vec![],
-            provider_env: vec![],
-            host_environment: vec![],
-            default_effort: None,
-            default_effort_explicit: false,
-            default_model: None,
-            default_mode: None,
-            socket_path: Some(tmp.path().join("dummy.sock")),
-            stored_acp_session_id: None,
-            fork_from: None,
-            seed_history_replay: false,
-            generation: 0,
-            artifact_dir: None,
-            sandbox_info: None,
-            source_profile: None,
-            mcp_servers: Vec::new(),
-        };
-        let lease = {
-            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId("s-stop".into()));
-            sup.test_install_handle(
-                "s-stop",
-                client,
+        const RUNNER: u64 = 42;
+        let _home = isolate_home();
+        // (attached, marker, record present, killed as unresponsive, want)
+        let cases = [
+            (true, Some(RUNNER), false, false, "daemon_restart"),
+            (true, Some(RUNNER), true, false, "daemon_restart"),
+            (true, None, false, false, "user_stopped"),
+            // A marker under the lease epoch is stale for an attached runner.
+            (true, Some(0), false, false, "user_stopped"),
+            (true, Some(0), true, false, "no_spawn_config"),
+            // The wedge kill's own marker re-arms the attached session.
+            (true, Some(RUNNER), false, true, "no_spawn_config"),
+            (false, None, false, true, "user_stopped"),
+            (false, Some(0), false, true, "user_stopped"),
+            (false, Some(RUNNER), false, false, "daemon_restart"),
+            (false, Some(RUNNER), false, true, "respawn"),
+        ];
+        for (i, (attached, marker, record, killed, want)) in cases.into_iter().enumerate() {
+            let id = format!("s-marker-{i}");
+            let sup = Supervisor::new(VecSink::new());
+            let kind = if attached {
+                WorkerKind::Attached
+            } else {
+                let socket = crate::process::worker_registry::socket_path_for(&id).unwrap();
                 WorkerKind::Runner {
-                    spawn_config: Box::new(dummy_config),
-                },
-                None,
-            )
-            .await
-        };
-        // No registry entry for "s-stop" — production code reads this
-        // as a user-initiated stop signal.
-        let decision = restart_decision(&sup.workers, "s-stop", true).await;
-        assert!(
-            matches!(decision, RestartDecision::UserStopped),
-            "expected UserStopped when registry entry is absent, got {decision:?}"
-        );
-        // A marker for another generation is stale and changes nothing.
-        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
-        let decision = restart_decision(&sup.workers, "s-stop", true).await;
-        assert!(
-            matches!(decision, RestartDecision::UserStopped),
-            "a stale-generation marker must not authorize a restart, got {decision:?}"
-        );
-        // A marker the daemon wrote for its own respawn of a drained
-        // build-stale worker is the resume pass's: no crash, no stop, marker
-        // left alone. Reading it as a crash showed a false "crashed more than
-        // 3 times" banner.
-        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
-        let decision = restart_decision(&sup.workers, "s-stop", false).await;
-        assert!(
-            matches!(decision, RestartDecision::DaemonRestart),
-            "a restart the daemon ordered must not be read as a crash, got {decision:?}"
-        );
-        assert!(
-            crate::process::worker_registry::take_restart_marker("s-stop", lease.epoch()),
-            "the marker must be left for the reaper"
-        );
-        // The wedged-agent watchdog marks this generation before it kills the
-        // runner, so the same missing record now reads as the restart it is.
-        crate::process::worker_registry::mark_restart_pending("s-stop", lease.epoch());
-        let decision = restart_decision(&sup.workers, "s-stop", true).await;
-        assert!(
-            matches!(decision, RestartDecision::Respawn(_)),
-            "this generation's marker must turn a missing record into a respawn, got {decision:?}"
-        );
+                    spawn_config: Box::new(runner_config(socket)),
+                }
+            };
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(id.clone()));
+            let identity = RunnerIdentity {
+                pid: 999_999_999,
+                generation: RUNNER,
+            };
+            let lease = sup
+                .test_install_handle(&id, client, kind, Some(identity))
+                .await;
+            assert_ne!(lease.epoch(), RUNNER);
+            if record {
+                save_record(&id, identity.pid, RUNNER);
+            }
+            if let Some(generation) = marker {
+                let generation = if generation == 0 {
+                    lease.epoch()
+                } else {
+                    generation
+                };
+                crate::process::worker_registry::mark_restart_pending(&id, generation);
+            }
+            let got = match restart_decision(&sup.workers, &sup.lifecycle, &id, killed).await {
+                RestartDecision::Respawn(_) => "respawn",
+                RestartDecision::BudgetBurned => "budget_burned",
+                RestartDecision::DaemonRestart => "daemon_restart",
+                RestartDecision::Gone => "gone",
+                RestartDecision::UserStopped => "user_stopped",
+                RestartDecision::NoSpawnConfig => "no_spawn_config",
+            };
+            assert_eq!(got, want, "case {i}");
+            if want == "daemon_restart" {
+                assert_eq!(
+                    crate::process::worker_registry::peek_restart_marker(&id),
+                    Some(RUNNER),
+                    "case {i}: the marker is left for the reaper"
+                );
+            }
+        }
+    }
+
+    /// The wedge kill of an attached worker marks the runner's own
+    /// generation, so it reads as a restart whichever of the reaper and the
+    /// drain task sees the missing record first.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_wedge_kill_of_an_attached_worker_reads_as_a_restart_either_way() {
+        let _home = isolate_home();
+        for (id, reaper_first) in [("s-wedge-reaper", true), ("s-wedge-drain", false)] {
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone());
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+            let identity = RunnerIdentity {
+                pid: 999_999_999,
+                generation: 11,
+            };
+            let lease = sup
+                .test_install_handle(id, client, WorkerKind::Attached, Some(identity))
+                .await;
+            // What the drain task writes before the kill; the dying runner
+            // then removes its own record.
+            crate::process::worker_registry::mark_restart_pending(
+                id,
+                installed_marker_key(&sup.lifecycle, &lease),
+            );
+            if reaper_first {
+                assert_eq!(sup.reap_user_stopped().await, vec![id.to_string()]);
+                assert_eq!(stopped_reasons(&sink, id), vec!["restart_pending"]);
+            } else {
+                let decision = restart_decision(&sup.workers, &sup.lifecycle, id, true).await;
+                assert!(
+                    matches!(decision, RestartDecision::NoSpawnConfig),
+                    "the drain task re-arms it, got {decision:?}"
+                );
+            }
+        }
     }
 
     /// An attached worker's end is not a budget burn until the window is.
@@ -6435,14 +6632,14 @@ cursor-acp-bridge = "agent acp"
             .await;
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
-            let decision = restart_decision(&sup.workers, "s-attached", true).await;
+            let decision = restart_decision(&sup.workers, &sup.lifecycle, "s-attached", true).await;
             assert!(
                 matches!(decision, RestartDecision::NoSpawnConfig),
                 "decision #{i} should be NoSpawnConfig, got {decision:?}"
             );
         }
         // Past the threshold, a real budget burn still wins.
-        let decision = restart_decision(&sup.workers, "s-attached", true).await;
+        let decision = restart_decision(&sup.workers, &sup.lifecycle, "s-attached", true).await;
         assert!(matches!(decision, RestartDecision::BudgetBurned));
     }
 
@@ -8566,6 +8763,305 @@ cursor-acp-bridge = "agent acp"
             sup.begin_resume("s-imm", ResumeKind::Spawn).await.unwrap(),
             ResumeReservationOutcome::Reserved(_)
         ));
+    }
+
+    /// SIGTERM breaks a real runner's transport, which the connection task
+    /// reports as an `AgentStartupError` on the inbound channel.
+    #[derive(Default)]
+    struct TransportBreaksOnTerm {
+        inner: FakeProcessControl,
+        inbound: std::sync::Mutex<Option<mpsc::Sender<Event>>>,
+    }
+
+    impl ProcessControl for TransportBreaksOnTerm {
+        fn is_alive(&self, pid: u32) -> bool {
+            self.inner.is_alive(pid)
+        }
+
+        fn terminate_group(&self, pid: u32) {
+            if let Some(tx) = self.inbound.lock().unwrap().take() {
+                let _ = tx.try_send(Event::AgentStartupError {
+                    message: "ACP connection failed: agent transport closed".into(),
+                });
+            }
+            self.inner.terminate_group(pid);
+        }
+
+        fn kill_group(&self, pid: u32) {
+            self.inner.kill_group(pid);
+        }
+    }
+
+    /// Install an attached worker flagged for a build-stale respawn.
+    async fn flag_attached<S: BroadcastSink>(
+        sup: &Supervisor<S>,
+        id: &str,
+        identity: RunnerIdentity,
+    ) -> Lease {
+        save_record(id, identity.pid, identity.generation);
+        let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+        let lease = sup
+            .test_install_handle(id, client, WorkerKind::Attached, Some(identity))
+            .await;
+        sup.mark_build_respawn_pending(id, chrono::Utc::now().timestamp_millis());
+        lease
+    }
+
+    /// The supervisor retires a drained build-stale worker as one restart:
+    /// the connection is closed and drained before the runner is signalled,
+    /// so the dying transport publishes no `AgentStartupError`, and the
+    /// background items are lost to `NewBuild` exactly once.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retire_build_stale_stops_the_worker_as_a_restart() {
+        use crate::acp::state::BackgroundLossCause::NewBuild;
+        let _home = isolate_home();
+        let control = Arc::new(TransportBreaksOnTerm::default());
+        control.inner.alive(4101);
+        let sink = VecSink::with_live_background(vec![live_item("sh1")]);
+        let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+        let identity = RunnerIdentity {
+            pid: 4101,
+            generation: 9,
+        };
+        let lease = flag_attached(&sup, "s-retire", identity).await;
+        let (inbound_tx, inbound_rx) = mpsc::channel::<Event>(16);
+        *control.inbound.lock().unwrap() = Some(inbound_tx);
+        let drain = sup.start_drain_task("s-retire".into(), lease, inbound_rx);
+        sup.workers
+            .lock()
+            .await
+            .get_mut("s-retire")
+            .expect("installed")
+            .drain_task = drain;
+
+        assert!(sup.retire_build_stale("s-retire").await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(stopped_reasons(&sink, "s-retire"), vec!["restart_pending"]);
+        assert!(
+            !sink
+                .frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, _, ev)| matches!(ev, Event::AgentStartupError { .. })),
+            "the daemon's own kill is not a startup error"
+        );
+        assert_eq!(lost_ids(&sink), vec![("sh1".into(), Some(NewBuild))]);
+        assert_eq!(control.inner.signals(), vec![(4101, "TERM")]);
+        assert_eq!(sup.worker_state("s-retire").await, AcpWorkerState::Absent);
+        assert!(crate::process::worker_registry::load("s-retire")
+            .unwrap()
+            .is_none());
+        assert!(sup.respawn_pending().is_empty());
+    }
+
+    /// A stop wins over a build-stale retire: one that lands during the
+    /// teardown is published and the session is not re-armed, and a record
+    /// `aoe acp stop` already removed leaves the worker to the reaper.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retire_build_stale_yields_to_a_stop() {
+        use crate::acp::state::BackgroundLossCause::UserStop;
+        let _home = isolate_home();
+        let control = Arc::new(FakeProcessControl::default());
+        control.immortal(4201);
+        let sink = VecSink::with_live_background(vec![live_item("sh1")]);
+        let sup = Arc::new(Supervisor::new(sink.clone()).with_process_control(control.clone()));
+        let identity = RunnerIdentity {
+            pid: 4201,
+            generation: 3,
+        };
+        flag_attached(&sup, "s-stop-race", identity).await;
+
+        let retire = tokio::spawn({
+            let sup = Arc::clone(&sup);
+            async move { sup.retire_build_stale("s-stop-race").await }
+        });
+        while control.signals().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        sup.shutdown("s-stop-race")
+            .await
+            .expect("a stop during a teardown is accepted");
+        control.exit(4201);
+        assert!(!retire.await.unwrap(), "the stop wins");
+        assert_eq!(
+            stopped_reasons(&sink, "s-stop-race"),
+            vec!["restart_pending", "user_stopped"]
+        );
+        assert_eq!(lost_ids(&sink), vec![("sh1".into(), Some(UserStop))]);
+        assert_eq!(
+            crate::process::worker_registry::peek_restart_marker("s-stop-race"),
+            None
+        );
+
+        let identity = RunnerIdentity {
+            pid: 4202,
+            generation: 5,
+        };
+        flag_attached(&sup, "s-cli-stop", identity).await;
+        crate::process::worker_registry::delete("s-cli-stop").unwrap();
+        assert!(!sup.retire_build_stale("s-cli-stop").await);
+        assert_eq!(
+            sup.worker_state("s-cli-stop").await,
+            AcpWorkerState::Running,
+            "the reaper classifies a stop it did not order"
+        );
+        assert!(stopped_reasons(&sink, "s-cli-stop").is_empty());
+        assert!(sup.respawn_pending().is_empty());
+    }
+
+    /// A drained runner that survives SIGKILL keeps its session owned. Its
+    /// restart stands and re-arms the session once a retry proves it gone,
+    /// unless a stop lands meanwhile: that claims the marker and publishes
+    /// itself.
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn retire_build_stale_rearms_an_unkillable_runner_once_it_exits() {
+        let _home = isolate_home();
+        for (id, stop_meanwhile) in [("s-imm-retire", false), ("s-imm-stopped", true)] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.immortal(4301);
+            let sink = VecSink::new();
+            let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+            let identity = RunnerIdentity {
+                pid: 4301,
+                generation: 6,
+            };
+            flag_attached(&sup, id, identity).await;
+
+            assert!(sup.retire_build_stale(id).await, "{id}");
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Stopping);
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(id),
+                Some(6),
+                "{id}"
+            );
+            if stop_meanwhile {
+                sup.shutdown(id)
+                    .await
+                    .expect("a stop of a teardown in flight is accepted");
+            }
+
+            control.exit(4301);
+            sup.retry_pending_teardowns().await;
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+            let want: &[&str] = if stop_meanwhile {
+                &["restart_pending", "user_stopped"]
+            } else {
+                &["restart_pending"]
+            };
+            assert_eq!(stopped_reasons(&sink, id), want, "{id}");
+            assert_eq!(
+                sup.take_late_restart_marker(id),
+                !stop_meanwhile,
+                "{id}: the restart stands unless the stop claimed its marker"
+            );
+        }
+    }
+
+    /// `aoe acp stop` removing the record while the retire closes the
+    /// connection still wins: the retire checks the record again right before
+    /// it signals. `aoe acp restart` leaves its marker and stays a restart.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn retire_build_stale_rechecks_the_record_before_signalling() {
+        use crate::acp::state::BackgroundLossCause::{NewBuild, UserStop};
+        struct OnDrop<F: FnMut()>(F);
+        impl<F: FnMut()> Drop for OnDrop<F> {
+            fn drop(&mut self) {
+                (self.0)()
+            }
+        }
+        let _home = isolate_home();
+        for (id, restart, want_reasons, want_loss) in [
+            (
+                "s-cli-stop-mid",
+                false,
+                &["restart_pending", "user_stopped"][..],
+                UserStop,
+            ),
+            (
+                "s-cli-restart-mid",
+                true,
+                &["restart_pending"][..],
+                NewBuild,
+            ),
+        ] {
+            let control = Arc::new(FakeProcessControl::default());
+            control.alive(4401);
+            let sink = VecSink::with_live_background(vec![live_item("sh1")]);
+            let sup = Supervisor::new(sink.clone()).with_process_control(control.clone());
+            let identity = RunnerIdentity {
+                pid: 4401,
+                generation: 7,
+            };
+            flag_attached(&sup, id, identity).await;
+            // The CLI acts while the retire awaits the aborted drain task.
+            let cli = OnDrop(move || {
+                if restart {
+                    crate::process::worker_registry::mark_restart_pending(id, 7);
+                }
+                let _ = crate::process::worker_registry::delete(id);
+            });
+            let drain = tokio::spawn(async move {
+                let _cli = cli;
+                std::future::pending::<()>().await
+            });
+            sup.workers
+                .lock()
+                .await
+                .get_mut(id)
+                .expect("installed")
+                .drain_task = drain;
+
+            assert_eq!(sup.retire_build_stale(id).await, restart, "{id}");
+            assert_eq!(stopped_reasons(&sink, id), want_reasons, "{id}");
+            assert_eq!(
+                lost_ids(&sink),
+                vec![("sh1".into(), Some(want_loss))],
+                "{id}"
+            );
+            assert_eq!(sup.worker_state(id).await, AcpWorkerState::Absent);
+            assert_eq!(
+                crate::process::worker_registry::peek_restart_marker(id),
+                None,
+                "{id}"
+            );
+        }
+    }
+
+    /// Re-adopting the same stale runner after its connection broke keeps
+    /// the time it was first flagged, so its caps do not restart; a new
+    /// runner generation starts fresh.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reflag_of_the_same_stale_runner_keeps_its_first_flag_time() {
+        let _home = isolate_home();
+        let sup = Supervisor::new(VecSink::new());
+        let id = "s-reflag";
+        for (generation, flagged_at, want) in
+            [(5, 1_000, 1_000), (5, 2_000, 1_000), (6, 3_000, 3_000)]
+        {
+            let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(id.into()));
+            let runner = RunnerIdentity {
+                pid: 999_999_999,
+                generation,
+            };
+            sup.test_install_handle(id, client, WorkerKind::Attached, Some(runner))
+                .await;
+            sup.mark_build_respawn_pending(id, flagged_at);
+            assert_eq!(
+                sup.respawn_pending(),
+                vec![(id.to_string(), want)],
+                "generation {generation} flagged at {flagged_at}"
+            );
+            // The connection breaks and the drain task drops the handle.
+            sup.test_remove_worker(id).await;
+            assert!(sup.respawn_pending().is_empty());
+        }
     }
 
     /// A stop asked of a resume that then fails before install (a dead
