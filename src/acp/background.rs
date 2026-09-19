@@ -34,11 +34,12 @@ fn end_item(
 /// Deadlines that have passed by `now` end their item: a timed monitor times
 /// out and a wakeup fires. A later end never overrides an earlier one.
 ///
-/// Sub-agent rows mirror upstream's `BackgroundAgent*` events and end only on
-/// `BackgroundAgentCompleted`; `Detached` means lost. A `BackgroundItemEnded`
-/// for a sub-agent never ends it: it records the loss cause, which applies to
-/// the `Detached` published with the same `at` (see `detach_background_agents`
-/// in the supervisor).
+/// Only upstream's `BackgroundAgentLaunched` starts a sub-agent row. It ends
+/// on whichever is seen first: `BackgroundAgentCompleted` (`Detached` means
+/// lost) or the registry's own `Stopped`/`Finished`, since the tailer can lag
+/// the agent's own stop by minutes. A registry `Lost` never ends it: it
+/// records the cause for the `Detached` published with the same `at` (see
+/// `detach_background_agents` in the supervisor).
 pub fn fold_background(
     rows: impl IntoIterator<Item = (DateTime<Utc>, Event)>,
     now: DateTime<Utc>,
@@ -84,10 +85,15 @@ pub fn fold_background(
                 let is_subagent = index
                     .get(&id)
                     .is_some_and(|&i| items[i].kind == BackgroundKind::Subagent);
-                if !is_subagent {
-                    end_item(&mut items, &index, &id, BackgroundEnd { reason, cause, at });
-                } else if let (BackgroundEndReason::Lost, Some(cause)) = (reason, cause) {
-                    detach_causes.insert(id, (at, cause));
+                match (is_subagent, reason, cause) {
+                    (true, BackgroundEndReason::Lost, Some(cause)) => {
+                        detach_causes.insert(id, (at, cause));
+                    }
+                    (true, BackgroundEndReason::Stopped | BackgroundEndReason::Finished, _)
+                    | (false, ..) => {
+                        end_item(&mut items, &index, &id, BackgroundEnd { reason, cause, at });
+                    }
+                    _ => {}
                 }
                 continue;
             }
@@ -538,13 +544,13 @@ mod tests {
         )
     }
 
-    /// Sub-agent rows follow upstream's `BackgroundAgent*` events alone. A
-    /// registry `BackgroundItemEnded` only lends its cause to the `Detached`
+    /// Upstream's launch creates a sub-agent row; the first end from either
+    /// side ends it. A registry `Lost` only lends its cause to the `Detached`
     /// that carries the same `at`.
     #[test]
     fn sub_agents_follow_upstream_background_agent_events() {
-        use BackgroundAgentStatus::{Completed, Detached, Error};
-        use BackgroundEndReason::{Finished, Lost};
+        use BackgroundAgentStatus::{Completed, Detached, Error, Stalled};
+        use BackgroundEndReason::{Finished, Lost, Stopped};
         use BackgroundLossCause::Respawn;
         let cases = vec![
             ("launched is live", vec![launched("a", 0)], None),
@@ -567,7 +573,38 @@ mod tests {
                 }),
             ),
             (
-                "a registry end alone does not end it",
+                "a stalled completion finishes it",
+                vec![launched("a", 0), completed("a", Stalled, 5)],
+                Some(BackgroundEnd {
+                    reason: Finished,
+                    cause: None,
+                    at: t(5),
+                }),
+            ),
+            (
+                "a registry stop ends it",
+                vec![launched("a", 0), ended("a", Stopped, None, 4)],
+                Some(BackgroundEnd {
+                    reason: Stopped,
+                    cause: None,
+                    at: t(4),
+                }),
+            ),
+            (
+                "a registry finish ends it before the tailer does",
+                vec![
+                    launched("a", 0),
+                    ended("a", Finished, None, 4),
+                    completed("a", Completed, 9),
+                ],
+                Some(BackgroundEnd {
+                    reason: Finished,
+                    cause: None,
+                    at: t(4),
+                }),
+            ),
+            (
+                "a registry loss alone does not end it",
                 vec![launched("a", 0), ended("a", Lost, Some(Respawn), 5)],
                 None,
             ),
