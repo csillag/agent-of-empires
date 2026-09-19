@@ -1178,6 +1178,7 @@ impl EventStore {
                      OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                      OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
                      OR json_extract(event_json, '$.AgentMessageChunk') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentThoughtChunk') IS NOT NULL
                      OR json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
                      -- ThinkingStarted is a unit enum variant, serialized as
                      -- the bare JSON string \"ThinkingStarted\" rather than an
@@ -2411,6 +2412,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
+        Event::AgentThoughtChunk { .. } => "agent_thought_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",

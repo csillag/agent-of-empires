@@ -937,6 +937,17 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
     },
+    /// Reasoning-summary text from an ACP `agent_thought_chunk` whose content
+    /// is non-empty. Recent models return a summary of their reasoning that is
+    /// often the only record of what the agent believed it was telling the
+    /// user: they route narration into this channel instead of emitting it as
+    /// a text block, so a turn can otherwise reach the user as tool calls with
+    /// no prose at all. `ThinkingStarted` still rides alongside for the
+    /// turn-activity signal; this variant carries the words. Adapters that
+    /// stream signature-only (empty) thought chunks produce none of these.
+    AgentThoughtChunk {
+        text: String,
+    },
     /// A cancel was requested for the in-flight turn: aoe sent the ACP
     /// `session/cancel` notification and armed the escalation watchdog.
     /// The turn is NOT over yet (no `Stopped`); this lets the UI show a
@@ -1361,6 +1372,9 @@ impl AcpState {
                 self.cancelling = false;
             }
             Event::AgentMessageChunk { .. } => {}
+            // Transcript-only, like `AgentMessageChunk`. The paired
+            // `ThinkingStarted` already carries the control-state signal.
+            Event::AgentThoughtChunk { .. } => {}
             // A cancel was requested; the turn is still active until its real
             // `Stopped` arrives (the UI derives the "Stopping…" label from this
             // flag). Bumps seq so the WS replay surfaces it to live clients.

@@ -546,8 +546,10 @@ export function activityToThreadMessages(
         row.asyncSubagent ?? false,
       );
     } else if (row.kind === "thinking") {
-      // Thinking is rendered by the global rattle spinner, not the
-      // message stream.
+      // A thinking update: the agent's between-tool narration, which Claude
+      // Code requests as `display: "updates"` instead of text blocks. The
+      // thinking *phase* is still the global rattle spinner.
+      currentAssistant.appendThought(row.text);
     } else if (row.kind === "empty_output") {
       // Synthesised when the agent finished a turn without emitting any
       // text or tool calls (e.g. interactive-only slash commands like
@@ -602,11 +604,22 @@ type DraftPart =
       isError?: boolean;
     };
 
+/** A thinking update as plain message text under a small tag. It is text the
+ *  agent addressed to the user, so it reads like a message. */
+function formatUpdate(raw: string): string {
+  return `*↳ update*\n\n${raw.trim()}`;
+}
+
 /** Mutable builder for an assistant message under construction. */
 class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
+  /** Whether the trailing part is an open update that the next thought row
+   *  should extend rather than restart. */
+  private thoughtRunOpen = false;
+  /** Verbatim text of the open update, as streamed. */
+  private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -615,15 +628,40 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
+    // A trailing update is a text part too; merging into it would put the
+    // answer under the update tag. Start a fresh part instead.
+    const afterThought = this.thoughtRunOpen;
+    this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
-    if (last && last.type === "text") {
+    if (!afterThought && last && last.type === "text") {
       last.text += text;
     } else {
       this.parts.push({ type: "text", text });
     }
   }
 
+  /** Append update text as its own tagged part. Consecutive thought rows
+   *  extend the open update; anything else closes it.
+   *
+   *  Rows are streamed token fragments that routinely split mid-word
+   *  ("met" + "adata"), so they are joined verbatim and the whole part is
+   *  re-rendered. */
+  appendThought(text: string) {
+    if (!text) return;
+    const last = this.parts[this.parts.length - 1];
+    if (this.thoughtRunOpen && last && last.type === "text") {
+      this.thoughtRaw += text;
+      last.text = formatUpdate(this.thoughtRaw);
+      return;
+    }
+    if (!text.trim()) return;
+    this.thoughtRaw = text;
+    this.parts.push({ type: "text", text: formatUpdate(this.thoughtRaw) });
+    this.thoughtRunOpen = true;
+  }
+
   appendToolCall(tool: ToolCall) {
+    this.thoughtRunOpen = false;
     // Forward the ACP tool title alongside the args so per-kind
     // renderers can show a descriptive label when raw_input is
     // empty (Claude's bash tool, for example, often emits an empty

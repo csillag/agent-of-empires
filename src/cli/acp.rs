@@ -1255,6 +1255,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
         Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
+        Event::AgentThoughtChunk { .. } => "agent_thought_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
         Event::AgentStartupError { .. } => "agent_startup_error",

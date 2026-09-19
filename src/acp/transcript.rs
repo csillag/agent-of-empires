@@ -84,10 +84,10 @@ pub struct TranscriptRow {
 
 /// The kind discriminant for a [`TranscriptRow`]. Mirrors the web
 /// `ActivityRow["kind"]` union with one deliberate omission: there is no
-/// `thinking` row. Neither reducer appends a thinking transcript row (the web
-/// reducer only sets `state.thinking`, the TUI only sets `status_text`); it is
-/// control-state, already tracked on `AcpState.thinking`. Adding an unused
-/// variant would be dead code, so it is left to `AcpState`.
+/// `thinking` row for the *phase*: that is control-state, tracked on
+/// `AcpState.thinking` and rendered as a spinner. `Thinking` rows here carry
+/// the TEXT of `AgentThoughtChunk`, which is a different thing: with thinking
+/// on, the model's between-tool narration arrives as thinking updates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptRowKind {
@@ -96,6 +96,9 @@ pub enum TranscriptRowKind {
     ToolError,
     ToolStopped,
     Message,
+    /// Thinking-update text (see the note above). Clients render it as a
+    /// message under an update tag: it is text the agent addressed to the user.
+    Thinking,
     UserPrompt,
     UserDiffComments,
     ElicitationAnswered,
@@ -160,6 +163,8 @@ pub struct TranscriptModel {
     /// The group id of the run of consecutive `AgentMessageChunk` rows still
     /// open, or `None` after any non-chunk event closed it.
     open_message_group: Option<String>,
+    /// The same, for a run of streamed `AgentThoughtChunk` rows.
+    open_thought_group: Option<String>,
     /// Monotonic counter behind [`TranscriptModel::fresh_group`].
     group_counter: u64,
     /// Highest seq consumed; frames whose seq is not greater are dropped so
@@ -193,6 +198,7 @@ impl TranscriptModel {
             tool_outputs: HashMap::new(),
             elicitation_tool_ids: HashSet::new(),
             open_message_group: None,
+            open_thought_group: None,
             group_counter: 0,
             last_seq: 0,
             turn_active: false,
@@ -226,8 +232,30 @@ impl TranscriptModel {
         if !matches!(event, Event::AgentMessageChunk { .. }) {
             self.open_message_group = None;
         }
+        // Same for a run of streamed thought chunks, except that
+        // `ThinkingStarted` rides along with every one of them (see
+        // `update_events`) and must not split the run it accompanies.
+        if !matches!(
+            event,
+            Event::AgentThoughtChunk { .. } | Event::ThinkingStarted
+        ) {
+            self.open_thought_group = None;
+        }
 
         match event {
+            // Reasoning-summary text. Counts as turn output for the same
+            // reason `ThinkingStarted` does: a turn that only reasoned is not
+            // an empty turn.
+            Event::AgentThoughtChunk { text } => {
+                let group_id = self.thought_group();
+                self.turn_has_output = true;
+                vec![self.append(TranscriptRow::new(
+                    format!("thought-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Thinking,
+                    text.clone(),
+                ))]
+            }
             Event::AgentMessageChunk { text } => {
                 let group_id = self.message_group();
                 self.turn_has_output = true;
@@ -746,6 +774,16 @@ impl TranscriptModel {
         g
     }
 
+    /// The group id for the current run of streamed thought chunks.
+    fn thought_group(&mut self) -> String {
+        if let Some(g) = self.open_thought_group.clone() {
+            return g;
+        }
+        let g = self.fresh_group();
+        self.open_thought_group = Some(g.clone());
+        g
+    }
+
     fn fresh_group(&mut self) -> String {
         self.group_counter += 1;
         format!("g{}", self.group_counter)
@@ -1144,6 +1182,75 @@ mod tests {
         let dc = row.diff_comments.as_ref().expect("diff_comments payload");
         assert!(dc.is_multi_repo);
         assert_eq!(dc.intro, "look");
+    }
+
+    /// Thought chunks become their own dimmed rows, grouped like message
+    /// chunks. The `ThinkingStarted` that rides with every one of them must
+    /// not split the run, and a real message must not join it: the whole
+    /// point of the row is that a summary is distinguishable from something
+    /// the agent addressed to the user.
+    #[test]
+    fn thought_chunks_group_across_their_thinking_signals_and_split_from_messages() {
+        let m = fold(vec![
+            Event::ThinkingStarted,
+            Event::AgentThoughtChunk {
+                text: "Checking the ".into(),
+            },
+            Event::ThinkingStarted,
+            Event::AgentThoughtChunk {
+                text: "port forwards.".into(),
+            },
+            Event::AgentMessageChunk {
+                text: "Both ports forward correctly.".into(),
+            },
+        ]);
+        let kinds: Vec<TranscriptRowKind> = m.rows().iter().map(|r| r.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                TranscriptRowKind::Thinking,
+                TranscriptRowKind::Thinking,
+                TranscriptRowKind::Message,
+            ]
+        );
+        assert_eq!(
+            m.rows()[0].group_id,
+            m.rows()[1].group_id,
+            "ThinkingStarted between chunks must not split the run"
+        );
+        assert_ne!(
+            m.rows()[1].group_id,
+            m.rows()[2].group_id,
+            "a message must not join the thought run"
+        );
+        assert_eq!(m.rows()[0].id, "thought-2");
+    }
+
+    /// A turn that only reasoned is not an empty turn: without this the
+    /// `empty_output` sweep would synthesise a "no output" notice over a turn
+    /// whose reasoning summary is sitting right there in the transcript.
+    #[test]
+    fn a_thought_chunk_counts_as_turn_output() {
+        let m = fold(vec![
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            },
+            Event::AgentThoughtChunk {
+                text: "Nothing to do here.".into(),
+            },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+        ]);
+        assert!(
+            !m.rows()
+                .iter()
+                .any(|r| r.kind == TranscriptRowKind::EmptyOutput),
+            "reasoning-only turn must not be flagged empty: {:?}",
+            m.rows().iter().map(|r| r.kind).collect::<Vec<_>>()
+        );
     }
 
     #[test]
