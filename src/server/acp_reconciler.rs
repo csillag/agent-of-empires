@@ -3871,7 +3871,7 @@ mod tests {
 
         let state = build_test_app_state(vec![inst]);
         let now = chrono::Utc::now();
-        // Seqs start well above 1: the supervisor's own `next_seqs` counter
+        // Seqs start well above 1: the supervisor's own seq counter
         // for this session starts unseeded at 0 and will allocate 1 for the
         // `BackgroundLossNoted` event the pass publishes below, which would
         // silently collide with (and no-op against) a seq 1 written here.
