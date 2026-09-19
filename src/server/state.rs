@@ -240,7 +240,7 @@ pub struct AppState {
     /// Disk-backed acp event log. The single source of truth for
     /// replay: `ChannelSink::publish` writes here on every event, the
     /// WS-on-connect drain reads from here, the `/acp/replay` REST
-    /// endpoint reads from here, and `Supervisor::next_seqs` is seeded
+    /// endpoint reads from here, and the supervisor seq counters are seeded
     /// from here at startup so a fresh publish gets `max_seq + 1`
     /// rather than 1.
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
