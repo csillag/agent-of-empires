@@ -3814,7 +3814,8 @@ mod tests {
     /// The owner's rule for background work: a live shell holds a drained
     /// build-stale worker for 30 min and a live sub-agent for 3 h, a live
     /// monitor does not hold it, and past its cap the worker is retired with
-    /// the items lost to `new_build`.
+    /// the items lost to `new_build` (a sub-agent through upstream's
+    /// `Detached`).
     #[tokio::test]
     #[serial_test::serial]
     async fn live_background_work_holds_a_drained_worker_up_to_the_cap() {
@@ -3839,13 +3840,26 @@ mod tests {
         ] {
             let (state, _home, _project) = capacity_test_state(id).await;
             let flagged_at = Utc::now().timestamp_millis() - 60_000;
-            let started = crate::acp::Event::BackgroundItemStarted {
-                kind,
-                id: "bg1".into(),
-                tool_call_id: None,
-                label: None,
-                started_at: Utc::now(),
-                expires_at: None,
+            // Sub-agent rows come only from upstream's launch event.
+            let started = if kind == BackgroundKind::Subagent {
+                crate::acp::Event::BackgroundAgentLaunched {
+                    agent_id: "bg1".into(),
+                    tool_call_id: "tc-bg1".into(),
+                    description: "bg1 task".into(),
+                    prompt: String::new(),
+                    model: String::new(),
+                    started_at: Utc::now(),
+                    output_file: String::new(),
+                }
+            } else {
+                crate::acp::Event::BackgroundItemStarted {
+                    kind,
+                    id: "bg1".into(),
+                    tool_call_id: None,
+                    label: None,
+                    started_at: Utc::now(),
+                    expires_at: None,
+                }
             };
             let store = &state.acp_event_store;
             store
