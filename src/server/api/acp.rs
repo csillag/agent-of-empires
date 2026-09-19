@@ -2684,7 +2684,8 @@ async fn config_option_category(
 ///
 /// With no worker running the pick is persisted rather than refused, and the
 /// 202 says `applied: "deferred"`. The spawn path then applies it after the
-/// handshake.
+/// handshake. A parked model pick off the agent's active `pin_model` is
+/// refused with 409 instead, because the pin wins at spawn.
 pub async fn acp_set_config_option(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2743,6 +2744,19 @@ pub async fn acp_set_config_option(
         // connection task re-asserting `agent_model` after the handshake; a
         // persisted pick that nothing applies would be a worse lie than the 404.
         (Err(SupervisorError::UnknownSession(_)), Some(selector)) => {
+            if selector == PersistedSelector::Model {
+                if let Some(pinned) = model_pin_against(&state, &id, &req.value).await {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "model is pinned: this session's agent is pinned to {pinned:?}, \
+                             so {:?} would not apply when it starts",
+                            req.value
+                        ),
+                    )
+                        .into_response();
+                }
+            }
             persist_selector(&state, &id, selector, &req.value, true).await;
             (
                 StatusCode::ACCEPTED,
@@ -2752,6 +2766,36 @@ pub async fn acp_set_config_option(
         }
         (Err(e), _) => supervisor_error_response("set_config_option failed", &e),
     }
+}
+
+/// The active `pin_model` a parked model pick loses to, if any. The spawn
+/// resolves a pin over `Instance.agent_model`, so persisting the pick would
+/// promise a model the session never starts on. Mirrors the plugin path's
+/// `model_pinned` refusal: picking the pinned model itself is allowed.
+async fn model_pin_against(state: &Arc<AppState>, id: &str, value: &str) -> Option<String> {
+    let (tool, agent_override, profile, project_path) = {
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == id)?;
+        (
+            inst.tool.clone(),
+            inst.agent_name.clone(),
+            inst.source_profile.clone(),
+            std::path::PathBuf::from(&inst.project_path),
+        )
+    };
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(&tool, agent_override.as_deref(), &profile, &project_path)
+        .await;
+    let pinned = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .acp
+            .pinned_model_for(&agent)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    (pinned != value.trim()).then_some(pinned)
 }
 
 /// Which persisted selector, if any, a `config_id` maps to. `"model"` is the
@@ -4670,5 +4714,56 @@ mod tests {
         .into_response();
 
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// An active `pin_model` wins at spawn, so a parked pick off it is refused
+    /// rather than persisted as a promise the next start would break. Picking
+    /// the pinned model itself is still deferred, as on the plugin path.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parked_model_pick_against_a_pin() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        std::fs::write(
+            crate::session::get_app_dir()
+                .expect("isolated app dir")
+                .join("config.toml"),
+            "[acp.acp_defaults.claude]\nmodel = \"claude-pinned\"\npin_model = true\n",
+        )
+        .expect("write config");
+
+        for (value, status, persisted) in [
+            ("opus[1m]", StatusCode::CONFLICT, None),
+            ("claude-pinned", StatusCode::ACCEPTED, Some("claude-pinned")),
+        ] {
+            let mut inst = crate::session::Instance::new("t", "/tmp");
+            inst.source_profile = "default".to_string();
+            let id = inst.id.clone();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let resp = acp_set_config_option(
+                State(Arc::clone(&state)),
+                Path(id),
+                Ok(Json(SetConfigOptionRequest {
+                    config_id: "model".to_string(),
+                    value: value.to_string(),
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(resp.status(), status, "{value}");
+            let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+            if status == StatusCode::CONFLICT {
+                let body = String::from_utf8_lossy(&body);
+                assert!(body.starts_with("model is pinned"), "{body}");
+            }
+            let instances = state.instances.read().await;
+            assert_eq!(instances[0].agent_model.as_deref(), persisted, "{value}");
+            assert_eq!(
+                instances[0].agent_model_pending,
+                persisted.is_some(),
+                "{value}"
+            );
+        }
     }
 }

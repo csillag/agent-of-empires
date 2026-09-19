@@ -765,6 +765,10 @@ fn refresh_spawn_model_effort(
     config
         .provider_env
         .retain(|(key, _)| key != "AOE_AGENT_MODEL");
+    // A cached assert must follow a pin that moved, or it would override it.
+    if config.default_model.is_some() {
+        config.default_model = model.clone();
+    }
     if let Some(model) = model {
         config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
     }
@@ -1969,6 +1973,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             host_environment,
             default_effort: effort,
             default_effort_explicit: effort_explicit,
+            // `model` is already resolved, so an active pin wins the assert too.
             default_model: assert_model.then_some(model).flatten(),
             default_mode,
             socket_path: Some(socket_path),
@@ -4611,6 +4616,49 @@ mod tests {
             Some("low"),
             "an explicit effort must survive the pin move"
         );
+    }
+
+    /// A cached model assert (a parked pick) follows a pin that moved between
+    /// launches instead of overriding it; without a pin the pick still applies.
+    #[test]
+    fn respawn_moves_a_cached_model_assert_with_the_pin() {
+        use crate::session::config::AcpAgentDefaults;
+        let pin = AcpAgentDefaults {
+            model: Some("model-b".into()),
+            pin_model: true,
+            ..Default::default()
+        };
+        for (defaults, cached, expected) in [
+            (None, Some("model-a"), Some("model-a")),
+            (Some(&pin), Some("model-a"), Some("model-b")),
+            (Some(&pin), None, None),
+        ] {
+            let mut config = SpawnConfig {
+                wrapper_substitution: None,
+                agent_key: "claude".into(),
+                tool: "claude".into(),
+                spec: spec("claude-agent-acp", &[]),
+                cwd: std::env::temp_dir(),
+                additional_dirs: vec![],
+                provider_env: vec![("AOE_AGENT_MODEL".into(), "model-a".into())],
+                host_environment: vec![],
+                default_effort: None,
+                default_effort_explicit: false,
+                default_model: cached.map(String::from),
+                default_mode: None,
+                socket_path: None,
+                stored_acp_session_id: None,
+                fork_from: None,
+                seed_history_replay: false,
+                artifact_dir: None,
+                sandbox_info: None,
+                source_profile: None,
+                mcp_servers: Vec::new(),
+                generation: 0,
+            };
+            refresh_spawn_model_effort(&mut config, defaults);
+            assert_eq!(config.default_model.as_deref(), expected, "{cached:?}");
+        }
     }
 
     fn ovr(tool: &str, command: &str) -> AgentCommandOverride {
