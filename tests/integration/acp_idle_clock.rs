@@ -44,6 +44,7 @@ async fn a_post_load_notification_moves_the_live_clock() {
         host_environment: vec![],
         default_effort: None,
         default_effort_explicit: false,
+        default_model: None,
         default_mode: None,
         socket_path: None,
         stored_acp_session_id: Some(stored.into()),
