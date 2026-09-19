@@ -5,7 +5,7 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
-import type { PromptAttachmentInput } from "./acpTypes";
+import type { PromptAttachmentInput, QueuedPrompt } from "./acpTypes";
 import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 import { toastBus } from "./toastBus";
 
@@ -94,6 +94,23 @@ export function setDraft(sessionId: string, text: string): void {
     clearDraftPersistFailure(sessionId);
   }
   notify(sessionId);
+}
+
+/** Text a page unload must not lose: the live composer draft plus any queued
+ *  prompt the server never confirmed. Queued prompts are no longer persisted
+ *  and are never re-posted, because a re-post can re-send one the server has
+ *  already drained or another client deleted (#4021); an unconfirmed one
+ *  therefore comes back as draft text for the user to send again. Oldest
+ *  first, so the draft the user was typing stays last. */
+export function unsentDraftOnUnload(draft: string, queued: readonly QueuedPrompt[]): string {
+  const unconfirmed = queued
+    .filter((q) => q.pending)
+    .map((q) => q.text.trim())
+    .filter((t) => t.length > 0);
+  if (unconfirmed.length === 0) return draft;
+  // The live draft goes through verbatim: its leading and trailing whitespace
+  // is text the owner typed, and only a blank one is dropped.
+  return (draft.trim().length > 0 ? [...unconfirmed, draft] : unconfirmed).join("\n\n");
 }
 
 // Drop the persisted draft for a single session id. Convenience over

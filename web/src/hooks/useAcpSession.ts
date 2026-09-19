@@ -16,7 +16,6 @@ import {
   deriveTurnActive,
   mergePrependedActivity,
   mergeServerRows,
-  normaliseTurnState,
   patchServerRow,
   reduceFrames,
   summarizeAnswers,
@@ -38,6 +37,7 @@ import {
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { safeSetItem } from "../lib/safeStorage";
 import {
+  LEGACY_KEY_PREFIX,
   STORAGE_KEY_PREFIX,
   STATE_TTL_MS,
   clearQueueCount,
@@ -140,8 +140,9 @@ export type Action =
   | { kind: "config_option_deferred"; configId: string; value: string }
   | { kind: "dismiss_config_option_deferred" };
 
-// Per-session memory and localStorage cache. Versioned keys allow schema
-// invalidation; TTL and LRU limits bound abandoned session state. Refresh an
+// Per-session in-memory state cache. It survives a component remount
+// (session switch, tab toggle) but not a page load, so every reload takes
+// the same fresh recent-first path a private window takes. Refresh an
 // existing Map key with delete then set because Map.set preserves its order.
 const STATE_CACHE_CAP = 32;
 const stateCache = new Map<string, AcpState>();
@@ -150,128 +151,18 @@ function storageKey(sessionId: string): string {
   return STORAGE_KEY_PREFIX + sessionId;
 }
 
-// Walk `aoe:acp-state:v1:*` keys and remove the single oldest one
-// (by `savedAt`), preferring corrupt entries when present. Returns true
-// when an entry was removed so the caller can retry the write. The
-// whitelist filter is load-bearing: it must never touch `acp:draft:*`
-// or any unrelated key. Drafts are authoritative client-side state and
-// cross-tab subscribers observe their removal immediately, so silently
-// evicting them would be data loss (see #1345 debate).
-function evictOldestPersistedAcpState(currentKey: string): boolean {
-  if (typeof window === "undefined") return false;
-  try {
-    let oldestKey: string | null = null;
-    let oldestTime = Infinity;
-    let firstCorruptKey: string | null = null;
-    for (let i = 0; i < window.localStorage.length; i++) {
-      const k = window.localStorage.key(i);
-      if (!k || !k.startsWith(STORAGE_KEY_PREFIX)) continue;
-      if (k === currentKey) continue;
-      const raw = window.localStorage.getItem(k);
-      if (raw === null) continue;
-      try {
-        const parsed = JSON.parse(raw) as PersistedEntry | null;
-        if (!parsed || typeof parsed.savedAt !== "number" || Number.isNaN(parsed.savedAt)) {
-          if (firstCorruptKey === null) firstCorruptKey = k;
-          continue;
-        }
-        if (parsed.savedAt < oldestTime) {
-          oldestTime = parsed.savedAt;
-          oldestKey = k;
-        }
-      } catch {
-        if (firstCorruptKey === null) firstCorruptKey = k;
-      }
-    }
-    const victim = firstCorruptKey ?? oldestKey;
-    if (!victim) return false;
-    window.localStorage.removeItem(victim);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/** Project the in-memory reducer state into the shape written to
- *  localStorage. Queued prompts that carry attachments are dropped
- *  entirely: their base64 bytes would blow the per-origin quota, and
- *  persisting the text alone would silently drain a degraded prompt on
- *  reload (e.g. "fix this screenshot:" with no screenshot). The full
- *  row stays in the in-memory `stateCache`, so it survives a component
- *  remount but not a hard page reload. See #1833 / #1000. */
-function toPersistedState(state: AcpState): AcpState {
-  // Optimistic overlay rows are ephemeral client presentation: a confirmed
-  // prompt is already in the server-owned `activity` (re-fetched on reload),
-  // so persisting the overlay would risk a stale duplicate. Drop it, and
-  // with it the in-flight prompt ids: after a reload no POST is left to
-  // acknowledge them, so a persisted id would latch the spinner forever.
-  const base: AcpState =
-    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0
-      ? { ...state, optimisticRows: [], inflightPromptIds: [] }
-      : state;
-  if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
-  return {
-    ...base,
-    queuedPrompts: base.queuedPrompts.filter((q) => !q.attachments?.length),
-  };
-}
-
+// Mirror only the queued-prompt count into localStorage, for the sidebar
+// badge on sessions whose structured view is not mounted. Everything else
+// in `AcpState` is server-owned and re-sent on load, and persisting it
+// froze a session behind a silently-failing over-quota write (#4021).
+// The entry is a few bytes, so there is no eviction path to fail into.
 function persistState(sessionId: string, state: AcpState): void {
-  const key = storageKey(sessionId);
   const body = JSON.stringify({
     savedAt: Date.now(),
-    state: toPersistedState(state),
+    queuedCount: state.queuedPrompts.length,
   } satisfies PersistedEntry);
-  if (safeSetItem(key, body)) {
+  if (safeSetItem(storageKey(sessionId), body)) {
     setQueueCount(sessionId, state.queuedPrompts.length);
-    return;
-  }
-  // Storage write failed (likely QuotaExceeded). Evict a single oldest
-  // structured view cache entry and retry exactly once. On a second failure the
-  // cache is best-effort: the next reload replays from the server, so
-  // we stay silent here per the deliberate UX choice for cache writes.
-  if (!evictOldestPersistedAcpState(key)) return;
-  if (safeSetItem(key, body)) {
-    setQueueCount(sessionId, state.queuedPrompts.length);
-  }
-}
-
-// Test-only exports so the eviction policy can be exercised without
-// driving the full hook lifecycle. Not part of the public API.
-export const __test = {
-  persistState,
-  loadPersistedState,
-  evictOldestPersistedAcpState,
-  STORAGE_KEY_PREFIX,
-};
-
-function loadPersistedState(sessionId: string): AcpState | undefined {
-  if (typeof window === "undefined") return undefined;
-  try {
-    const raw = window.localStorage.getItem(storageKey(sessionId));
-    if (!raw) return undefined;
-    const parsed = JSON.parse(raw) as PersistedEntry | null;
-    if (!parsed || typeof parsed.savedAt !== "number" || typeof parsed.state !== "object" || parsed.state === null) {
-      return undefined;
-    }
-    if (Date.now() - parsed.savedAt > STATE_TTL_MS) {
-      window.localStorage.removeItem(storageKey(sessionId));
-      return undefined;
-    }
-    const state = parsed.state as Partial<AcpState>;
-    if (typeof state.lastSeq !== "number" || !Array.isArray(state.activity) || !Array.isArray(state.queuedPrompts)) {
-      window.localStorage.removeItem(storageKey(sessionId));
-      return undefined;
-    }
-    // Merge over the current defaults so an entry persisted by an older
-    // bundle gains any fields added since (e.g. `pendingElicitations`);
-    // without this the new code reads `undefined` for a freshly-added
-    // array and crashes on `.map`. Then backfill the turn state; see
-    // `normaliseTurnState` for the rules.
-    const merged: AcpState = { ...emptyAcpState(), ...(state as AcpState) };
-    return normaliseTurnState(merged);
-  } catch {
-    return undefined;
   }
 }
 
@@ -279,6 +170,7 @@ function dropPersistedState(sessionId: string): void {
   if (typeof window === "undefined") return;
   try {
     window.localStorage.removeItem(storageKey(sessionId));
+    window.localStorage.removeItem(LEGACY_KEY_PREFIX + sessionId);
   } catch {
     // ignore
   }
@@ -290,7 +182,7 @@ function dropAllPersistedState(): void {
     const toRemove: string[] = [];
     for (let i = 0; i < window.localStorage.length; i++) {
       const k = window.localStorage.key(i);
-      if (k && k.startsWith(STORAGE_KEY_PREFIX)) toRemove.push(k);
+      if (k && (k.startsWith(STORAGE_KEY_PREFIX) || k.startsWith(LEGACY_KEY_PREFIX))) toRemove.push(k);
     }
     for (const k of toRemove) window.localStorage.removeItem(k);
   } catch {
@@ -299,7 +191,13 @@ function dropAllPersistedState(): void {
 }
 
 let sweptStorage = false;
-function sweepExpiredStorage(): void {
+/** One localStorage scan per page load: expire stale badge entries and delete
+ *  every pre-#4021 `v1` entry outright, so a browser that still holds a frozen
+ *  AcpState snapshot can never rehydrate one and stops losing quota to it.
+ *  Called from the app entry point, because a browser that never opens a
+ *  session would otherwise keep a multi-megabyte entry forever, and again on
+ *  the first hook mount, which the guard makes free. */
+export function sweepAcpStateStorage(): void {
   if (sweptStorage) return;
   sweptStorage = true;
   if (typeof window === "undefined") return;
@@ -308,6 +206,10 @@ function sweepExpiredStorage(): void {
     const now = Date.now();
     for (let i = 0; i < window.localStorage.length; i++) {
       const k = window.localStorage.key(i);
+      if (k && k.startsWith(LEGACY_KEY_PREFIX)) {
+        toRemove.push(k);
+        continue;
+      }
       if (!k || !k.startsWith(STORAGE_KEY_PREFIX)) continue;
       const raw = window.localStorage.getItem(k);
       if (!raw) {
@@ -329,6 +231,18 @@ function sweepExpiredStorage(): void {
   }
 }
 
+// Test-only exports so the storage policy can be exercised without
+// driving the full hook lifecycle. Not part of the public API.
+export const __test = {
+  persistState,
+  /** Re-arm the once-per-page storage sweep between test cases. */
+  resetStorageSweep: (): void => {
+    sweptStorage = false;
+  },
+  STORAGE_KEY_PREFIX,
+  LEGACY_KEY_PREFIX,
+};
+
 function cacheGet(sessionId: string): AcpState | undefined {
   const value = stateCache.get(sessionId);
   if (value !== undefined) {
@@ -337,22 +251,6 @@ function cacheGet(sessionId: string): AcpState | undefined {
     stateCache.delete(sessionId);
     stateCache.set(sessionId, value);
     return value;
-  }
-  const persisted = loadPersistedState(sessionId);
-  if (persisted !== undefined) {
-    stateCache.set(sessionId, persisted);
-    while (stateCache.size > STATE_CACHE_CAP) {
-      const oldest = stateCache.keys().next().value;
-      if (oldest === undefined) break;
-      stateCache.delete(oldest);
-    }
-    // A `useBackgroundAgents` subscriber that already rendered an empty
-    // snapshot (panel open before this cache was primed) won't see the
-    // persisted agents until something else calls `cacheSet`. Wake it.
-    // Deferred so the notify never fires during a render that called
-    // `cacheGet` (e.g. the reducer initializer).
-    queueMicrotask(() => notifyStateListeners(sessionId));
-    return persisted;
   }
   return undefined;
 }
@@ -956,10 +854,9 @@ export function useAcpSession(
    *  `{ minutes: null }`. See #1581. */
   snoozedUntil: string | null = null,
 ) {
-  // Sweep stale persisted state entries on first hook mount in this
-  // module's lifetime. Idempotent (guarded by `sweptStorage`) so the
-  // cost is one full localStorage scan per page load.
-  sweepExpiredStorage();
+  // Backstop for the app-entry sweep: guarded, so this is free when it has
+  // already run.
+  sweepAcpStateStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   // Mirror the triage timestamps onto refs so `sendPrompt`'s wake
@@ -1034,12 +931,6 @@ export function useAcpSession(
   useEffect(() => {
     lastSeqRef.current = state.lastSeq;
   }, [state.lastSeq]);
-  // Mirror the queue so the one-time server-migration read (below) sees the
-  // current rows without a stale closure or a queue-sized dep array.
-  const queuedPromptsRef = useRef(state.queuedPrompts);
-  useEffect(() => {
-    queuedPromptsRef.current = state.queuedPrompts;
-  }, [state.queuedPrompts]);
   // Older-history paging (#2236). `oldestSeqRef` mirrors the recent-first
   // load watermark so `loadOlder` (a stable callback) reads it without
   // re-creating. `hasMoreOlder` / `loadingOlder` drive the scroll-up
@@ -1227,8 +1118,7 @@ export function useAcpSession(
         // baseline, rejected prompts, the optimistic turn counters).
         // `?view=rows` returns the folded rows with an EMPTY `frames`, so pull
         // both projections of the SAME page in parallel: default frames feed
-        // the control reducer, `view=rows` feeds the transcript. Identical
-        // pagination metadata, so the frames response drives the cursors.
+        // the control reducer, `view=rows` feeds the transcript.
         const tailParams = `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`;
         const [tailRes, tailRowsRes] = await Promise.all([
           fetch(`/api/sessions/${encodeURIComponent(sid)}/acp/replay?${tailParams}`, { credentials: "same-origin" }),
@@ -1247,7 +1137,8 @@ export function useAcpSession(
         // rows dropped here would never be resent. Returning leaves the
         // cursors untouched so the next hydrate retries the same page.
         if (!tailRowsRes.ok) return;
-        const tailRows = ((await tailRowsRes.json()) as ReplayPageResponse).rows ?? [];
+        const tailRowsPage = (await tailRowsRes.json()) as ReplayPageResponse;
+        const tailRows = tailRowsPage.rows ?? [];
         dispatch({
           kind: "frames",
           frames: tail.frames ?? [],
@@ -1260,8 +1151,15 @@ export function useAcpSession(
         // awaited call subscribes with `since = highest_seq` and the
         // server drains only live events, not the whole transcript we
         // just rendered recent-first. See #2236.
-        if (tail.highest_seq > lastSeqRef.current) {
-          lastSeqRef.current = tail.highest_seq;
+        //
+        // The two legs are independent requests, so one can read the store
+        // later than the other. Take the LOWER head: dialling above a seq
+        // whose rows this page never carried would leave a hole the WS never
+        // resends, and every load is this path now (#4021). The overlap the
+        // lower cursor costs is deduped by seq in the reducer.
+        const tailHead = Math.min(tail.highest_seq, tailRowsPage.highest_seq);
+        if (tailHead > lastSeqRef.current) {
+          lastSeqRef.current = tailHead;
         }
         // Long session: the tail skipped the seq-0 handshake (prompt
         // capabilities, slash palette, agent/model/mode), pinned near the
@@ -1416,6 +1314,10 @@ export function useAcpSession(
     const switched = sessionId ? cacheGet(sessionId) : undefined;
     lastSeqRef.current = switched?.lastSeq ?? 0;
     oldestSeqRef.current = switched?.oldestSeq ?? 0;
+    // A cached session already has its watermark, so re-offer "load earlier"
+    // instead of stranding the user at the rows the cache happens to hold.
+    // `loadOlder` corrects an optimistic true from the next page's `has_more`.
+    if (oldestSeqRef.current > 0) setHasMoreOlder(true);
   }
 
   useEffect(() => {
@@ -1955,40 +1857,22 @@ export function useAcpSession(
 
   // Server-queue hydration. The daemon owns the queue and drains it (even
   // with no tab open), so the client's job is to reflect the server snapshot,
-  // not to drain. Re-list on connect and whenever a turn ends (a server drain
-  // fires at turn-end, so the drained rows disappear on the following list)
-  // and dispatch a reconcile that keeps this session's optimistic thumbnails
-  // and any still-in-flight enqueue.
+  // not to drain and never to re-post. Re-list on connect and whenever a turn
+  // ends (a server drain fires at turn-end, so the drained rows disappear on
+  // the following list) and dispatch a reconcile that keeps this session's
+  // optimistic thumbnails and any still-in-flight enqueue.
   //
-  // The FIRST run also migrates: it pushes any rows queued before the server
-  // owned the queue (rows restored from localStorage, or in-flight) to the
-  // server, keyed by their existing id so the POST is idempotent, then lists.
-  // Attachments survive migration only for rows still in memory (localStorage
-  // drops the bytes), matching the prior reload behavior. See the server-side
-  // prompt queue design.
-  // Keyed by session id, not a bare boolean: the hook instance outlives a
-  // session switch (the SPA swaps `sessionId` without remounting), so a single
-  // flag meant only the first session a tab ever opened got migrated and every
-  // later one silently skipped it, stranding its pre-server-queue rows in
-  // localStorage.
-  const queueMigratedRef = useRef<Set<string>>(new Set());
+  // This used to re-POST every locally-held row on the first open of each
+  // session, to migrate rows queued before the server owned the queue. Those
+  // rows came out of localStorage, where a frozen entry could hold prompts the
+  // server had already drained or another client had deleted, and the upsert
+  // has no tombstone, so the migration resurrected and re-sent them (#4021).
+  // Queued prompts are no longer persisted, so there is nothing to migrate.
   useEffect(() => {
     if (!sessionId) return;
     if (status !== "open") return;
     let cancelled = false;
     void (async () => {
-      if (!queueMigratedRef.current.has(sessionId)) {
-        queueMigratedRef.current.add(sessionId);
-        for (const q of queuedPromptsRef.current) {
-          if (cancelled) return;
-          await enqueueServerPrompt(sessionId, {
-            id: q.id,
-            text: q.text,
-            createdAt: q.queuedAt,
-            attachments: q.attachments,
-          });
-        }
-      }
       const rows = await listServerQueue(sessionId);
       if (cancelled) return;
       dispatch({ kind: "hydrate_server_queue", rows });

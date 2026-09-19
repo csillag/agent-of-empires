@@ -1,28 +1,29 @@
-// Storage layer for per-session structured view state. The structured view reducer state
-// is mirrored into localStorage under `aoe:acp-state:v1:<id>` by
-// useStructuredView's persistState so a reload rehydrates without replaying the
-// whole transcript (see useStructuredView.ts and #1132). This module owns the
-// key shape and TTL so both the writer (useStructuredView) and read-only
-// consumers (the sidebar queued-prompt badge) share one source of truth,
-// without the sidebar having to import the heavy structured view hook and its WS
-// machinery just to read a count.
+// Storage layer for the sidebar's per-session "N queued" badge.
+//
+// The structured view reducer state is NOT persisted: the transcript,
+// `lastSeq`, pending cards and the rest are server-owned and re-sent on
+// every load, and mirroring them into localStorage froze whole sessions
+// behind a silently-failing over-quota write (#4021). All that survives a
+// reload under `aoe:acp-state:v2:<id>` is a queued-prompt count, so the
+// sidebar can render a badge for a session whose structured view hook is
+// not mounted. The entry is a few bytes and can never exhaust the quota.
 //
 // It also exposes a small pub/sub (mirroring acpDrafts.ts) plus an
-// in-memory queued-prompt count cache so the sidebar can render a live
-// "N queued" badge via useSyncExternalStore. The cache keeps a snapshot
-// read O(1) and avoids JSON.parsing the (potentially large) state blob
-// during render: persistState already holds queuedPrompts.length and
-// publishes it on every write, and cross-tab `storage` events parse the
-// new value exactly once.
+// in-memory count cache so the sidebar can render the badge via
+// useSyncExternalStore: the writer already holds `queuedPrompts.length`
+// and publishes it on every write, and cross-tab `storage` events parse
+// the new value exactly once.
 
-import type { AcpState } from "./acpTypes";
-
-export const STORAGE_KEY_PREFIX = "aoe:acp-state:v1:";
+export const STORAGE_KEY_PREFIX = "aoe:acp-state:v2:";
+// Pre-#4021 prefix. Entries under it hold a whole frozen AcpState and are
+// deleted, never read: rehydrating one is what resurrected stale rows and
+// answered question cards across a reload.
+export const LEGACY_KEY_PREFIX = "aoe:acp-state:v1:";
 export const STATE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface PersistedEntry {
   savedAt: number;
-  state: AcpState;
+  queuedCount: number;
 }
 
 function storageKey(sessionId: string): string {
@@ -53,7 +54,7 @@ function notify(sessionId: string | null): void {
   }
 }
 
-// Parse a queued-prompt count out of a raw persisted entry, honoring the
+// Parse the queued-prompt count out of a raw persisted entry, honoring the
 // TTL. Returns null when the entry is missing, expired, corrupt, or
 // structurally invalid so callers fall back to 0 without caching a bogus
 // value.
@@ -69,44 +70,14 @@ function parseQueuedCount(raw: string | null): number | null {
     ) {
       return null;
     }
-    const q = (parsed.state as Partial<AcpState> | undefined)?.queuedPrompts;
-    return Array.isArray(q) ? q.length : null;
+    return typeof parsed.queuedCount === "number" && Number.isFinite(parsed.queuedCount) ? parsed.queuedCount : null;
   } catch {
     return null;
   }
 }
 
-// Parse the newest `queuedAt` (epoch ms) out of a raw persisted entry,
-// honoring the TTL. Returns null when the entry is missing, expired,
-// corrupt, has no queued rows, or carries no parseable timestamp.
-function parseNewestQueuedAt(raw: string | null): number | null {
-  if (raw === null) return null;
-  try {
-    const parsed = JSON.parse(raw) as PersistedEntry | null;
-    if (
-      !parsed ||
-      typeof parsed.savedAt !== "number" ||
-      Number.isNaN(parsed.savedAt) ||
-      Date.now() - parsed.savedAt > STATE_TTL_MS
-    ) {
-      return null;
-    }
-    const q = (parsed.state as Partial<AcpState> | undefined)?.queuedPrompts;
-    if (!Array.isArray(q)) return null;
-    let newest: number | null = null;
-    for (const row of q) {
-      const at = Date.parse(row?.queuedAt ?? "");
-      if (Number.isNaN(at)) continue;
-      if (newest === null || at > newest) newest = at;
-    }
-    return newest;
-  } catch {
-    return null;
-  }
-}
-
-// Publish a session's current queued-prompt count. Called by useStructuredView's
-// persistState on every successful write; the length is already in hand
+// Publish a session's current queued-prompt count. Called by the structured
+// view hook's persistState on every write; the length is already in hand
 // there, so no JSON parsing happens on the write hot path.
 export function setQueueCount(sessionId: string, count: number): void {
   queueCounts.set(sessionId, count);
@@ -127,9 +98,8 @@ export function clearQueueCount(sessionId?: string): void {
 
 // Side-effect-free read of a session's queued-prompt count. Safe to call
 // from a useSyncExternalStore snapshot during render: it never mutates
-// localStorage (unlike useStructuredView's loadPersistedState, which prunes
-// expired entries) and returns a primitive. Reads the in-memory cache
-// first; on a miss it parses localStorage once and memoises the result.
+// localStorage and returns a primitive. Reads the in-memory cache first;
+// on a miss it parses localStorage once and memoises the result.
 export function getQueuedCount(sessionId: string): number {
   const cached = queueCounts.get(sessionId);
   if (cached !== undefined) return cached;
@@ -143,20 +113,6 @@ export function getQueuedCount(sessionId: string): number {
   }
   queueCounts.set(sessionId, count);
   return count;
-}
-
-// Read the epoch-ms timestamp of the newest queued prompt persisted for
-// a session, or null when there is none. Used by the background drain
-// arming check to tell a queue this browser just parked from one
-// restored out of storage days later. Uncached: the arming check
-// memoises its own verdict and only asks once per session per page load.
-export function getNewestQueuedAt(sessionId: string): number | null {
-  if (typeof window === "undefined") return null;
-  try {
-    return parseNewestQueuedAt(window.localStorage.getItem(storageKey(sessionId)));
-  } catch {
-    return null;
-  }
 }
 
 // Subscribe to acp-state changes. `filter` scopes the listener to a

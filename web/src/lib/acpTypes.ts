@@ -1002,13 +1002,12 @@ export interface QueuedPrompt {
   /** ISO-8601 client wall clock at enqueue time. Displayed as a
    *  relative age in the strip. */
   queuedAt: string;
-  /** Attachments staged with this queued prompt. The bytes now live
-   *  server-side (the pending-attachment store) and are delivered on drain;
-   *  a locally-queued row keeps the raw base64 in memory so the strip can
-   *  render a thumbnail until the server confirms. `persistState` still drops
-   *  any queued row that has them rather than writing megabytes into the
-   *  per-origin localStorage quota; a hydrate from the server repopulates the
-   *  metadata (id/kind/mime/name, no bytes) after reload. See #1833 / #1000. */
+  /** Attachments staged with this queued prompt. The bytes live server-side
+   *  (the pending-attachment store) and are delivered on drain; a
+   *  locally-queued row keeps the raw base64 in memory so the strip can
+   *  render a thumbnail until the server confirms. A hydrate from the server
+   *  repopulates the metadata (id/kind/mime/name, no bytes) after a reload.
+   *  See #1833 / #1000. */
   attachments?: PromptAttachmentInput[];
   /** True for an optimistic row whose server enqueue POST has not been
    *  confirmed yet. A hydrate from the server keeps `pending` rows that are
@@ -1973,87 +1972,4 @@ export function isCompactionReminderDue(
   }
   if (!state.availableCommands.some((c) => c.name === "compact")) return false;
   return (usage.used / usage.size) * 100 >= prefs.compactionReminderPercent;
-}
-
-/** Normalise a partial AcpState so the turn state is populated. Used by
- *  the localStorage loader: an entry persisted before #3417 carries the
- *  retired `pendingUserPromptSeq` / `lastStoppedSeq` counters and no
- *  `serverTurnActive`, so we seed the latter from the cached `turnActive`
- *  boolean as a warm hint. The WS connect snapshot replaces it with daemon
- *  truth a moment later. In-flight prompt ids are request-local and always
- *  start empty: after a reload there is no POST left to acknowledge them. */
-export function normaliseTurnState(
-  state: AcpState & {
-    oldestSeq?: number;
-    serverTurnActive?: boolean;
-    promptSeq?: number;
-    rejectedPrompts?: RejectedPrompt[];
-    agentUnresponsive?: boolean;
-    agentOrphaned?: boolean;
-    usageBaseline?: { cost: number } | null;
-    configOptions?: ConfigOptionDescriptor[];
-    configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
-    configOptionDeferred?: ConfigOptionDeferred | null;
-    pendingConfigOption?: { configId: string; value: string } | null;
-    compactionReminderDismissed?: SessionUsage | null;
-  },
-): AcpState {
-  const serverTurnActive =
-    typeof state.serverTurnActive === "boolean" ? state.serverTurnActive : state.turnActive === true;
-  // A hydrate that already has prompt rows already had prompts; a cold entry
-  // re-folds its history and counts them on the way through.
-  const promptSeq =
-    typeof state.promptSeq === "number" && Number.isFinite(state.promptSeq)
-      ? Math.max(0, Math.floor(state.promptSeq))
-      : (state.activity ?? []).filter((r) => r.kind === "user_prompt").length;
-  // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
-  // backfill so the reducer and renderers see well-typed values instead
-  // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
-  const rejectedPrompts = Array.isArray(state.rejectedPrompts) ? state.rejectedPrompts : [];
-  const agentUnresponsive = typeof state.agentUnresponsive === "boolean" ? state.agentUnresponsive : false;
-  // Pre-#1240 persisted entries lack agentOrphaned; backfill to false
-  // so the reducer and renderers see a well-typed value instead of
-  // `undefined`.
-  const agentOrphaned = typeof state.agentOrphaned === "boolean" ? state.agentOrphaned : false;
-  // Pre-#1354 persisted entries lack usageBaseline; backfill to null
-  // so the UsageUpdated reducer's `next.usageBaseline && ...` check
-  // sees a well-typed value. The baseline stays null until the next
-  // SessionCleared / ConversationCompacted, which matches the
-  // pre-fix behaviour for that one session; subsequent /clear events
-  // start subtracting normally.
-  const usageBaseline = state.usageBaseline === undefined ? null : state.usageBaseline;
-  // Pre-#1403 persisted entries lack the config-option trio.
-  const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
-  const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
-  const configOptionDeferred = state.configOptionDeferred === undefined ? null : state.configOptionDeferred;
-  const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
-  // Pre-#3253 persisted entries lack the compaction-reminder dismissal;
-  // backfill to null so a warm hydrate starts armed rather than reading
-  // `undefined` as "not dismissed" by luck.
-  const compactionReminderDismissed =
-    state.compactionReminderDismissed === undefined ? null : state.compactionReminderDismissed;
-  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
-  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
-  // never sees undefined on a warm hydrate.
-  const oldestSeq =
-    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
-      ? Math.max(0, Math.floor(state.oldestSeq))
-      : 0;
-  return {
-    ...state,
-    oldestSeq,
-    rejectedPrompts,
-    agentUnresponsive,
-    agentOrphaned,
-    usageBaseline,
-    configOptions,
-    configOptionSwitchFailed,
-    configOptionDeferred,
-    pendingConfigOption,
-    compactionReminderDismissed,
-    serverTurnActive,
-    promptSeq,
-    inflightPromptIds: [],
-    turnActive: serverTurnActive,
-  };
 }
