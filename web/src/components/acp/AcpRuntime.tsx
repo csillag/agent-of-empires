@@ -90,7 +90,8 @@ function RuntimeHost({ adapter, children }: { adapter: ExternalStoreAdapter<Thre
 
 /** Staged attachments persisted per session, with a ref mirror for `onNew`. */
 function usePendingAttachments(sessionId: string) {
-  // The view remounts per session, so the initializer seeds the right draft once.
+  // Each kept session has its own layer, so this mount keeps one sessionId for
+  // its whole life and the initializer seeds that session's draft once.
   const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
     getDraftAttachments(sessionId),
   );
