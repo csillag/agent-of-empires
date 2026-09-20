@@ -198,7 +198,7 @@ function AcpChrome({
     loadingEarlierHistory: ctx.loadingEarlierHistory,
     composerCollapsed,
     promptSeq: state.promptSeq,
-    hasEverOpened: ctx.hasEverOpened,
+    status,
     localInflight: state.inflightPromptIds.length > 0,
     active,
   });

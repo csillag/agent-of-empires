@@ -19,7 +19,7 @@ export function useTranscriptScroll({
   loadingEarlierHistory,
   composerCollapsed,
   promptSeq,
-  hasEverOpened,
+  status,
   localInflight,
   active = true,
 }: {
@@ -30,7 +30,8 @@ export function useTranscriptScroll({
   composerCollapsed: boolean;
   /** Counts every prompt once, from any path or device; keys the submit re-pin. */
   promptSeq: number;
-  hasEverOpened: boolean;
+  /** Live socket. Replay lands before the dial, so a bump while this is not open is hydration. */
+  status: "connecting" | "open" | "closed" | "error";
   /** This client has an optimistic prompt row still awaiting its server echo. */
   localInflight: boolean;
   /** Suspended views do not poll the visual viewport. */
@@ -84,12 +85,12 @@ export function useTranscriptScroll({
     const d = promptRepinDecision({
       seen: seenPromptSeqRef.current,
       promptSeq,
-      live: hasEverOpened,
+      live: status === "open",
       localInflight,
     });
     seenPromptSeqRef.current = d.seen;
     if (d.pin) pinToBottom("auto");
-  }, [promptSeq, hasEverOpened, localInflight, pinToBottom]);
+  }, [promptSeq, status, localInflight, pinToBottom]);
 
   // Mirrors so the scroll effect sees the latest load wiring without re-subscribing.
   const canLoadEarlierRef = useRef(canLoadEarlierHistory);
