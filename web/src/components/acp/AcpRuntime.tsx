@@ -35,7 +35,7 @@ import {
 } from "@assistant-ui/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { useAcpSession } from "../../hooks/useAcpSession";
+import { useAcpSession, type ResumePhase } from "../../hooks/useAcpSession";
 import { isVisiblyBusy } from "../../lib/acpTypes";
 import type {
   ActivityRow,
@@ -86,6 +86,8 @@ export interface AcpContext {
   state: AcpState;
   status: ReturnType<typeof useAcpSession>["status"];
   hasEverOpened: boolean;
+  /** Catch-up phase of a resumed view; drives the catching-up strip. */
+  resumePhase: ResumePhase;
   /** True while the auto-reconnect backoff is armed between a close
    *  and the next dial. Drives the "Reconnecting (N/MAX) in Xs" copy
    *  in SystemNotices. See #1130. */
@@ -309,6 +311,7 @@ export function AcpRuntime({
         state: acp.state,
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
+        resumePhase: acp.resumePhase,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

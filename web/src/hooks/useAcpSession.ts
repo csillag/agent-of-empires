@@ -776,6 +776,11 @@ export function transcriptDeltaAction(delta: TranscriptDelta, sessionId: string)
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
+/** Where a resumed view is in its catch-up. `checking` means the replay has
+ *  been asked and has not answered; `catching_up` means it answered that the
+ *  server is ahead and the rows are landing. Only the latter earns a strip. */
+export type ResumePhase = "idle" | "checking" | "catching_up";
+
 /** Reconnect backoff: 1s, 2s, 4s, 8s, 16s, 30s, 30s (cap). Seven
  *  attempts cover the common mobile-background / Cloudflare-idle /
  *  WiFi-flap recovery shapes without flooding the daemon when the
@@ -967,6 +972,12 @@ export function useAcpSession(
   setRetryCountdownRef.current = setRetryCountdown;
   const setHasEverOpenedRef = useRef(setHasEverOpened);
   setHasEverOpenedRef.current = setHasEverOpened;
+  const [resumePhase, setResumePhase] = useState<ResumePhase>("idle");
+  const setResumePhaseRef = useRef(setResumePhase);
+  setResumePhaseRef.current = setResumePhase;
+  // Seq this view had folded when the current warm replay started, so the
+  // first page can say whether anything was actually missed.
+  const resumeSeenRef = useRef(0);
 
   // clearRetryTimers is shared across the session effect (scheduleReconnect,
   // connect cleanup) and the auto-reconnect trigger effect below. Defined
@@ -1098,7 +1109,7 @@ export function useAcpSession(
   // it while `turnActive` is true (false on a freshly-mounted hook).
   const lastActivityRef = useRef<number>(0);
 
-  const fetchReplay = useCallback(async (sid: string) => {
+  const fetchReplayPages = useCallback(async (sid: string) => {
     try {
       // Cold open (cache miss, nothing loaded): recent-first. Render the
       // most recent page immediately and page older history lazily on
@@ -1204,6 +1215,11 @@ export function useAcpSession(
         const pageRows = ((await rowsRes.json()) as ReplayPageResponse).rows ?? [];
         if (target === null) {
           target = data.highest_seq;
+          // The server is ahead of what this view had: that is the observed
+          // state the catching-up strip reports.
+          if (data.highest_seq > resumeSeenRef.current) {
+            setResumePhaseRef.current("catching_up");
+          }
           // Detect a server-side seq reset: the supervisor's per-session
           // counter has been forgotten (acp_disable → acp_enable,
           // or session delete+recreate with the same id), so the new
@@ -1244,6 +1260,27 @@ export function useAcpSession(
       // frames.
     }
   }, []);
+
+  // Public replay entry point. Owns the resume phase so every exit from the
+  // paging loop, including an early return on a failed page, clears it.
+  const fetchReplay = useCallback(
+    async (sid: string) => {
+      if (lastSeqRef.current === 0) {
+        // A cold open has nothing to catch up on; its own "starting" strip
+        // covers the wait.
+        await fetchReplayPages(sid);
+        return;
+      }
+      resumeSeenRef.current = lastSeqRef.current;
+      setResumePhaseRef.current("checking");
+      try {
+        await fetchReplayPages(sid);
+      } finally {
+        setResumePhaseRef.current("idle");
+      }
+    },
+    [fetchReplayPages],
+  );
 
   // Fetch the next-older page of history and prepend it. Stable callback;
   // reads the watermark / guards from refs. The scroll-up handler and the
@@ -2133,6 +2170,8 @@ export function useAcpSession(
     manualReconnect,
     /** Distinguishes initial connection from recovery. */
     hasEverOpened,
+    /** Whether this view is mid-catch-up after a resume. See ResumePhase. */
+    resumePhase,
     resolveApproval,
     resolveElicitation,
     sendPrompt,
