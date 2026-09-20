@@ -173,10 +173,11 @@ export function AcpRuntime({
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
   // Seed from the persisted draft so a staged image survives a session
-  // switch or reload like unsent text does. StructuredView remounts this
-  // runtime per session (`key={sessionId}`), so the initializer runs once
-  // with the right session's attachments and `sessionId` is stable for the
-  // instance lifetime, which keeps the persist effect below race-free.
+  // switch or reload like unsent text does. Every mount of this runtime keeps
+  // one `sessionId` for its whole life (the keep-alive host gives each session
+  // its own layer, and a view that changes session is a new mount), so the
+  // initializer runs once with the right session's attachments and the persist
+  // effect below stays race-free.
   const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
     getDraftAttachments(sessionId),
   );
