@@ -978,6 +978,11 @@ export function useAcpSession(
   // Seq this view had folded when the current warm replay started, so the
   // first page can say whether anything was actually missed.
   const resumeSeenRef = useRef(0);
+  // True when the last resume's replay did not complete: the view is showing
+  // what it had before, which is now known to be behind the server.
+  const [resumeFailed, setResumeFailed] = useState(false);
+  const setResumeFailedRef = useRef(setResumeFailed);
+  setResumeFailedRef.current = setResumeFailed;
 
   // clearRetryTimers is shared across the session effect (scheduleReconnect,
   // connect cleanup) and the auto-reconnect trigger effect below. Defined
@@ -1109,7 +1114,9 @@ export function useAcpSession(
   // it while `turnActive` is true (false on a freshly-mounted hook).
   const lastActivityRef = useRef<number>(0);
 
-  const fetchReplayPages = useCallback(async (sid: string) => {
+  // Resolves false when a page never landed, so the caller can say the view is
+  // behind rather than leaving a stale transcript with nothing to explain it.
+  const fetchReplayPages = useCallback(async (sid: string): Promise<boolean> => {
     try {
       // Cold open (cache miss, nothing loaded): recent-first. Render the
       // most recent page immediately and page older history lazily on
@@ -1132,17 +1139,17 @@ export function useAcpSession(
             credentials: "same-origin",
           }),
         ]);
-        if (!tailRes.ok) return;
+        if (!tailRes.ok) return false;
         const tail = (await tailRes.json()) as ReplayPageResponse;
         if (tail.lost) {
           dispatch({ kind: "lagged", skipped: tail.highest_seq });
-          return;
+          return true;
         }
         // Bail rather than render a hole: the frames leg below advances
         // `lastSeqRef`, and the WS then drains from that cursor, so a page of
         // rows dropped here would never be resent. Returning leaves the
         // cursors untouched so the next hydrate retries the same page.
-        if (!tailRowsRes.ok) return;
+        if (!tailRowsRes.ok) return false;
         const tailRowsPage = (await tailRowsRes.json()) as ReplayPageResponse;
         const tailRows = tailRowsPage.rows ?? [];
         dispatch({
@@ -1182,7 +1189,7 @@ export function useAcpSession(
           }
         }
         dispatch({ kind: "lagged_resolved" });
-        return;
+        return true;
       }
       // Defensive overlap: re-fetch from `lastSeq - REPLAY_OVERLAP`
       // instead of `lastSeq` so events that landed in the broadcast
@@ -1210,7 +1217,7 @@ export function useAcpSession(
         // Both legs page the same window, so a failure on either one has to
         // stop the loop: advancing the cursor past a page whose rows never
         // arrived leaves a hole nothing refetches.
-        if (!res.ok || !rowsRes.ok) return;
+        if (!res.ok || !rowsRes.ok) return false;
         const data = (await res.json()) as ReplayPageResponse;
         const pageRows = ((await rowsRes.json()) as ReplayPageResponse).rows ?? [];
         if (target === null) {
@@ -1237,7 +1244,7 @@ export function useAcpSession(
         // transcript. Stop the loop; a partial transcript is wrong.
         if (data.lost) {
           dispatch({ kind: "lagged", skipped: data.highest_seq });
-          return;
+          return true;
         }
         if (data.frames.length > 0 || pageRows.length > 0) {
           dispatch({
@@ -1254,10 +1261,12 @@ export function useAcpSession(
         break;
       }
       dispatch({ kind: "lagged_resolved" });
+      return true;
     } catch {
       // Network failure: leave the lagged flag set so the user
       // sees something is wrong rather than silently dropping
       // frames.
+      return false;
     }
   }, []);
 
@@ -1272,9 +1281,10 @@ export function useAcpSession(
         return;
       }
       resumeSeenRef.current = lastSeqRef.current;
+      setResumeFailedRef.current(false);
       setResumePhaseRef.current("checking");
       try {
-        await fetchReplayPages(sid);
+        if (!(await fetchReplayPages(sid))) setResumeFailedRef.current(true);
       } finally {
         setResumePhaseRef.current("idle");
       }
@@ -2172,6 +2182,10 @@ export function useAcpSession(
     hasEverOpened,
     /** Whether this view is mid-catch-up after a resume. See ResumePhase. */
     resumePhase,
+    /** True when the last resume could not fetch what it missed, so the
+     *  transcript on screen is known to be behind. Cleared by the next
+     *  resume. */
+    resumeFailed,
     resolveApproval,
     resolveElicitation,
     sendPrompt,

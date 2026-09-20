@@ -28,6 +28,7 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     retryCountdown: 0,
     maxRetries: 7,
     resumePhase: "idle",
+    resumeFailed: false,
     manualReconnect,
     ...overrides,
   };
@@ -87,6 +88,7 @@ describe("SystemNotices rate-limit handoff", () => {
         retryCountdown={0}
         maxRetries={7}
         resumePhase="idle"
+        resumeFailed={false}
         manualReconnect={vi.fn()}
       />,
     );
@@ -122,6 +124,7 @@ describe("SystemNotices rate-limit handoff", () => {
         retryCountdown={0}
         maxRetries={7}
         resumePhase="idle"
+        resumeFailed={false}
         manualReconnect={vi.fn()}
       />,
     );
@@ -315,6 +318,13 @@ describe("SystemNotices single-strip discipline", () => {
     const { container } = mount({ status: "closed", resumePhase: "checking" });
     expect(container.querySelector("[data-testid^='acp-strip-']")).toBeNull();
     expect(container.firstChild).toBeNull();
+  });
+
+  it("offers a retry when the catch-up request itself failed", () => {
+    const { getByTestId, getByRole, manualReconnect } = mount({ resumeFailed: true });
+    expect(getByTestId("acp-strip-resume_failed").textContent).toContain("Could not catch up");
+    fireEvent.click(getByRole("button", { name: /retry/i }));
+    expect(manualReconnect).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the manual reconnect affordance when the retry envelope is spent", () => {

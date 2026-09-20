@@ -36,6 +36,8 @@ let head = 10;
 /** Resolves the next replay response, so a test can look at the phase while
  *  the request is in flight. */
 let release: (() => void) | null = null;
+/** When set, the resume page fails the way a dropped network does. */
+let failWarm = false;
 
 function page(seqs: number[]) {
   return JSON.stringify({
@@ -58,12 +60,14 @@ function page(seqs: number[]) {
 beforeEach(() => {
   head = 10;
   release = null;
+  failWarm = false;
   clearAcpCache();
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
       if (!url.includes("/acp/replay")) return new Response(JSON.stringify({ rows: [] }), { status: 200 });
+      if (failWarm && url.includes("since=")) return new Response("", { status: 500 });
       if (url.includes("since=") && release === null) {
         // Warm (resume) page: hold it open until the test releases it.
         await new Promise<void>((resolve) => {
@@ -145,5 +149,58 @@ describe("useAcpSession resume phase", () => {
 
     expect(result.current.resumePhase).toBe("idle");
     expect(phases).not.toContain("catching_up");
+  });
+});
+
+describe("useAcpSession failed resume", () => {
+  it("flags a resume whose replay never landed, and keeps what was on screen", async () => {
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) => useAcpSession("sess-cu", "running", null, null, active),
+      { initialProps: { active: true } },
+    );
+    await flush();
+    const shown = result.current.state.activity.map((r) => r.id);
+    expect(shown).toEqual(["user-seq-9", "user-seq-10"]);
+    expect(result.current.resumeFailed).toBe(false);
+
+    rerender({ active: false });
+    await flush();
+
+    failWarm = true;
+    head = 12;
+    rerender({ active: true });
+    await flush();
+
+    expect(result.current.resumeFailed).toBe(true);
+    expect(result.current.resumePhase).toBe("idle");
+    expect(result.current.state.activity.map((r) => r.id)).toEqual(shown);
+  });
+
+  it("clears the flag on the next resume that gets through", async () => {
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) => useAcpSession("sess-cu", "running", null, null, active),
+      { initialProps: { active: true } },
+    );
+    await flush();
+    rerender({ active: false });
+    await flush();
+    failWarm = true;
+    rerender({ active: true });
+    await flush();
+    expect(result.current.resumeFailed).toBe(true);
+
+    rerender({ active: false });
+    await flush();
+    failWarm = false;
+    head = 12;
+    rerender({ active: true });
+    await flush();
+    await act(async () => {
+      release?.();
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    });
+
+    expect(result.current.resumeFailed).toBe(false);
+    expect(result.current.state.lastSeq).toBe(12);
   });
 });

@@ -319,6 +319,7 @@ function AcpChrome({
   status,
   hasEverOpened,
   resumePhase,
+  resumeFailed,
   reconnecting,
   retryCount,
   retryCountdown,
@@ -790,6 +791,7 @@ function AcpChrome({
             retryCountdown={retryCountdown}
             maxRetries={maxRetries}
             resumePhase={resumePhase}
+            resumeFailed={resumeFailed}
             manualReconnect={manualReconnect}
             onSwitchAgent={onSwitchAgent}
             onResumeRateLimit={() => void resumeRateLimitedSession()}
@@ -1819,6 +1821,7 @@ export function SystemNotices({
   retryCountdown,
   maxRetries,
   resumePhase,
+  resumeFailed,
   manualReconnect,
   onSwitchAgent,
   onResumeRateLimit,
@@ -1838,6 +1841,7 @@ export function SystemNotices({
   retryCountdown: number;
   maxRetries: number;
   resumePhase: ResumePhase;
+  resumeFailed: boolean;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
   onResumeRateLimit?: () => void;
@@ -1852,6 +1856,7 @@ export function SystemNotices({
     retryCountdown,
     maxRetries,
     resumePhase,
+    resumeFailed,
     lagged,
     rateLimit,
     rateLimitAutoResume,
@@ -1865,7 +1870,7 @@ export function SystemNotices({
   const rateLimitActions = rateLimit !== null && parked;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1" data-testid={`acp-strip-${strip.kind}`}>
-      {strip.kind === "reconnect_exhausted" ? (
+      {strip.kind === "reconnect_exhausted" || strip.kind === "resume_failed" ? (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
           <span>{strip.text}</span>
           <button
@@ -1873,7 +1878,7 @@ export function SystemNotices({
             onClick={manualReconnect}
             className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
           >
-            Reconnect
+            {strip.kind === "resume_failed" ? "Retry" : "Reconnect"}
           </button>
         </div>
       ) : (
