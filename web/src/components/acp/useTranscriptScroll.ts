@@ -3,6 +3,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
+import { recallScroll, rememberScroll } from "../../lib/suspendedScroll";
 import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { repinOnResize } from "../../lib/repinOnResize";
@@ -50,6 +51,9 @@ export function useTranscriptScroll({
   const didRestoreScrollRef = useRef(false);
   const [atBottom, setAtBottom] = useState(true);
   const { keyboardOpen } = useMobileKeyboard(active);
+  // Observers outlive a suspension. A hidden viewport reads as zero, so they
+  // stand down, and the handoff effect owns the recorded position.
+  const activeScrollRef = useRef(active);
   const isCoarse = useIsCoarsePointer();
 
   /** An explicit "stick again": a programmatic scroll fires no gesture, so set
@@ -225,7 +229,7 @@ export function useTranscriptScroll({
     document.addEventListener("visibilitychange", onVisibility);
     // The viewport itself is observed too: chrome outside this view (the App
     // header collapse) can resize it.
-    const wasAtBottom = () => wasAtBottomRef.current;
+    const wasAtBottom = () => activeScrollRef.current && wasAtBottomRef.current;
     const repin = () => {
       writeScrollTop(vp.scrollHeight);
     };
@@ -234,6 +238,7 @@ export function useTranscriptScroll({
     // Growth with a pending anchor came from older rows at the top: keep the
     // read position. Otherwise it grew at the bottom: follow if pinned.
     const contentRo = new ResizeObserver(() => {
+      if (!activeScrollRef.current) return;
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
@@ -260,6 +265,34 @@ export function useTranscriptScroll({
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
   }, [requestEarlierHistory, isCoarse, sessionId]);
+
+  // Record the sampler's position before the view goes dark, and write it back
+  // once the viewport is visible again. A hidden container reports scrollTop 0.
+  useLayoutEffect(() => {
+    if (active === activeScrollRef.current) return;
+    activeScrollRef.current = active;
+    if (!active) {
+      rememberScroll(sessionId, { stuck: wasAtBottomRef.current, top: lastScrollTopRef.current });
+      return;
+    }
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const saved = recallScroll(sessionId);
+    if (saved) wasAtBottomRef.current = saved.stuck;
+    const apply = () => {
+      const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+      if (top != null) {
+        vp.scrollTop = top;
+        lastScrollTopRef.current = vp.scrollTop;
+      }
+    };
+    apply();
+    const first = requestAnimationFrame(() => {
+      setAtBottom(wasAtBottomRef.current);
+      requestAnimationFrame(apply);
+    });
+    return () => cancelAnimationFrame(first);
+  }, [active, sessionId]);
 
   // Hold the bottom pin through a keyboard or composer-collapse transition.
   // `wasAtBottomRef` covers sitting idle at the bottom; the timestamp covers an
