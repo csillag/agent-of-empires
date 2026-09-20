@@ -17,6 +17,8 @@ const loading = new Map<string, Promise<void>>();
 // Session ids whose probe has a live effect, so a test can tell a view that
 // stayed mounted from one React tore down to show a fallback.
 const live = new Set<string>();
+// Renders per session id, so a test can tell which layers a poll tick moved.
+const renders = new Map<string, number>();
 
 function holdView(sessionId: string): () => void {
   let release = () => {};
@@ -44,6 +46,7 @@ vi.mock("../acp/StructuredView", () => ({
   StructuredView: ({ sessionId, active }: { sessionId: string; active?: boolean }) => {
     const pending = loading.get(sessionId);
     if (pending) throw pending;
+    renders.set(sessionId, (renders.get(sessionId) ?? 0) + 1);
     return <Probe sessionId={sessionId} active={active} />;
   },
 }));
@@ -51,6 +54,7 @@ vi.mock("../acp/StructuredView", () => ({
 afterEach(() => {
   loading.clear();
   live.clear();
+  renders.clear();
 });
 
 import { SessionViewHost } from "../SessionViewHost";
@@ -247,5 +251,40 @@ describe("SessionViewHost", () => {
     });
     expect(await screen.findByTestId("view-b")).toBeDefined();
     expect(live.has("a")).toBe(true);
+  });
+
+  it("re-renders only the layer whose session changed", async () => {
+    const { rerender } = mount("a", [session("a"), session("b")]);
+    await screen.findByTestId("view-a");
+    rerender(
+      <Suspense fallback={null}>
+        <SessionViewHost
+          activeSessionId="b"
+          sessions={[session("a"), session("b")]}
+          onOpenFileRef={() => {}}
+          onOpenAgentsPane={() => {}}
+          onRestoreSession={() => {}}
+        />
+      </Suspense>,
+    );
+    await screen.findByTestId("view-b");
+    const before = { a: renders.get("a") ?? 0, b: renders.get("b") ?? 0 };
+
+    // A poll tick: fresh objects for every session, one of them actually
+    // different, and a new inline restore handler from App.
+    rerender(
+      <Suspense fallback={null}>
+        <SessionViewHost
+          activeSessionId="b"
+          sessions={[session("a"), session("b", { acp_worker_state: "stopping" })]}
+          onOpenFileRef={() => {}}
+          onOpenAgentsPane={() => {}}
+          onRestoreSession={() => {}}
+        />
+      </Suspense>,
+    );
+
+    expect(renders.get("a")).toBe(before.a);
+    expect(renders.get("b")).toBe(before.b + 1);
   });
 });
