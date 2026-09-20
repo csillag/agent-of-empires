@@ -840,7 +840,10 @@ function AcpChrome({
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
       {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
-      {state.nextWakeupAt &&
+      {/* Active only: the countdown ticks every second, and a suspended view
+          runs no timers. */}
+      {active &&
+        state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&
         !state.workerStopped &&
