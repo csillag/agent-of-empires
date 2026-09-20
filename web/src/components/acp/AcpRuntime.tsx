@@ -93,6 +93,8 @@ export interface AcpContext {
   resumePhase: ResumePhase;
   /** The last resume could not fetch what it missed; the view is behind. */
   resumeFailed: boolean;
+  /** The transcript was discarded because the conversation was replaced. */
+  conversationReset: boolean;
   /** True while the auto-reconnect backoff is armed between a close
    *  and the next dial. Drives the "Reconnecting (N/MAX) in Xs" copy
    *  in SystemNotices. See #1130. */
@@ -319,6 +321,7 @@ export function AcpRuntime({
         hasEverOpened: acp.hasEverOpened,
         resumePhase: acp.resumePhase,
         resumeFailed: acp.resumeFailed,
+        conversationReset: acp.conversationReset,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

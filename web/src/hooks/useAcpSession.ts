@@ -983,6 +983,11 @@ export function useAcpSession(
   const [resumeFailed, setResumeFailed] = useState(false);
   const setResumeFailedRef = useRef(setResumeFailed);
   setResumeFailedRef.current = setResumeFailed;
+  // True when the last replay found the daemon's seq counter below where this
+  // view was: the conversation on screen was replaced while we were away.
+  const [conversationReset, setConversationReset] = useState(false);
+  const setConversationResetRef = useRef(setConversationReset);
+  setConversationResetRef.current = setConversationReset;
 
   // clearRetryTimers is shared across the session effect (scheduleReconnect,
   // connect cleanup) and the auto-reconnect trigger effect below. Defined
@@ -1236,6 +1241,7 @@ export function useAcpSession(
           // first page, where `cursor` is the client's resume point.
           if (data.highest_seq < firstSince) {
             dispatch({ kind: "reset" });
+            setConversationResetRef.current(true);
           }
         }
         // Honor `lost` on every page: a retention prune between pages
@@ -1282,6 +1288,7 @@ export function useAcpSession(
       }
       resumeSeenRef.current = lastSeqRef.current;
       setResumeFailedRef.current(false);
+      setConversationResetRef.current(false);
       setResumePhaseRef.current("checking");
       try {
         if (!(await fetchReplayPages(sid))) setResumeFailedRef.current(true);
@@ -2186,6 +2193,9 @@ export function useAcpSession(
      *  transcript on screen is known to be behind. Cleared by the next
      *  resume. */
     resumeFailed,
+    /** True when this view's transcript was discarded because the daemon
+     *  replaced the conversation. Cleared by the next clean replay. */
+    conversationReset,
     resolveApproval,
     resolveElicitation,
     sendPrompt,

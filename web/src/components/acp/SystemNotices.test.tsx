@@ -29,6 +29,7 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     maxRetries: 7,
     resumePhase: "idle",
     resumeFailed: false,
+    conversationReset: false,
     manualReconnect,
     ...overrides,
   };
@@ -89,6 +90,7 @@ describe("SystemNotices rate-limit handoff", () => {
         maxRetries={7}
         resumePhase="idle"
         resumeFailed={false}
+        conversationReset={false}
         manualReconnect={vi.fn()}
       />,
     );
@@ -125,6 +127,7 @@ describe("SystemNotices rate-limit handoff", () => {
         maxRetries={7}
         resumePhase="idle"
         resumeFailed={false}
+        conversationReset={false}
         manualReconnect={vi.fn()}
       />,
     );

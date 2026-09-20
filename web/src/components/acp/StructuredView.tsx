@@ -320,6 +320,7 @@ function AcpChrome({
   hasEverOpened,
   resumePhase,
   resumeFailed,
+  conversationReset,
   reconnecting,
   retryCount,
   retryCountdown,
@@ -792,6 +793,7 @@ function AcpChrome({
             maxRetries={maxRetries}
             resumePhase={resumePhase}
             resumeFailed={resumeFailed}
+            conversationReset={conversationReset}
             manualReconnect={manualReconnect}
             onSwitchAgent={onSwitchAgent}
             onResumeRateLimit={() => void resumeRateLimitedSession()}
@@ -1822,6 +1824,7 @@ export function SystemNotices({
   maxRetries,
   resumePhase,
   resumeFailed,
+  conversationReset,
   manualReconnect,
   onSwitchAgent,
   onResumeRateLimit,
@@ -1842,6 +1845,7 @@ export function SystemNotices({
   maxRetries: number;
   resumePhase: ResumePhase;
   resumeFailed: boolean;
+  conversationReset: boolean;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
   onResumeRateLimit?: () => void;
@@ -1857,6 +1861,7 @@ export function SystemNotices({
     maxRetries,
     resumePhase,
     resumeFailed,
+    conversationReset,
     lagged,
     rateLimit,
     rateLimitAutoResume,
