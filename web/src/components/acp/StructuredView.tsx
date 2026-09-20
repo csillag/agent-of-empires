@@ -156,6 +156,10 @@ interface Props {
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
+  /** False while this view sits suspended in the keep-alive set: it renders
+   *  its last state and nothing else. Defaults to true so the mobile pane and
+   *  the tests keep today's single-view behaviour. */
+  active?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -180,6 +184,7 @@ export function StructuredView(props: Props) {
     fileRefSession,
     onOpenAgentsPane,
     isSandboxed,
+    active = true,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -199,6 +204,7 @@ export function StructuredView(props: Props) {
             archivedAt={archivedAt}
             snoozedUntil={snoozedUntil}
             showClearedTurns={showClearedTurns}
+            active={active}
           >
             {(ctx) => (
               <BackgroundAgentsContext.Provider
@@ -218,6 +224,7 @@ export function StructuredView(props: Props) {
                   trashedAt={trashedAt}
                   onRestore={onRestore}
                   isSandboxed={isSandboxed}
+                  active={active}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -273,8 +280,8 @@ function structuredViewFontStyle(
  *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
  *  the hook-to-style wiring is testable without mounting the assistant-ui
  *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
-export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
-  const { keyboardHeight } = useMobileKeyboard();
+export function StructuredViewRoot({ active = true, children }: { active?: boolean; children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard(active);
   const { settings } = useWebSettings();
   return (
     <div
@@ -293,6 +300,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 
 function AcpChrome({
   sessionId,
+  active,
   acpWorkerState,
   rateLimitAutoResume,
   acpAgent,
@@ -338,6 +346,7 @@ function AcpChrome({
   isSandboxed,
 }: AcpContext & {
   sessionId: string;
+  active: boolean;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   rateLimitAutoResume?: boolean;
   acpAgent: string | null;
@@ -421,7 +430,7 @@ function AcpChrome({
   const [atBottom, setAtBottom] = useState(true);
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
   /** An explicit "stick again": set the pinned intent directly and re-pin. The
    *  programmatic scroll fires no gesture, so the sampler would not pick it up. */
   const pinToBottom = useCallback(
@@ -721,7 +730,7 @@ function AcpChrome({
     );
   }
   return (
-    <StructuredViewRoot>
+    <StructuredViewRoot active={active}>
       <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
@@ -858,7 +867,7 @@ function AcpChrome({
                   model…", and the Force end turn watchdog) so the actionable
                   card stands alone; it returns once the turn resumes. See
                   #2145. */}
-                {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                {active && state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
                   <div className="mt-3 ml-1">
                     <WorkingSpinner
                       thinking={state.thinking}

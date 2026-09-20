@@ -79,6 +79,9 @@ interface Props {
    *  has forgotten. The `ClearedTurnsBanner` in `StructuredView` provides
    *  the toggle. See #1101. */
   showClearedTurns?: boolean;
+  /** False while this view is suspended in the keep-alive set: the tree stays
+   *  mounted, the socket and the timers do not. */
+  active?: boolean;
   children: (ctx: AcpContext) => ReactNode;
 }
 
@@ -157,9 +160,10 @@ export function AcpRuntime({
   archivedAt = null,
   snoozedUntil = null,
   showClearedTurns = false,
+  active = true,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, active);
   const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
