@@ -235,6 +235,7 @@ function AcpChrome({
             maxRetries={ctx.maxRetries}
             resumePhase={ctx.resumePhase}
             resumeFailed={ctx.resumeFailed}
+            conversationReset={ctx.conversationReset}
             manualReconnect={ctx.manualReconnect}
             onSwitchAgent={onSwitchAgent}
             onResumeRateLimit={() => void rateLimitResume.respawn()}

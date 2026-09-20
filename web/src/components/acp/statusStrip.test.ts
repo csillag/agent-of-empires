@@ -12,6 +12,7 @@ const base = {
   resumePhase: "idle" as const,
   lagged: false,
   resumeFailed: false,
+  conversationReset: false,
   rateLimit: null,
   rateLimitRetriesExhausted: false,
 };
@@ -100,6 +101,19 @@ describe("pickStatusStrip", () => {
       "Starting structured view…",
     );
     expect(pickStatusStrip({ ...base, status: "connecting" })?.text).toBe("Reconnecting to structured view…");
+  });
+
+  it("explains a replaced conversation above a catch-up", () => {
+    const strip = pickStatusStrip({ ...base, conversationReset: true, resumePhase: "catching_up", lagged: true });
+    expect(strip).toEqual({
+      tier: "catching_up",
+      kind: "conversation_reset",
+      text: "This conversation was reset while you were away; showing the current transcript.",
+    });
+  });
+
+  it("still yields to an error", () => {
+    expect(pickStatusStrip({ ...base, conversationReset: true, rateLimit })?.kind).toBe("rate_limit");
   });
 
   it("reports a resume whose catch-up never landed, above the catch-up itself", () => {

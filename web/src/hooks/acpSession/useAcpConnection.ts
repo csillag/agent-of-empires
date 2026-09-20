@@ -83,6 +83,9 @@ export function useAcpConnection(
   // The last warm replay did not complete. The phase is idle again and a live
   // socket stays open, so this is the only signal that the transcript is behind.
   const [resumeFailed, setResumeFailed] = useState(false);
+  // The last replay found the daemon's seq counter below this view: the
+  // conversation on screen was replaced while we were away.
+  const [conversationReset, setConversationReset] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [retryCountdown, setRetryCountdown] = useState(0);
@@ -257,10 +260,16 @@ export function useAcpConnection(
         return;
       }
       setResumeFailed(false);
+      setConversationReset(false);
       setResumePhase("checking");
       try {
-        const ok = await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, () =>
-          setResumePhase("catching_up"),
+        const ok = await fetchReplay(
+          sessionId,
+          lastSeqRef,
+          dispatch,
+          setHasMoreOlder,
+          () => setResumePhase("catching_up"),
+          () => setConversationReset(true),
         );
         if (!ok) setResumeFailed(true);
       } finally {
@@ -382,6 +391,7 @@ export function useAcpConnection(
     hasEverOpened,
     resumePhase,
     resumeFailed,
+    conversationReset,
     loadOlder,
     hasMoreOlder,
     loadingOlder,

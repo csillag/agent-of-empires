@@ -34,6 +34,7 @@ function noticeProps(overrides?: Partial<NoticeProps>): NoticeProps {
     maxRetries: 7,
     resumePhase: "idle",
     resumeFailed: false,
+    conversationReset: false,
     manualReconnect: vi.fn(),
     ...overrides,
   };
