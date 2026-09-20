@@ -24,6 +24,24 @@
       "components": ["web/src/components/BottomDock.tsx"]
     },
     {
+      "id": "app-shell.session-view-host",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionViewHost.test.tsx",
+        "src/lib/keepAliveSet.test.ts",
+        "src/lib/suspendedScroll.test.ts",
+        "src/hooks/useAcpSession.suspend.test.ts"
+      ],
+      "components": [
+        "web/src/components/SessionViewHost.tsx",
+        "web/src/App.tsx",
+        "web/src/lib/keepAliveSet.ts",
+        "web/src/lib/suspendedScroll.ts",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "app-shell.pane-docking",
       "kind": "mocked-playwright",
       "risk": "high",
