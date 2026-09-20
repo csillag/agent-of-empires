@@ -221,31 +221,26 @@ function AcpChrome({
         currentAgent={state.agent ?? acpAgent}
         onPrefill={(text) => setPrimerPrefill({ id: `rate-limit-recovery-${Date.now()}`, text })}
       >
-        {({ onSwitchAgent }) =>
-          status !== "open" ||
-          state.lagged ||
-          state.rateLimit ||
-          state.rateLimitRetriesExhausted ||
-          ctx.reconnecting ? (
-            <SystemNotices
-              status={status}
-              lagged={state.lagged}
-              rateLimit={state.rateLimit}
-              rateLimitAutoResume={view.rateLimitAutoResume}
-              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
-              hasEverOpened={ctx.hasEverOpened}
-              reconnecting={ctx.reconnecting}
-              retryCount={ctx.retryCount}
-              retryCountdown={ctx.retryCountdown}
-              maxRetries={ctx.maxRetries}
-              manualReconnect={ctx.manualReconnect}
-              onSwitchAgent={onSwitchAgent}
-              onResumeRateLimit={() => void rateLimitResume.respawn()}
-              rateLimitResumeState={rateLimitResume.state}
-              rateLimitResumeError={rateLimitResume.error}
-            />
-          ) : null
-        }
+        {({ onSwitchAgent }) => (
+          <SystemNotices
+            status={status}
+            lagged={state.lagged}
+            rateLimit={state.rateLimit}
+            rateLimitAutoResume={view.rateLimitAutoResume}
+            rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
+            hasEverOpened={ctx.hasEverOpened}
+            reconnecting={ctx.reconnecting}
+            retryCount={ctx.retryCount}
+            retryCountdown={ctx.retryCountdown}
+            maxRetries={ctx.maxRetries}
+            resumePhase={ctx.resumePhase}
+            manualReconnect={ctx.manualReconnect}
+            onSwitchAgent={onSwitchAgent}
+            onResumeRateLimit={() => void rateLimitResume.respawn()}
+            rateLimitResumeState={rateLimitResume.state}
+            rateLimitResumeError={rateLimitResume.error}
+          />
+        )}
       </RateLimitRecoverySection>
 
       <SessionBanners
