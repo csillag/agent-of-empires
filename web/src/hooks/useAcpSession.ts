@@ -838,6 +838,10 @@ export function useAcpSession(
    *  `archivedAt`, via PATCH /api/sessions/{id}/snooze with
    *  `{ minutes: null }`. See #1581. */
   snoozedUntil: string | null = null,
+  /** False while this session's view is suspended in the keep-alive set: the
+   *  tree stays mounted but holds no socket and no timer. Resuming re-runs the
+   *  connect path, which replays from the cached `lastSeq`. */
+  active: boolean = true,
 ) {
   // Backstop for the app-entry sweep: guarded, so this is free when it has
   // already run.
@@ -879,6 +883,10 @@ export function useAcpSession(
   // satisfying react-you-might-not-need-an-effect/no-event-handler.
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
+  // Read by listeners installed outside the session effect, which must not
+  // dial a socket for a view nobody is looking at.
+  const activeRef = useRef(active);
+  activeRef.current = active;
   useEffect(() => {
     if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
   }, [state]);
@@ -986,6 +994,7 @@ export function useAcpSession(
   // (satisfies react-you-might-not-need-an-effect/no-event-handler).
   const tryAutoReconnectRef = useRef<() => void>(() => {});
   tryAutoReconnectRef.current = () => {
+    if (!activeRef.current) return;
     const ws = wsRef.current;
     const ready = ws?.readyState;
     if (ready === WebSocket.CONNECTING) return;
@@ -1011,13 +1020,14 @@ export function useAcpSession(
   // it never resurrects an intentionally-closed or retry-exhausted
   // socket; backoff owns those. See #2287.
   useEffect(() => {
+    if (!active) return;
     const id = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
         tryAutoReconnectRef.current();
       }
     }, ACP_WS_WATCHDOG_INTERVAL_MS);
     return () => clearInterval(id);
-  }, []);
+  }, [active]);
 
   // Subscribe to visibility+pageshow and online via useSyncExternalStore
   // so no effect directly subscribes to an external store, satisfying
@@ -1306,8 +1316,9 @@ export function useAcpSession(
   }
 
   useEffect(() => {
-    if (!sessionId) {
+    if (!sessionId || !active) {
       statusRef.current = "closed";
+      setStatusRef.current("closed");
       return;
     }
     // Hydrate the reducer from the per-session cache rather than
@@ -1564,7 +1575,7 @@ export function useAcpSession(
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, fetchReplay, clearRetryTimers]);
+  }, [sessionId, active, fetchReplay, clearRetryTimers]);
 
   const resolveApproval = useCallback(
     // `optionId` answers with the agent's own option instead of letting
