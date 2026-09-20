@@ -80,6 +80,9 @@ export function useAcpConnection(
 ) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [resumePhase, setResumePhase] = useState<ResumePhase>("idle");
+  // The last warm replay did not complete. The phase is idle again and a live
+  // socket stays open, so this is the only signal that the transcript is behind.
+  const [resumeFailed, setResumeFailed] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [retryCountdown, setRetryCountdown] = useState(0);
@@ -253,9 +256,13 @@ export function useAcpConnection(
         await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
         return;
       }
+      setResumeFailed(false);
       setResumePhase("checking");
       try {
-        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, () => setResumePhase("catching_up"));
+        const ok = await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, () =>
+          setResumePhase("catching_up"),
+        );
+        if (!ok) setResumeFailed(true);
       } finally {
         setResumePhase("idle");
       }
@@ -374,6 +381,7 @@ export function useAcpConnection(
     manualReconnect,
     hasEverOpened,
     resumePhase,
+    resumeFailed,
     loadOlder,
     hasMoreOlder,
     loadingOlder,

@@ -42,6 +42,8 @@ export interface AcpContext {
   hasEverOpened: boolean;
   /** Catch-up phase of a resumed view; drives the catching-up strip. */
   resumePhase: ResumePhase;
+  /** The last resume could not fetch what it missed; the view is behind. */
+  resumeFailed: boolean;
   /** The auto-reconnect backoff is armed between a close and the next dial. */
   reconnecting: boolean;
   retryCount: number;
@@ -199,6 +201,7 @@ export function AcpRuntime({
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
         resumePhase: acp.resumePhase,
+        resumeFailed: acp.resumeFailed,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

@@ -11,6 +11,7 @@ const base = {
   maxRetries: 7,
   resumePhase: "idle" as const,
   lagged: false,
+  resumeFailed: false,
   rateLimit: null,
   rateLimitRetriesExhausted: false,
 };
@@ -99,6 +100,23 @@ describe("pickStatusStrip", () => {
       "Starting structured view…",
     );
     expect(pickStatusStrip({ ...base, status: "connecting" })?.text).toBe("Reconnecting to structured view…");
+  });
+
+  it("reports a resume whose catch-up never landed, above the catch-up itself", () => {
+    const strip = pickStatusStrip({ ...base, resumeFailed: true, resumePhase: "catching_up", lagged: true });
+    expect(strip).toEqual({
+      tier: "error",
+      kind: "resume_failed",
+      text: "Could not catch up on what happened while you were away.",
+    });
+  });
+
+  it("keeps the failed catch-up visible on a socket that is otherwise healthy", () => {
+    expect(pickStatusStrip({ ...base, status: "open", resumeFailed: true })?.kind).toBe("resume_failed");
+  });
+
+  it("still yields the failed catch-up to a rate limit", () => {
+    expect(pickStatusStrip({ ...base, resumeFailed: true, rateLimit })?.kind).toBe("rate_limit");
   });
 
   it("keeps the cached-transcript wording for a dropped socket", () => {

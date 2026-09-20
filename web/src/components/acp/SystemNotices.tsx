@@ -50,6 +50,7 @@ export function SystemNotices({
   retryCountdown,
   maxRetries,
   resumePhase,
+  resumeFailed,
   manualReconnect,
   onSwitchAgent,
   onResumeRateLimit,
@@ -68,6 +69,7 @@ export function SystemNotices({
   retryCountdown: number;
   maxRetries: number;
   resumePhase: ResumePhase;
+  resumeFailed: boolean;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
   onResumeRateLimit?: () => void;
@@ -82,6 +84,7 @@ export function SystemNotices({
     retryCountdown,
     maxRetries,
     resumePhase,
+    resumeFailed,
     lagged,
     rateLimit,
     rateLimitAutoResume,
@@ -95,11 +98,11 @@ export function SystemNotices({
   const rateLimitActions = rateLimit !== null && parked;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1" data-testid={`acp-strip-${strip.kind}`}>
-      {strip.kind === "reconnect_exhausted" ? (
+      {strip.kind === "reconnect_exhausted" || strip.kind === "resume_failed" ? (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
           <span>{strip.text}</span>
           <button type="button" onClick={manualReconnect} className={ACTION_BUTTON}>
-            Reconnect
+            {strip.kind === "resume_failed" ? "Retry" : "Reconnect"}
           </button>
         </div>
       ) : (

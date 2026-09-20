@@ -16,6 +16,7 @@ export interface StatusStrip {
     | "reconnect_exhausted"
     | "rate_limit_exhausted"
     | "rate_limit"
+    | "resume_failed"
     | "catching_up"
     | "lagged"
     | "reconnecting"
@@ -68,6 +69,8 @@ export function pickStatusStrip(args: {
   retryCountdown: number;
   maxRetries: number;
   resumePhase: ResumePhase;
+  /** The last resume could not fetch what it missed. */
+  resumeFailed: boolean;
   lagged: boolean;
   rateLimit: RateLimitInfo | null;
   /** Omitted when the caller does not know, in which case nothing is claimed. */
@@ -88,6 +91,11 @@ export function pickStatusStrip(args: {
   }
   if (args.rateLimit) {
     return { tier: "error", kind: "rate_limit", text: rateLimitText(args.rateLimit, args.rateLimitAutoResume) };
+  }
+  // A replay that never landed is invisible in the phase, which is idle again
+  // by then, and in the status, which a live socket leaves open.
+  if (args.resumeFailed) {
+    return { tier: "error", kind: "resume_failed", text: "Could not catch up on what happened while you were away." };
   }
   if (args.resumePhase === "catching_up") {
     return { tier: "catching_up", kind: "catching_up", text: "Catching up on what happened while you were away…" };
