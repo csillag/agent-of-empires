@@ -140,7 +140,7 @@ describe("useAcpSession suspended mode", () => {
     expect(replayCalls.filter((u) => u.includes("since=") && !u.includes("view=rows"))).toHaveLength(1);
   });
 
-  it("ignores a visibility wakeup while suspended", async () => {
+  it("ignores a visibility wakeup while suspended, and takes one once resumed", async () => {
     const { rerender } = renderHook(
       ({ active }: { active: boolean }) => useAcpSession("sess-suspend", "running", null, null, active),
       { initialProps: { active: true } },
@@ -149,6 +149,10 @@ describe("useAcpSession suspended mode", () => {
     act(() => sockets[0]!.onopen?.(new Event("open")));
     rerender({ active: false });
     await flush();
+    // A suspended view's socket is closed, which is exactly the state a wakeup
+    // would otherwise re-dial from.
+    expect(sockets[0]!.readyState).toBe(FakeWebSocket.CLOSED);
+    const replaysBeforeWakeup = replayCalls.length;
 
     await act(async () => {
       document.dispatchEvent(new Event("visibilitychange"));
@@ -156,5 +160,11 @@ describe("useAcpSession suspended mode", () => {
     });
 
     expect(sockets).toHaveLength(1);
+    expect(replayCalls).toHaveLength(replaysBeforeWakeup);
+
+    rerender({ active: true });
+    await flush();
+    expect(sockets).toHaveLength(2);
+    expect(replayCalls.length).toBeGreaterThan(replaysBeforeWakeup);
   });
 });
