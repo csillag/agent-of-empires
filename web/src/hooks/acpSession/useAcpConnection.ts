@@ -70,6 +70,8 @@ export function useAcpConnection(
   sessionIdRef: RefObject<string | null>,
   state: AcpState,
   dispatch: Dispatch<Action>,
+  /** False while the view is suspended: no socket, no timer, status closed. */
+  active = true,
 ) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [reconnecting, setReconnecting] = useState(false);
@@ -79,6 +81,7 @@ export function useAcpConnection(
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasEverOpened, setHasEverOpened] = useState(false);
 
+  const activeRef = useLatestRef(active);
   const lastSeqRef = useLatestRef(state.lastSeq);
   const oldestSeqRef = useLatestRef(state.oldestSeq);
   const hasMoreOlderRef = useLatestRef(hasMoreOlder);
@@ -116,19 +119,21 @@ export function useAcpConnection(
   }, [clearRetryTimers]);
 
   const tryAutoReconnect = useCallback(() => {
+    if (!activeRef.current) return;
     const ready = wsRef.current?.readyState;
     if (ready === WebSocket.CONNECTING) return;
     // An OPEN socket only counts as alive while it keeps hearing from the server.
     if (ready === WebSocket.OPEN && Date.now() - lastServerMsgRef.current < ACP_WS_STALE_MS) return;
     redial();
-  }, [redial]);
+  }, [redial, activeRef]);
 
   useEffect(() => {
+    if (!active) return;
     const id = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) tryAutoReconnect();
     }, ACP_WS_WATCHDOG_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [tryAutoReconnect]);
+  }, [tryAutoReconnect, active]);
 
   const visCounterRef = useRef(0);
   const subscribeVisibilityCount = useCallback(
@@ -182,10 +187,11 @@ export function useAcpConnection(
     }
   }, [dispatch, sessionIdRef, oldestSeqRef, hasMoreOlderRef]);
 
-  const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
-  if (sessionId !== trackedSessionId) {
-    setTrackedSessionId(sessionId);
-    setStatus(sessionId ? "connecting" : "closed");
+  const tracked = active ? sessionId : null;
+  const [trackedSessionId, setTrackedSessionId] = useState(tracked);
+  if (tracked !== trackedSessionId) {
+    setTrackedSessionId(tracked);
+    setStatus(tracked ? "connecting" : "closed");
     setReconnecting(false);
     setRetryCount(0);
     setRetryCountdown(0);
@@ -199,7 +205,10 @@ export function useAcpConnection(
     loadingOlderRef.current = false;
     lastSeqRef.current = cached?.lastSeq ?? 0;
     oldestSeqRef.current = cached?.oldestSeq ?? 0;
-    if (!sessionId) return;
+    if (!sessionId || !active) {
+      settersRef.current.setStatus("closed");
+      return;
+    }
     dispatch({ kind: "hydrate", state: cached ?? emptyAcpState() });
     retryCountRef.current = 0;
     let cancelled = false;
@@ -331,7 +340,7 @@ export function useAcpConnection(
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef]);
+  }, [sessionId, active, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef]);
 
   const manualReconnect = useCallback(() => {
     setReconnecting(false);

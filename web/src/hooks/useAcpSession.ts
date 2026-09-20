@@ -120,6 +120,10 @@ export function useAcpSession(
   workerState: "absent" | "resuming" | "running" | "stopping" = "running",
   archivedAt: string | null = null,
   snoozedUntil: string | null = null,
+  /** False while this session's view is suspended in the keep-alive set: the
+   *  tree stays mounted but holds no socket and no timer. Resuming re-runs the
+   *  connect path, which replays from the cached `lastSeq`. */
+  active: boolean = true,
 ) {
   sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
@@ -130,7 +134,7 @@ export function useAcpSession(
     if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
   }, [state, sessionIdRef]);
   const queuedPromptsRef = useLatestRef(state.queuedPrompts);
-  const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch);
+  const connection = useAcpConnection(sessionId, sessionIdRef, state, dispatch, active);
   const { status, lastActivityRef } = connection;
 
   const resolveApproval = useCallback(
