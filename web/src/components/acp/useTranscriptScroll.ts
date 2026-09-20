@@ -220,7 +220,10 @@ export function useTranscriptScroll({
     }
 
     const saveScroll = () => {
-      saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top: vp.scrollTop });
+      // A hidden layer's viewport reports 0. Suspended, the sampler's last
+      // record is the position, the same source the handoff saves.
+      const top = activeScrollRef.current ? vp.scrollTop : lastScrollTopRef.current;
+      saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top });
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") saveScroll();
