@@ -19,6 +19,11 @@ import { cacheGet } from "./stateCache";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
+/** Where a resumed view is in its catch-up. `checking` means the replay has
+ *  been asked and has not answered; `catching_up` means it answered that the
+ *  server is ahead and the rows are landing. Only the latter earns a strip. */
+export type ResumePhase = "idle" | "checking" | "catching_up";
+
 export const ACP_MAX_RETRIES = 7;
 const ACP_RETRY_BASE_MS = 1000;
 const ACP_RETRY_CAP_MS = 30000;
@@ -74,6 +79,7 @@ export function useAcpConnection(
   active = true,
 ) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [resumePhase, setResumePhase] = useState<ResumePhase>("idle");
   const [reconnecting, setReconnecting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [retryCountdown, setRetryCountdown] = useState(0);
@@ -242,6 +248,19 @@ export function useAcpConnection(
       }, delayMs);
     };
 
+    const replay = async () => {
+      if (lastSeqRef.current === 0) {
+        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+        return;
+      }
+      setResumePhase("checking");
+      try {
+        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder, () => setResumePhase("catching_up"));
+      } finally {
+        setResumePhase("idle");
+      }
+    };
+
     const handleMessage = (data: ServerMessage) => {
       const kind = typeof data === "object" && data !== null && "kind" in data ? data.kind : undefined;
       switch (kind) {
@@ -249,7 +268,7 @@ export function useAcpConnection(
           return;
         case "lagged":
           dispatch({ kind: "lagged", skipped: (data as { skipped?: number }).skipped ?? 0 });
-          void fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+          void replay();
           return;
         case "reduced_state": {
           const { state: reduced, unchanged } = data as { state?: ReducedState; unchanged?: string[] };
@@ -290,7 +309,7 @@ export function useAcpConnection(
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       void (async () => {
-        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+        await replay();
         if (!isCurrentDial()) return;
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
@@ -354,6 +373,7 @@ export function useAcpConnection(
     retryCountdown,
     manualReconnect,
     hasEverOpened,
+    resumePhase,
     loadOlder,
     hasMoreOlder,
     loadingOlder,

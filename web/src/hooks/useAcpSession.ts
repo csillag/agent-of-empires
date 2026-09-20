@@ -33,6 +33,7 @@ import {
 import { LEGACY_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
+export type { ResumePhase } from "./acpSession/useAcpConnection";
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
 export { clearAcpCache, useBackgroundAgents } from "./acpSession/stateCache";
 

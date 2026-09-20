@@ -9,7 +9,7 @@ import {
 } from "@assistant-ui/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { useAcpSession } from "../../hooks/useAcpSession";
+import { useAcpSession, type ResumePhase } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { isVisiblyBusy } from "../../lib/acpTypes";
@@ -37,6 +37,8 @@ export interface AcpContext {
   state: AcpState;
   status: Session["status"];
   hasEverOpened: boolean;
+  /** Catch-up phase of a resumed view; drives the catching-up strip. */
+  resumePhase: ResumePhase;
   /** The auto-reconnect backoff is armed between a close and the next dial. */
   reconnecting: boolean;
   retryCount: number;
@@ -192,6 +194,7 @@ export function AcpRuntime({
         state: acp.state,
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
+        resumePhase: acp.resumePhase,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

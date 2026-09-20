@@ -39,10 +39,12 @@ export async function fetchReplay(
   lastSeq: { current: number },
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
+  /** Warm replay found the server ahead of what this view had already folded. */
+  onServerAhead?: () => void,
 ): Promise<void> {
   try {
     if (lastSeq.current === 0) await fetchTail(sid, lastSeq, dispatch, setHasMoreOlder);
-    else await fetchForward(sid, lastSeq.current, dispatch);
+    else await fetchForward(sid, lastSeq.current, dispatch, onServerAhead);
   } catch {
     // Best effort.
   }
@@ -80,7 +82,12 @@ async function fetchTail(
   dispatch({ kind: "lagged_resolved" });
 }
 
-async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch): Promise<void> {
+async function fetchForward(
+  sid: string,
+  lastSeq: number,
+  dispatch: Dispatch,
+  onServerAhead?: () => void,
+): Promise<void> {
   const firstSince = Math.max(0, lastSeq - REPLAY_OVERLAP);
   let cursor = firstSince;
   let target: number | null = null;
@@ -91,6 +98,8 @@ async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch): P
     const pageRows = await readRows(rowsRes);
     if (target === null) {
       target = data.highest_seq;
+      // The server is ahead of what this view had already folded.
+      if (data.highest_seq > lastSeq) onServerAhead?.();
       // The server's log is behind our cursor (e.g. it was reset), so start over.
       if (data.highest_seq < firstSince) dispatch({ kind: "reset" });
     }
