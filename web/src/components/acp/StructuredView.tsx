@@ -42,6 +42,7 @@ import { promptRepinDecision } from "../../lib/promptRepin";
 import { nextStick } from "../../lib/stickToBottom";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
+import type { ResumePhase } from "../../hooks/useAcpSession";
 import { Composer } from "./Composer";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { CompactionReminderBanner } from "./CompactionReminderBanner";
@@ -51,6 +52,7 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickStatusStrip } from "./statusStrip";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
@@ -316,6 +318,7 @@ function AcpChrome({
   state,
   status,
   hasEverOpened,
+  resumePhase,
   reconnecting,
   retryCount,
   retryCountdown,
@@ -774,27 +777,26 @@ function AcpChrome({
         currentAgent={state.agent ?? acpAgent}
         onPrefill={recoveryHandoffPrefill}
       >
-        {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
-            <SystemNotices
-              status={status}
-              lagged={state.lagged}
-              rateLimit={state.rateLimit}
-              rateLimitAutoResume={rateLimitAutoResume}
-              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
-              hasEverOpened={hasEverOpened}
-              reconnecting={reconnecting}
-              retryCount={retryCount}
-              retryCountdown={retryCountdown}
-              maxRetries={maxRetries}
-              manualReconnect={manualReconnect}
-              onSwitchAgent={onSwitchAgent}
-              onResumeRateLimit={() => void resumeRateLimitedSession()}
-              rateLimitResumeState={rateLimitResumeState}
-              rateLimitResumeError={rateLimitResumeError}
-            />
-          ) : null
-        }
+        {({ onSwitchAgent }) => (
+          <SystemNotices
+            status={status}
+            lagged={state.lagged}
+            rateLimit={state.rateLimit}
+            rateLimitAutoResume={rateLimitAutoResume}
+            rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
+            hasEverOpened={hasEverOpened}
+            reconnecting={reconnecting}
+            retryCount={retryCount}
+            retryCountdown={retryCountdown}
+            maxRetries={maxRetries}
+            resumePhase={resumePhase}
+            manualReconnect={manualReconnect}
+            onSwitchAgent={onSwitchAgent}
+            onResumeRateLimit={() => void resumeRateLimitedSession()}
+            rateLimitResumeState={rateLimitResumeState}
+            rateLimitResumeError={rateLimitResumeError}
+          />
+        )}
       </RateLimitRecoverySection>
 
       {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
@@ -1805,20 +1807,6 @@ export function RateLimitRecoverySection({
   );
 }
 
-/** The agent's own wording for a rate limit, fit for a banner. On the prompt
- *  path `status` is already a sentence, but the defensive connection-end path
- *  (`classify_rate_limit_from_message`) puts the whole error Display string in,
- *  transport prefixes and the raw `{"errorKind":"rate_limit"}` fingerprint
- *  included, and that path never has a reported reset. Strip both so an unknown
- *  reset can never render a JSON payload. See #3152. */
-function rateLimitWording(status: string): string {
-  const text = status
-    .replace(/[\s:]*\{[\s\S]*\}\s*$/, "")
-    .replace(/^(?:ACP connection failed:\s*)?(?:Internal error:?\s*)?/, "")
-    .trim();
-  return text || "the agent did not report a reset time.";
-}
-
 export function SystemNotices({
   status,
   lagged,
@@ -1830,6 +1818,7 @@ export function SystemNotices({
   retryCount,
   retryCountdown,
   maxRetries,
+  resumePhase,
   manualReconnect,
   onSwitchAgent,
   onResumeRateLimit,
@@ -1848,92 +1837,49 @@ export function SystemNotices({
   retryCount: number;
   retryCountdown: number;
   maxRetries: number;
+  resumePhase: ResumePhase;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
   onResumeRateLimit?: () => void;
   rateLimitResumeState?: RespawnState;
   rateLimitResumeError?: string | null;
 }) {
-  const messages: { kind: string; text: string }[] = [];
-  // Retry envelope exhausted: the auto-reconnect chain stopped after
-  // `maxRetries` and we're sitting on a dead WS. Surface the manual
-  // affordance instead of a status line so the user has a clear path
-  // back to live. See #1130.
-  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
-  if (reconnecting && status !== "open") {
-    // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
-    // "Reconnecting…" copy with concrete progress so the user knows
-    // the tab isn't frozen and roughly how long until the next dial.
-    const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
-    messages.push({
-      kind: "warn",
-      text: `Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`,
-    });
-  } else if (status === "connecting") {
-    messages.push({
-      kind: "info",
-      text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
-    });
-  } else if (status === "error") {
-    messages.push({
-      kind: "warn",
-      text: hasEverOpened
-        ? "Structured view reconnecting… showing cached transcript; new messages disabled."
-        : "Starting structured view worker… this can take a few seconds for new sessions.",
-    });
-  } else if (status === "closed" && !reconnectRetriesExhausted) {
-    messages.push({
-      kind: "warn",
-      text: hasEverOpened
-        ? "Structured view disconnected. Showing cached transcript; new messages disabled."
-        : "Structured view not ready yet. Retrying…",
-    });
-  }
-  if (lagged) {
-    messages.push({
-      kind: "warn",
-      text: "Some events were missed during reconnect.",
-    });
-  }
-  if (rateLimit) {
-    // No reported reset means the agent never told us when the window
-    // clears, so show what it did say (usually "resets 4am (Europe/Paris)")
-    // rather than a made-up clock time. See #3152.
-    const reset = rateLimit.resets_at === null ? null : new Date(rateLimit.resets_at);
-    messages.push({
-      kind: "warn",
-      text:
-        reset && !Number.isNaN(reset.getTime())
-          ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
-          : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
-    });
-    // Say whether the park ends by itself: the same banner with the setting
-    // off used to read as "AoE is broken" rather than "as configured" (#3514).
-    if (rateLimitAutoResume === true && !rateLimitRetriesExhausted) {
-      messages.push({ kind: "muted", text: "Auto-resume is armed; the session resumes when the window clears." });
-    } else if (rateLimitAutoResume === false) {
-      messages.push({
-        kind: "muted",
-        text: "Auto-resume is off for this profile; use Resume now, or enable acp.rate_limit_auto_resume.",
-      });
-    }
-  }
-  if (rateLimitRetriesExhausted) {
-    messages.push({
-      kind: "warn",
-      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
-    });
-  }
+  const strip = pickStatusStrip({
+    status,
+    hasEverOpened,
+    reconnecting,
+    retryCount,
+    retryCountdown,
+    maxRetries,
+    resumePhase,
+    lagged,
+    rateLimit,
+    rateLimitAutoResume,
+    rateLimitRetriesExhausted,
+  });
+  if (!strip) return null;
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
-  if (messages.length === 0 && !reconnectRetriesExhausted) return null;
+  // Both rate-limit strips describe the same park, so both carry its recovery
+  // affordances, and only while the daemon still reports one.
+  const parked = strip.kind === "rate_limit" || strip.kind === "rate_limit_exhausted";
+  const rateLimitActions = rateLimit !== null && parked;
   return (
-    <div className="border-b border-surface-800 px-4 py-2 space-y-1">
-      {messages.map((m, i) => (
-        <div key={i} className={`text-xs ${m.kind === "warn" ? "text-brand-400" : "text-text-muted"}`}>
-          {m.text}
+    <div className="border-b border-surface-800 px-4 py-2 space-y-1" data-testid={`acp-strip-${strip.kind}`}>
+      {strip.kind === "reconnect_exhausted" ? (
+        <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
+          <span>{strip.text}</span>
+          <button
+            type="button"
+            onClick={manualReconnect}
+            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+          >
+            Reconnect
+          </button>
         </div>
-      ))}
-      {rateLimit && (onResumeRateLimit || onSwitchAgent) && (
+      ) : (
+        <div className={`text-xs ${strip.tier === "error" ? "text-brand-400" : "text-text-muted"}`}>{strip.text}</div>
+      )}
+      {rateLimitActions && (onResumeRateLimit || onSwitchAgent) && (
         <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
           {onResumeRateLimit && (
             <button
@@ -1960,23 +1906,11 @@ export function SystemNotices({
           )}
         </div>
       )}
-      {rateLimit && rateLimitResumeState === "ok" && (
+      {rateLimitActions && rateLimitResumeState === "ok" && (
         <div className="pt-1 text-xs text-text-muted">Resume requested. New events should start streaming shortly.</div>
       )}
-      {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
+      {rateLimitActions && rateLimitResumeState === "failed" && rateLimitResumeError && (
         <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
-      )}
-      {reconnectRetriesExhausted && (
-        <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
-          <span>Connection lost. Auto-retry stopped.</span>
-          <button
-            type="button"
-            onClick={manualReconnect}
-            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
-          >
-            Reconnect
-          </button>
-        </div>
       )}
     </div>
   );

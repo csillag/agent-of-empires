@@ -27,6 +27,7 @@ function mount(overrides?: Partial<React.ComponentProps<typeof SystemNotices>>) 
     retryCount: 0,
     retryCountdown: 0,
     maxRetries: 7,
+    resumePhase: "idle",
     manualReconnect,
     ...overrides,
   };
@@ -85,6 +86,7 @@ describe("SystemNotices rate-limit handoff", () => {
         retryCount={0}
         retryCountdown={0}
         maxRetries={7}
+        resumePhase="idle"
         manualReconnect={vi.fn()}
       />,
     );
@@ -119,6 +121,7 @@ describe("SystemNotices rate-limit handoff", () => {
         retryCount={0}
         retryCountdown={0}
         maxRetries={7}
+        resumePhase="idle"
         manualReconnect={vi.fn()}
       />,
     );
@@ -291,5 +294,32 @@ describe("SystemNotices rate-limit handoff", () => {
     });
     expect(getByText(/Auto-resume stopped: the same prompt was re-sent too many times/i)).toBeDefined();
     expect(queryByRole("button", { name: /resume now/i })).toBeNull();
+  });
+});
+
+describe("SystemNotices single-strip discipline", () => {
+  const rateLimit = { status: "limited", resets_at: null, kind: "rate_limit" };
+
+  it("shows the rate limit and not the disconnect underneath it", () => {
+    const { container, queryByText } = mount({ status: "closed", rateLimit });
+    expect(container.querySelectorAll("[data-testid^='acp-strip-']")).toHaveLength(1);
+    expect(queryByText(/Showing cached transcript/)).toBeNull();
+  });
+
+  it("shows the catching-up strip while a resume folds missed events", () => {
+    const { getByTestId } = mount({ status: "closed", resumePhase: "catching_up" });
+    expect(getByTestId("acp-strip-catching_up").textContent).toContain("Catching up");
+  });
+
+  it("shows nothing while a resume is still asking", () => {
+    const { container } = mount({ status: "closed", resumePhase: "checking" });
+    expect(container.querySelector("[data-testid^='acp-strip-']")).toBeNull();
+    expect(container.firstChild).toBeNull();
+  });
+
+  it("keeps the manual reconnect affordance when the retry envelope is spent", () => {
+    const { getByRole, manualReconnect } = mount({ status: "closed", retryCount: 7 });
+    fireEvent.click(getByRole("button", { name: /reconnect/i }));
+    expect(manualReconnect).toHaveBeenCalledTimes(1);
   });
 });
