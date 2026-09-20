@@ -110,6 +110,15 @@ describe("useMobileKeyboard", () => {
     expect(ctl.listenerCount("scroll")).toBe(0);
   });
 
+  it("wires nothing while disabled, even on a coarse pointer", () => {
+    stubMatchMedia(true);
+    const ctl = stubVisualViewport(800);
+    const { result } = renderHook(() => useMobileKeyboard(false));
+    expect(result.current.isMobile).toBe(true);
+    expect(ctl.listenerCount("resize")).toBe(0);
+    expect(ctl.listenerCount("scroll")).toBe(0);
+  });
+
   it("detects the keyboard opening and measures the bottom inset", () => {
     stubMatchMedia(true);
     const vp = stubVisualViewport(800);

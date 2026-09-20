@@ -1,14 +1,4 @@
-import {
-  lazy,
-  Suspense,
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
@@ -113,16 +103,7 @@ import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
 import { TerminalSessionStack } from "./components/TerminalSessionStack";
-// Lazy-load the acp surface so non-acp users never download
-// the @assistant-ui/react, shiki, and in-house StringDiff/DiffLine
-// dependency tree. Cuts ~hundreds of KB off the cold-start bundle
-// for the (currently default) tmux-only flow. The Suspense fallback
-// below covers the brief load while the chunk arrives.
-const StructuredView = lazy(() =>
-  import("./components/acp/StructuredView").then((m) => ({
-    default: m.StructuredView,
-  })),
-);
+import { SessionViewHost } from "./components/SessionViewHost";
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
@@ -1878,30 +1859,13 @@ function AppContent({
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                   {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <StructuredView
-                        key={activeSessionId}
-                        sessionId={activeSessionId!}
-                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        rateLimitAutoResume={activeSession.rate_limit_auto_resume}
-                        tool={activeSession.tool}
-                        acpAgent={activeSession.acp_agent ?? null}
-                        clearAliases={activeSession.clear_aliases}
-                        archivedAt={activeSession.archived_at ?? null}
-                        snoozedUntil={activeSession.snoozed_until ?? null}
-                        trashedAt={activeSession.trashed_at ?? null}
-                        onRestore={
-                          activeSession.trashed_at
-                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
-                            : undefined
-                        }
-                        onOpenFileRef={handleOpenFileRef}
-                        fileRefSession={activeSession}
-                        onOpenAgentsPane={openAgentsPane}
-                        isSandboxed={activeSession.is_sandboxed}
-                        background={activeSession?.background}
-                      />
-                    </Suspense>
+                    <SessionViewHost
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions}
+                      onOpenFileRef={handleOpenFileRef}
+                      onOpenAgentsPane={openAgentsPane}
+                      onRestoreSession={(id) => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, id))}
+                    />
                   ) : (
                     <TerminalSessionStack
                       activeSessionId={activeSessionId!}
@@ -2418,13 +2382,5 @@ function AppContent({
         />
       </div>
     </AcpPrefsProvider>
-  );
-}
-
-function AcpLoadingFallback() {
-  return (
-    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
-    </div>
   );
 }

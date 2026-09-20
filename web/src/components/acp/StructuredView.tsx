@@ -37,10 +37,12 @@ import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta }
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { recallScroll, rememberScroll } from "../../lib/suspendedScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { nextStick } from "../../lib/stickToBottom";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
+import type { ResumePhase } from "../../hooks/useAcpSession";
 import { Composer } from "./Composer";
 import { ConfigOptionDeferredNotice, ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { CompactionReminderBanner } from "./CompactionReminderBanner";
@@ -49,7 +51,8 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showStartupErrorBanner, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickStatusStrip } from "./statusStrip";
 import { BackgroundAgentsContext, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { BackgroundPanel } from "./BackgroundPanel";
 import { waitingOn } from "../../lib/background";
@@ -161,6 +164,10 @@ interface Props {
   onOpenAgentsPane?: () => void;
   /** Background work of this session, from the sessions API. */
   background?: BackgroundSummary;
+  /** False while this view sits suspended in the keep-alive set: it renders
+   *  its last state and nothing else. Defaults to true so the mobile pane and
+   *  the tests keep today's single-view behaviour. */
+  active?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -186,6 +193,7 @@ export function StructuredView(props: Props) {
     onOpenAgentsPane,
     isSandboxed,
     background,
+    active = true,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -205,6 +213,7 @@ export function StructuredView(props: Props) {
             archivedAt={archivedAt}
             snoozedUntil={snoozedUntil}
             showClearedTurns={showClearedTurns}
+            active={active}
           >
             {(ctx) => (
               <BackgroundAgentsContext.Provider
@@ -225,6 +234,7 @@ export function StructuredView(props: Props) {
                   onRestore={onRestore}
                   isSandboxed={isSandboxed}
                   background={background}
+                  active={active}
                   {...ctx}
                 />
               </BackgroundAgentsContext.Provider>
@@ -280,8 +290,8 @@ function structuredViewFontStyle(
  *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
  *  the hook-to-style wiring is testable without mounting the assistant-ui
  *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
-export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
-  const { keyboardHeight } = useMobileKeyboard();
+export function StructuredViewRoot({ active = true, children }: { active?: boolean; children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard(active);
   const { settings } = useWebSettings();
   return (
     <div
@@ -300,6 +310,7 @@ export function StructuredViewRoot({ children }: { children: React.ReactNode }) 
 
 function AcpChrome({
   sessionId,
+  active,
   acpWorkerState,
   rateLimitAutoResume,
   acpAgent,
@@ -314,6 +325,9 @@ function AcpChrome({
   state,
   status,
   hasEverOpened,
+  resumePhase,
+  resumeFailed,
+  conversationReset,
   reconnecting,
   retryCount,
   retryCountdown,
@@ -348,6 +362,7 @@ function AcpChrome({
 }: AcpContext & {
   sessionId: string;
   background?: BackgroundSummary;
+  active: boolean;
   acpWorkerState: "absent" | "resuming" | "running" | "stopping";
   rateLimitAutoResume?: boolean;
   acpAgent: string | null;
@@ -415,6 +430,10 @@ function AcpChrome({
   // smooth scroll bypasses it; it only moves down, which never un-sticks.
   // See stickToBottom.ts.
   const lastScrollTopRef = useRef(0);
+  // The observers below outlive a suspension; a zero-sized hidden viewport must
+  // not be mistaken for a reader who scrolled. The handoff effect owns the
+  // write, so the ref also holds the previous value it compares against.
+  const activeScrollRef = useRef(active);
   const setScrollTop = useCallback((vp: HTMLElement, top: number) => {
     vp.scrollTop = top;
     lastScrollTopRef.current = vp.scrollTop;
@@ -435,7 +454,7 @@ function AcpChrome({
   const [atBottom, setAtBottom] = useState(true);
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
   /** An explicit "stick again": set the pinned intent directly and re-pin. The
    *  programmatic scroll fires no gesture, so the sampler would not pick it up. */
   const pinToBottom = useCallback(
@@ -461,12 +480,12 @@ function AcpChrome({
     const d = promptRepinDecision({
       seen: seenPromptSeqRef.current,
       promptSeq: state.promptSeq,
-      live: hasEverOpened,
+      live: status === "open",
       localInflight,
     });
     seenPromptSeqRef.current = d.seen;
     if (d.pin) pinToBottom("auto");
-  }, [state.promptSeq, hasEverOpened, localInflight, pinToBottom]);
+  }, [state.promptSeq, status, localInflight, pinToBottom]);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.
@@ -633,7 +652,10 @@ function AcpChrome({
     // reopen can restore it. `pagehide` covers a reload / PWA close; the
     // visibility hook covers backgrounding; the cleanup covers a session switch.
     const saveScroll = () => {
-      saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top: vp.scrollTop });
+      // A hidden layer's viewport reports 0. Suspended, the sampler's last
+      // record is the only true position, and it is what the handoff saves.
+      const top = activeScrollRef.current ? vp.scrollTop : lastScrollTopRef.current;
+      saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top });
     };
     const onVisibility = () => {
       if (document.visibilityState === "hidden") saveScroll();
@@ -643,7 +665,7 @@ function AcpChrome({
     // Re-pin on two elements: the chrome below the viewport (composer, queued
     // strips) and the viewport itself, because chrome *outside* this view can
     // resize it too (the App's header collapse).
-    const wasAtBottom = () => wasAtBottomRef.current;
+    const wasAtBottom = () => activeScrollRef.current && wasAtBottomRef.current;
     const repin = () => setScrollTop(vp, vp.scrollHeight);
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
@@ -658,6 +680,7 @@ function AcpChrome({
     //     bottom-following path; the viewport primitive's competing auto-scroll
     //     intent is disabled below.
     const contentRo = new ResizeObserver(() => {
+      if (!activeScrollRef.current) return;
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
@@ -682,6 +705,35 @@ function AcpChrome({
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
   }, [requestEarlierHistory, isCoarse, sessionId, setScrollTop]);
+
+  // Suspend / resume scroll handoff. On the way out the position comes from the
+  // sampler's record, not the DOM: by the time this runs the view is already
+  // display:none and reports zero. On the way back it is reapplied across the
+  // frames in which markdown, tool cards and images settle, the same ladder the
+  // mount-time restore uses.
+  useLayoutEffect(() => {
+    if (active === activeScrollRef.current) return;
+    activeScrollRef.current = active;
+    if (!active) {
+      rememberScroll(sessionId, { stuck: wasAtBottomRef.current, top: lastScrollTopRef.current });
+      return;
+    }
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const saved = recallScroll(sessionId);
+    if (saved) wasAtBottomRef.current = saved.stuck;
+    const apply = () => {
+      const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+      if (top != null) setScrollTop(vp, top);
+    };
+    apply();
+    requestAnimationFrame(() => {
+      // The reactive mirror only drives the jump-to-bottom button, so it is set
+      // off the effect body rather than cascading a render out of the restore.
+      setAtBottom(wasAtBottomRef.current);
+      requestAnimationFrame(apply);
+    });
+  }, [active, sessionId, setScrollTop]);
 
   // Hold the bottom pin across a chrome transition that resizes the viewport:
   // the soft keyboard opening/closing, and the composer ("hide text input")
@@ -735,7 +787,7 @@ function AcpChrome({
     );
   }
   return (
-    <StructuredViewRoot>
+    <StructuredViewRoot active={active}>
       <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
@@ -744,30 +796,33 @@ function AcpChrome({
         currentAgent={state.agent ?? acpAgent}
         onPrefill={recoveryHandoffPrefill}
       >
-        {({ onSwitchAgent }) =>
-          status !== "open" || state.lagged || state.rateLimit || state.rateLimitRetriesExhausted || reconnecting ? (
-            <SystemNotices
-              status={status}
-              lagged={state.lagged}
-              rateLimit={state.rateLimit}
-              rateLimitAutoResume={rateLimitAutoResume}
-              rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
-              hasEverOpened={hasEverOpened}
-              reconnecting={reconnecting}
-              retryCount={retryCount}
-              retryCountdown={retryCountdown}
-              maxRetries={maxRetries}
-              manualReconnect={manualReconnect}
-              onSwitchAgent={onSwitchAgent}
-              onResumeRateLimit={() => void resumeRateLimitedSession()}
-              rateLimitResumeState={rateLimitResumeState}
-              rateLimitResumeError={rateLimitResumeError}
-            />
-          ) : null
-        }
+        {({ onSwitchAgent }) => (
+          <SystemNotices
+            status={status}
+            lagged={state.lagged}
+            rateLimit={state.rateLimit}
+            rateLimitAutoResume={rateLimitAutoResume}
+            rateLimitRetriesExhausted={state.rateLimitRetriesExhausted}
+            hasEverOpened={hasEverOpened}
+            reconnecting={reconnecting}
+            retryCount={retryCount}
+            retryCountdown={retryCountdown}
+            maxRetries={maxRetries}
+            resumePhase={resumePhase}
+            resumeFailed={resumeFailed}
+            conversationReset={conversationReset}
+            manualReconnect={manualReconnect}
+            onSwitchAgent={onSwitchAgent}
+            onResumeRateLimit={() => void resumeRateLimitedSession()}
+            rateLimitResumeState={rateLimitResumeState}
+            rateLimitResumeError={rateLimitResumeError}
+          />
+        )}
       </RateLimitRecoverySection>
 
-      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
+      {showStartupErrorBanner({ startupError: state.startupError, acpWorkerState }) && (
+        <StartupErrorBanner sessionId={sessionId} message={state.startupError!} />
+      )}
       {(() => {
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
@@ -795,12 +850,14 @@ function AcpChrome({
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {acpWorkerState === "resuming" &&
-        !state.startupError &&
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
       {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
-      {state.nextWakeupAt &&
+      {/* Active only: the countdown ticks every second, and a suspended view
+          runs no timers. */}
+      {active &&
+        state.nextWakeupAt &&
         !state.turnActive &&
         !state.startupError &&
         !state.workerStopped &&
@@ -872,7 +929,7 @@ function AcpChrome({
                   model…", and the Force end turn watchdog) so the actionable
                   card stands alone; it returns once the turn resumes. See
                   #2145. */}
-                {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                {active && state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
                   <div className="mt-3 ml-1">
                     <WorkingSpinner
                       thinking={state.thinking}
@@ -1789,20 +1846,6 @@ export function RateLimitRecoverySection({
   );
 }
 
-/** The agent's own wording for a rate limit, fit for a banner. On the prompt
- *  path `status` is already a sentence, but the defensive connection-end path
- *  (`classify_rate_limit_from_message`) puts the whole error Display string in,
- *  transport prefixes and the raw `{"errorKind":"rate_limit"}` fingerprint
- *  included, and that path never has a reported reset. Strip both so an unknown
- *  reset can never render a JSON payload. See #3152. */
-function rateLimitWording(status: string): string {
-  const text = status
-    .replace(/[\s:]*\{[\s\S]*\}\s*$/, "")
-    .replace(/^(?:ACP connection failed:\s*)?(?:Internal error:?\s*)?/, "")
-    .trim();
-  return text || "the agent did not report a reset time.";
-}
-
 export function SystemNotices({
   status,
   lagged,
@@ -1814,6 +1857,9 @@ export function SystemNotices({
   retryCount,
   retryCountdown,
   maxRetries,
+  resumePhase,
+  resumeFailed,
+  conversationReset,
   manualReconnect,
   onSwitchAgent,
   onResumeRateLimit,
@@ -1832,92 +1878,53 @@ export function SystemNotices({
   retryCount: number;
   retryCountdown: number;
   maxRetries: number;
+  resumePhase: ResumePhase;
+  resumeFailed: boolean;
+  conversationReset: boolean;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
   onResumeRateLimit?: () => void;
   rateLimitResumeState?: RespawnState;
   rateLimitResumeError?: string | null;
 }) {
-  const messages: { kind: string; text: string }[] = [];
-  // Retry envelope exhausted: the auto-reconnect chain stopped after
-  // `maxRetries` and we're sitting on a dead WS. Surface the manual
-  // affordance instead of a status line so the user has a clear path
-  // back to live. See #1130.
-  const reconnectRetriesExhausted = status !== "open" && hasEverOpened && !reconnecting && retryCount >= maxRetries;
-  if (reconnecting && status !== "open") {
-    // Auto-retry banner: "Reconnecting (3/7) in 4s". Replaces the bare
-    // "Reconnecting…" copy with concrete progress so the user knows
-    // the tab isn't frozen and roughly how long until the next dial.
-    const countdownPart = retryCountdown > 0 ? ` in ${retryCountdown}s` : "";
-    messages.push({
-      kind: "warn",
-      text: `Structured view disconnected. Reconnecting (${retryCount}/${maxRetries})${countdownPart}…`,
-    });
-  } else if (status === "connecting") {
-    messages.push({
-      kind: "info",
-      text: hasEverOpened ? "Reconnecting to structured view…" : "Starting structured view…",
-    });
-  } else if (status === "error") {
-    messages.push({
-      kind: "warn",
-      text: hasEverOpened
-        ? "Structured view reconnecting… showing cached transcript; new messages disabled."
-        : "Starting structured view worker… this can take a few seconds for new sessions.",
-    });
-  } else if (status === "closed" && !reconnectRetriesExhausted) {
-    messages.push({
-      kind: "warn",
-      text: hasEverOpened
-        ? "Structured view disconnected. Showing cached transcript; new messages disabled."
-        : "Structured view not ready yet. Retrying…",
-    });
-  }
-  if (lagged) {
-    messages.push({
-      kind: "warn",
-      text: "Some events were missed during reconnect.",
-    });
-  }
-  if (rateLimit) {
-    // No reported reset means the agent never told us when the window
-    // clears, so show what it did say (usually "resets 4am (Europe/Paris)")
-    // rather than a made-up clock time. See #3152.
-    const reset = rateLimit.resets_at === null ? null : new Date(rateLimit.resets_at);
-    messages.push({
-      kind: "warn",
-      text:
-        reset && !Number.isNaN(reset.getTime())
-          ? `Rate-limited (${rateLimit.kind}); resets at ${reset.toLocaleTimeString()}.`
-          : `Rate-limited (${rateLimit.kind}); ${rateLimitWording(rateLimit.status)}`,
-    });
-    // Say whether the park ends by itself: the same banner with the setting
-    // off used to read as "AoE is broken" rather than "as configured" (#3514).
-    if (rateLimitAutoResume === true && !rateLimitRetriesExhausted) {
-      messages.push({ kind: "muted", text: "Auto-resume is armed; the session resumes when the window clears." });
-    } else if (rateLimitAutoResume === false) {
-      messages.push({
-        kind: "muted",
-        text: "Auto-resume is off for this profile; use Resume now, or enable acp.rate_limit_auto_resume.",
-      });
-    }
-  }
-  if (rateLimitRetriesExhausted) {
-    messages.push({
-      kind: "warn",
-      text: "Auto-resume stopped: the same prompt was re-sent too many times without getting through. Resume manually or send a new prompt.",
-    });
-  }
+  const strip = pickStatusStrip({
+    status,
+    hasEverOpened,
+    reconnecting,
+    retryCount,
+    retryCountdown,
+    maxRetries,
+    resumePhase,
+    resumeFailed,
+    conversationReset,
+    lagged,
+    rateLimit,
+    rateLimitAutoResume,
+    rateLimitRetriesExhausted,
+  });
+  if (!strip) return null;
   const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
-  if (messages.length === 0 && !reconnectRetriesExhausted) return null;
+  // Both rate-limit strips describe the same park, so both carry its recovery
+  // affordances, and only while the daemon still reports one.
+  const parked = strip.kind === "rate_limit" || strip.kind === "rate_limit_exhausted";
+  const rateLimitActions = rateLimit !== null && parked;
   return (
-    <div className="border-b border-surface-800 px-4 py-2 space-y-1">
-      {messages.map((m, i) => (
-        <div key={i} className={`text-xs ${m.kind === "warn" ? "text-brand-400" : "text-text-muted"}`}>
-          {m.text}
+    <div className="border-b border-surface-800 px-4 py-2 space-y-1" data-testid={`acp-strip-${strip.kind}`}>
+      {strip.kind === "reconnect_exhausted" || strip.kind === "resume_failed" ? (
+        <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
+          <span>{strip.text}</span>
+          <button
+            type="button"
+            onClick={manualReconnect}
+            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+          >
+            {strip.kind === "resume_failed" ? "Retry" : "Reconnect"}
+          </button>
         </div>
-      ))}
-      {rateLimit && (onResumeRateLimit || onSwitchAgent) && (
+      ) : (
+        <div className={`text-xs ${strip.tier === "error" ? "text-brand-400" : "text-text-muted"}`}>{strip.text}</div>
+      )}
+      {rateLimitActions && (onResumeRateLimit || onSwitchAgent) && (
         <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
           {onResumeRateLimit && (
             <button
@@ -1944,23 +1951,11 @@ export function SystemNotices({
           )}
         </div>
       )}
-      {rateLimit && rateLimitResumeState === "ok" && (
+      {rateLimitActions && rateLimitResumeState === "ok" && (
         <div className="pt-1 text-xs text-text-muted">Resume requested. New events should start streaming shortly.</div>
       )}
-      {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
+      {rateLimitActions && rateLimitResumeState === "failed" && rateLimitResumeError && (
         <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
-      )}
-      {reconnectRetriesExhausted && (
-        <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
-          <span>Connection lost. Auto-retry stopped.</span>
-          <button
-            type="button"
-            onClick={manualReconnect}
-            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
-          >
-            Reconnect
-          </button>
-        </div>
       )}
     </div>
   );

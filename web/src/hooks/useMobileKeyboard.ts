@@ -47,7 +47,10 @@ function createKeyboardStore() {
 
 type KeyboardStore = ReturnType<typeof createKeyboardStore>;
 
-export function useMobileKeyboard() {
+/** `enabled` false leaves the viewport machinery unwired: a suspended session
+ *  view is display:none, so every measurement it could take is meaningless and
+ *  its polling would run for nothing. */
+export function useMobileKeyboard(enabled: boolean = true) {
   const [store] = useState<KeyboardStore>(() => createKeyboardStore());
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
 
@@ -77,7 +80,7 @@ export function useMobileKeyboard() {
   }, [store]);
 
   useEffect(() => {
-    if (!state.isMobile) return;
+    if (!enabled || !state.isMobile) return;
     const vv = window.visualViewport;
     if (!vv) return;
 
@@ -170,7 +173,7 @@ export function useMobileKeyboard() {
       window.removeEventListener("orientationchange", handleOrientationChange);
       window.removeEventListener("scroll", handleViewportChange);
     };
-  }, [state.isMobile, store]);
+  }, [enabled, state.isMobile, store]);
 
   return {
     isMobile: state.isMobile,

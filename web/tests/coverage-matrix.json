@@ -24,6 +24,24 @@
       "components": ["web/src/components/BottomDock.tsx"]
     },
     {
+      "id": "app-shell.session-view-host",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/__tests__/SessionViewHost.test.tsx",
+        "src/lib/keepAliveSet.test.ts",
+        "src/lib/suspendedScroll.test.ts",
+        "src/hooks/useAcpSession.suspend.test.ts"
+      ],
+      "components": [
+        "web/src/components/SessionViewHost.tsx",
+        "web/src/App.tsx",
+        "web/src/lib/keepAliveSet.ts",
+        "web/src/lib/suspendedScroll.ts",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "app-shell.pane-docking",
       "kind": "mocked-playwright",
       "risk": "high",
@@ -2286,6 +2304,22 @@
       ]
     },
     {
+      "id": "acp.status-strip",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/acp/statusStrip.test.ts",
+        "src/components/acp/SystemNotices.test.tsx",
+        "src/hooks/useAcpSession.catchUp.test.ts",
+        "src/hooks/useAcpSession.reset.test.ts"
+      ],
+      "components": [
+        "web/src/components/acp/statusStrip.ts",
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
       "id": "acp.switch-agent-manual",
       "kind": "vitest",
       "risk": "medium",
@@ -2645,8 +2679,11 @@
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": [
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/workerStoppedBanner.test.ts"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/workerStoppedBanner.ts"]
     },
     {
       "id": "acp.startup-error-banner-live",

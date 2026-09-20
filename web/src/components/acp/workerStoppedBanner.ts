@@ -52,3 +52,13 @@ export function pickWorkerStoppedVariant(args: {
 export function showWorkerStoppingBanner(args: { acpWorkerState: string; startupError: string | null }): boolean {
   return args.acpWorkerState === "stopping" && !args.startupError;
 }
+
+/** Whether the startup-error banner speaks for the launch the user is
+ *  watching. `startupError` is folded from the event log and stays set until a
+ *  worker completes its handshake, so a failure the reconciler has already
+ *  moved past outlives itself. While the worker is `resuming` the daemon is
+ *  mid-launch and that record is history: a launch that fails again publishes
+ *  its own `AgentStartupError`, and the worker leaves `resuming` with it. */
+export function showStartupErrorBanner(args: { startupError: string | null; acpWorkerState: string }): boolean {
+  return args.startupError !== null && args.acpWorkerState !== "resuming";
+}

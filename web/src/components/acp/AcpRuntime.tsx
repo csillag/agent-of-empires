@@ -35,7 +35,7 @@ import {
 } from "@assistant-ui/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { useAcpSession } from "../../hooks/useAcpSession";
+import { useAcpSession, type ResumePhase } from "../../hooks/useAcpSession";
 import { isVisiblyBusy } from "../../lib/acpTypes";
 import type {
   ActivityRow,
@@ -79,6 +79,9 @@ interface Props {
    *  has forgotten. The `ClearedTurnsBanner` in `StructuredView` provides
    *  the toggle. See #1101. */
   showClearedTurns?: boolean;
+  /** False while this view is suspended in the keep-alive set: the tree stays
+   *  mounted, the socket and the timers do not. */
+  active?: boolean;
   children: (ctx: AcpContext) => ReactNode;
 }
 
@@ -86,6 +89,12 @@ export interface AcpContext {
   state: AcpState;
   status: ReturnType<typeof useAcpSession>["status"];
   hasEverOpened: boolean;
+  /** Catch-up phase of a resumed view; drives the catching-up strip. */
+  resumePhase: ResumePhase;
+  /** The last resume could not fetch what it missed; the view is behind. */
+  resumeFailed: boolean;
+  /** The transcript was discarded because the conversation was replaced. */
+  conversationReset: boolean;
   /** True while the auto-reconnect backoff is armed between a close
    *  and the next dial. Drives the "Reconnecting (N/MAX) in Xs" copy
    *  in SystemNotices. See #1130. */
@@ -156,18 +165,20 @@ export function AcpRuntime({
   archivedAt = null,
   snoozedUntil = null,
   showClearedTurns = false,
+  active = true,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, active);
   const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
   // Seed from the persisted draft so a staged image survives a session
-  // switch or reload like unsent text does. StructuredView remounts this
-  // runtime per session (`key={sessionId}`), so the initializer runs once
-  // with the right session's attachments and `sessionId` is stable for the
-  // instance lifetime, which keeps the persist effect below race-free.
+  // switch or reload like unsent text does. Every mount of this runtime keeps
+  // one `sessionId` for its whole life (the keep-alive host gives each session
+  // its own layer, and a view that changes session is a new mount), so the
+  // initializer runs once with the right session's attachments and the persist
+  // effect below stays race-free.
   const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
     getDraftAttachments(sessionId),
   );
@@ -310,6 +321,9 @@ export function AcpRuntime({
         state: acp.state,
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
+        resumePhase: acp.resumePhase,
+        resumeFailed: acp.resumeFailed,
+        conversationReset: acp.conversationReset,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

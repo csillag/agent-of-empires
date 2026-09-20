@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showStartupErrorBanner, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
 describe("pickWorkerStoppedVariant", () => {
   it("returns 'none' when the worker is not stopped", () => {
@@ -185,5 +185,23 @@ describe("worker stopping (#3487)", () => {
     for (const [acpWorkerState, startupError, expected] of cases) {
       expect(showWorkerStoppingBanner({ acpWorkerState, startupError })).toBe(expected);
     }
+  });
+});
+
+describe("showStartupErrorBanner", () => {
+  it("shows a startup error against a worker that is not being launched", () => {
+    expect(showStartupErrorBanner({ startupError: "agent spawn failed", acpWorkerState: "absent" })).toBe(true);
+    expect(showStartupErrorBanner({ startupError: "agent spawn failed", acpWorkerState: "running" })).toBe(true);
+  });
+
+  it("stays quiet while the daemon is launching this worker", () => {
+    // The record is a past failure the reconciler has already moved past; the
+    // spawning banner owns the chrome until this launch reports its own
+    // outcome.
+    expect(showStartupErrorBanner({ startupError: "agent spawn failed", acpWorkerState: "resuming" })).toBe(false);
+  });
+
+  it("shows nothing when there is no startup error", () => {
+    expect(showStartupErrorBanner({ startupError: null, acpWorkerState: "absent" })).toBe(false);
   });
 });
