@@ -4,6 +4,12 @@
 // is visible and live; the others stay mounted, hidden and inert, so coming
 // back to one paints its last state, its scroll position and its composer
 // draft at once instead of remounting. The set lives for this page load only.
+//
+// Known limits: App renders the host or the terminal stack, never both, so
+// visiting a terminal session (or a narrow window falling back to the mobile
+// pane) unmounts the host and the set with it. Keeping the cache small is the
+// other one: cycling past the per-session state cache's 32 entries drops a
+// kept session's data, and its resume then hydrates empty.
 
 import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
