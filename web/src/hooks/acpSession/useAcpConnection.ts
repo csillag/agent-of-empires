@@ -221,6 +221,9 @@ export function useAcpConnection(
       settersRef.current.setStatus("closed");
       return;
     }
+    // A resume leaves the status state "closed". Set it with the dial, or the
+    // view reports a dropped socket for the whole handshake.
+    settersRef.current.setStatus("connecting");
     dispatch({ kind: "hydrate", state: cached ?? emptyAcpState() });
     retryCountRef.current = 0;
     let cancelled = false;
