@@ -176,6 +176,30 @@ describe("useAcpSession failed resume", () => {
     expect(result.current.state.activity.map((r) => r.id)).toEqual(shown);
   });
 
+  it("clears a stale failure when the hook reopens a session cold", async () => {
+    const { result, rerender } = renderHook(
+      ({ sessionId, active }: { sessionId: string; active: boolean }) =>
+        useAcpSession(sessionId, "running", null, null, active),
+      { initialProps: { sessionId: "sess-cu", active: true } },
+    );
+    await flush();
+    rerender({ sessionId: "sess-cu", active: false });
+    await flush();
+    failWarm = true;
+    rerender({ sessionId: "sess-cu", active: true });
+    await flush();
+    expect(result.current.resumeFailed).toBe(true);
+
+    // A cold open has nothing to catch up on, so the failure of the last
+    // resume cannot still be on screen.
+    failWarm = false;
+    rerender({ sessionId: "sess-cu-2", active: true });
+    await flush();
+
+    expect(result.current.state.lastSeq).toBe(10);
+    expect(result.current.resumeFailed).toBe(false);
+  });
+
   it("clears the flag on the next resume that gets through", async () => {
     const { result, rerender } = renderHook(
       ({ active }: { active: boolean }) => useAcpSession("sess-cu", "running", null, null, active),

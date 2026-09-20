@@ -1282,7 +1282,9 @@ export function useAcpSession(
     async (sid: string) => {
       if (lastSeqRef.current === 0) {
         // A cold open has nothing to catch up on; its own "starting" strip
-        // covers the wait.
+        // covers the wait, and an older resume's failure is no longer this
+        // view's story.
+        setResumeFailedRef.current(false);
         await fetchReplayPages(sid);
         return;
       }
