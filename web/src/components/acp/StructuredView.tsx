@@ -466,12 +466,12 @@ function AcpChrome({
     const d = promptRepinDecision({
       seen: seenPromptSeqRef.current,
       promptSeq: state.promptSeq,
-      live: hasEverOpened,
+      live: status === "open",
       localInflight,
     });
     seenPromptSeqRef.current = d.seen;
     if (d.pin) pinToBottom("auto");
-  }, [state.promptSeq, hasEverOpened, localInflight, pinToBottom]);
+  }, [state.promptSeq, status, localInflight, pinToBottom]);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.
