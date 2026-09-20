@@ -166,8 +166,7 @@ async function flushAsync(): Promise<void> {
 }
 
 /** Records every fetch so tests can assert which endpoint was hit. Maintains a
- *  tiny in-memory server queue so GET /queue reflects prior POSTs (for the
- *  migration + hydrate paths). */
+ *  tiny in-memory server queue so GET /queue reflects prior POSTs. */
 interface Recorded {
   method: string;
   url: string;
@@ -347,15 +346,18 @@ describe("useAcpSession server-queue integration", () => {
     expect(calls.some((c) => c.method === "DELETE" && /\/queue$/.test(c.url.split("?")[0]!))).toBe(true);
   });
 
-  it("migrates local rows to the server and hydrates from the snapshot on connect", async () => {
-    // Pre-seed a local optimistic row (as a reload would restore), then connect.
-    // The migration POSTs it to the server; the hydrate list then reflects it.
-    serverQueue.set("pre", { id: "pre", seq: 0, text: "migrated", created_at: "2026-01-01T00:00:00.000Z" });
-    const { result } = await openSession("sess-migrate");
+  it("hydrates from the server snapshot on connect without re-posting anything (#4021)", async () => {
+    // The connect path used to re-POST every locally-held row to migrate
+    // pre-server-queue queues. Those rows came out of localStorage, which
+    // could hold a prompt the server had already drained, and the upsert has
+    // no tombstone, so the migration re-sent it. The server list is the only
+    // source now.
+    serverQueue.set("pre", { id: "pre", seq: 0, text: "already queued", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-hydrate");
     await flushAsync();
-    // GET /queue ran on connect and hydrated the row.
     expect(queueCalls("/queue").some((c) => c.method === "GET")).toBe(true);
-    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["migrated"]);
+    expect(queueCalls("/queue").filter((c) => c.method === "POST")).toHaveLength(0);
+    expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["already queued"]);
   });
 
   // Regression tests for `sendQueuedNow`, the "Send now" affordance on a
@@ -364,8 +366,8 @@ describe("useAcpSession server-queue integration", () => {
   // duplicate a prompt.
   it("does not resend a queued row whose attachment bytes live only on the server", async () => {
     // A row hydrated from the server (any reload, or a second device) carries
-    // attachment metadata with an empty `dataB64`: localStorage drops
-    // attachment-carrying rows and the server sends refs, not blobs.
+    // attachment metadata with an empty `dataB64`: the server sends refs, not
+    // blobs.
     serverQueue.set("img", {
       id: "img",
       seq: 0,

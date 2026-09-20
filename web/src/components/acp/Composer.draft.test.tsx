@@ -23,9 +23,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { AssistantRuntimeProvider, useExternalStoreRuntime, type ThreadMessageLike } from "@assistant-ui/react";
 
+import type { QueuedPrompt } from "../../lib/acpTypes";
 import { Composer } from "./Composer";
 
-function HarnessComposer({ sessionId }: { sessionId: string }) {
+function HarnessComposer({ sessionId, queuedPrompts = [] }: { sessionId: string; queuedPrompts?: QueuedPrompt[] }) {
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
     messages: [],
     isRunning: false,
@@ -52,13 +53,20 @@ function HarnessComposer({ sessionId }: { sessionId: string }) {
         promptCapabilities={null}
         pendingAttachments={[]}
         setPendingAttachments={() => {}}
+        queuedPrompts={queuedPrompts}
+        editQueuedPrompt={() => {}}
       />
     </AssistantRuntimeProvider>
   );
 }
 
-function mountComposer(sessionId: string) {
-  const utils = render(<HarnessComposer sessionId={sessionId} />);
+function setVisibility(state: DocumentVisibilityState): void {
+  Object.defineProperty(document, "visibilityState", { value: state, configurable: true });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
+function mountComposer(sessionId: string, queuedPrompts: QueuedPrompt[] = []) {
+  const utils = render(<HarnessComposer sessionId={sessionId} queuedPrompts={queuedPrompts} />);
   const textarea = utils.container.querySelector("textarea");
   if (!textarea) throw new Error("composer textarea not rendered");
   return { ...utils, textarea };
@@ -108,6 +116,7 @@ afterEach(() => {
   // Unmount before restoring real timers so the unmount flush in the
   // draft effect does not race the next test's storage assertions.
   cleanup();
+  Object.defineProperty(document, "visibilityState", { value: "visible", configurable: true });
   vi.useRealTimers();
   vi.unstubAllGlobals();
   window.localStorage.clear();
@@ -179,6 +188,104 @@ describe("Composer per-session draft persistence", () => {
     const back = mountComposer("sess-send");
     await flushComposer();
     expect(back.textarea.value).toBe("");
+  });
+
+  // #4021: queued prompts are no longer persisted and are never re-posted,
+  // so an unload is the last chance to keep a prompt the server never
+  // confirmed. It comes back as draft text, not as a silent re-send.
+  it("folds an unconfirmed queued prompt into the draft on page unload", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q1", text: "server took this", queuedAt: "2026-01-01T00:00:00.000Z" },
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-rescue", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-rescue")).toBe("server never took this\n\nstill typing");
+  });
+
+  // The unload sequence fires pagehide first and flips visibility to hidden
+  // after it, so a plain flush on hidden would land last and drop the rescue.
+  it("keeps the rescue when visibility flips to hidden after pagehide", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-order", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      window.dispatchEvent(new Event("pagehide"));
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-order")).toBe("server never took this\n\nstill typing");
+  });
+
+  // iOS Safari fires pagehide only on a real unload, so an app switch that
+  // ends in the tab being evicted gets no other warning.
+  it("rescues on hidden alone, with no pagehide (the iOS shape)", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-ios", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-ios")).toBe("server never took this\n\nstill typing");
+  });
+
+  // A beforeunload the user cancels never reaches a `visible` transition, so
+  // the latch has to time out or the next real hide is dropped silently.
+  it("recovers from a cancelled unload so a later hide still rescues", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea } = mountComposer("sess-cancelled", queued);
+    fireEvent.change(textarea, { target: { value: "before the false alarm" } });
+    act(() => {
+      window.dispatchEvent(new Event("beforeunload"));
+    });
+    // The navigation is cancelled: the page lives on and never goes visible
+    // again, because it never stopped being visible.
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+
+    fireEvent.change(textarea, { target: { value: "typed after the false alarm" } });
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-cancelled")).toBe(
+      "server never took this\n\ntyped after the false alarm",
+    );
+  });
+
+  it("re-arms on return to the foreground so a second hide still flushes", () => {
+    const { textarea } = mountComposer("sess-rearm");
+    fireEvent.change(textarea, { target: { value: "first" } });
+    act(() => {
+      setVisibility("hidden");
+      setVisibility("visible");
+    });
+    fireEvent.change(textarea, { target: { value: "first and second" } });
+    act(() => {
+      setVisibility("hidden");
+    });
+    expect(window.localStorage.getItem("acp:draft:sess-rearm")).toBe("first and second");
+  });
+
+  it("leaves the queue out of the plain unmount flush, where the rows survive", () => {
+    const queued: QueuedPrompt[] = [
+      { id: "q2", text: "server never took this", queuedAt: "2026-01-01T00:00:01.000Z", pending: true },
+    ];
+    const { textarea, unmount } = mountComposer("sess-switch", queued);
+    fireEvent.change(textarea, { target: { value: "still typing" } });
+    unmount();
+    expect(window.localStorage.getItem("acp:draft:sess-switch")).toBe("still typing");
   });
 
   it("flushes the pending debounced write on unmount so a fast switch loses nothing", () => {

@@ -16,18 +16,7 @@ function entryKey(id: string): string {
 }
 
 function writeEntry(id: string, queued: number, savedAt = Date.now()): void {
-  const queuedPrompts = Array.from({ length: queued }, (_, i) => ({
-    id: `${id}-${i}`,
-    text: `q${i}`,
-    queuedAt: "t",
-  }));
-  localStorage.setItem(
-    entryKey(id),
-    JSON.stringify({
-      savedAt,
-      state: { lastSeq: 0, activity: [], queuedPrompts },
-    }),
-  );
+  localStorage.setItem(entryKey(id), JSON.stringify({ savedAt, queuedCount: queued }));
 }
 
 beforeEach(() => {
@@ -70,7 +59,7 @@ describe("getQueuedCount", () => {
     expect(getQueuedCount("a")).toBe(0);
   });
 
-  it("treats an entry without a queuedPrompts array as 0", () => {
+  it("treats an entry without a numeric queuedCount as 0", () => {
     localStorage.setItem(entryKey("a"), JSON.stringify({ savedAt: Date.now(), state: { lastSeq: 0 } }));
     expect(getQueuedCount("a")).toBe(0);
   });
@@ -135,14 +124,7 @@ describe("subscribeAcpState storage events", () => {
     window.dispatchEvent(
       new StorageEvent("storage", {
         key: entryKey("a"),
-        newValue: JSON.stringify({
-          savedAt: Date.now(),
-          state: {
-            lastSeq: 0,
-            activity: [],
-            queuedPrompts: [{ id: "a-0", text: "x", queuedAt: "t" }],
-          },
-        }),
+        newValue: JSON.stringify({ savedAt: Date.now(), queuedCount: 1 }),
         storageArea: localStorage,
       }),
     );

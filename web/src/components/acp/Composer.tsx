@@ -38,7 +38,7 @@ import type {
   PromptCapabilities,
   QueuedPrompt,
 } from "../../lib/acpTypes";
-import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib/acpDrafts";
+import { clearDraft, clearDraftAttachments, getDraft, setDraft, unsentDraftOnUnload } from "../../lib/acpDrafts";
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
@@ -548,6 +548,12 @@ export function Composer({
   useEffect(() => {
     draftTextRef.current = composerText;
   }, [composerText]);
+  // Mirrored so the unload listeners read the current queue without being
+  // re-registered on every queue change.
+  const queuedPromptsRef = useRef(queuedPrompts);
+  useEffect(() => {
+    queuedPromptsRef.current = queuedPrompts;
+  }, [queuedPrompts]);
   const composerRuntime = useMemo<ComposerClient>(
     () => ({
       getState: () => composerRef.current.getState(),
@@ -837,19 +843,50 @@ export function Composer({
     // OS evicting the tab. Without these listeners, whatever the debounce
     // below is still holding at the moment the page dies is lost; on a fast
     // typer that's the last sentence or two of the draft (#1358).
-    // visibilitychange covers iOS Safari, which fires pagehide only on
-    // real unload, not on app-switch.
     const flush = () => setDraft(sessionId, draftTextRef.current);
-    const onHidden = () => {
-      if (document.visibilityState === "hidden") flush();
+    // Every listener that can be the last writer before the page dies has to
+    // rescue queued prompts the server never confirmed: nothing persists them
+    // any more, and re-posting one on the next load can re-send a prompt the
+    // server already drained (#4021). That includes the hidden handler,
+    // because visibility flips to hidden *after* pagehide on a same-tab
+    // navigation, so a plain flush there would land last and drop the rescue;
+    // on iOS Safari, where pagehide fires only on a real unload, hidden is the
+    // only warning an evicted tab ever gets. The latch keeps the second one a
+    // no-op. Only the unmount cleanup stays plain: the queue rows survive it
+    // in memory and are still on screen.
+    let unloaded = false;
+    let unlatch: ReturnType<typeof setTimeout> | undefined;
+    const unloadFlush = () => {
+      unloaded = true;
+      // Self-heal the latch. A real unload fires pagehide and the hidden
+      // transition inside one task, so no macrotask can land between them,
+      // but a beforeunload the user then cancels never reaches a `visible`
+      // transition to clear the latch: browsers hold visibility while the
+      // dialog is up. Without this the next genuine hide would be dropped
+      // and anything typed after the false alarm would have no rescue.
+      clearTimeout(unlatch);
+      unlatch = setTimeout(() => {
+        unloaded = false;
+      }, 0);
+      setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
     };
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
-    document.addEventListener("visibilitychange", onHidden);
+    const onVisibility = () => {
+      if (document.visibilityState !== "hidden") {
+        // Foreground again (app switch back, bfcache restore): re-arm, or a
+        // later hide would skip the flush #1358 needs.
+        unloaded = false;
+        return;
+      }
+      if (!unloaded) unloadFlush();
+    };
+    window.addEventListener("beforeunload", unloadFlush);
+    window.addEventListener("pagehide", unloadFlush);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
-      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("beforeunload", unloadFlush);
+      window.removeEventListener("pagehide", unloadFlush);
+      document.removeEventListener("visibilitychange", onVisibility);
+      clearTimeout(unlatch);
       flush();
     };
   }, [composerRuntime, sessionId]);
