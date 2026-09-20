@@ -15,6 +15,7 @@ export function SessionBanners({
   snoozedUntil,
   onRestore,
   dismissError,
+  active = true,
 }: {
   sessionId: string;
   state: AcpState;
@@ -24,6 +25,8 @@ export function SessionBanners({
   snoozedUntil: string | null;
   onRestore?: () => Promise<boolean> | void;
   dismissError: () => void;
+  /** Suspended views run no countdown timer. */
+  active?: boolean;
 }) {
   const variant = pickWorkerStoppedVariant({
     workerStopped: state.workerStopped,
@@ -61,7 +64,7 @@ export function SessionBanners({
           </PulseBanner>
         ))}
       {showWorkerStoppingBanner({ acpWorkerState, startupError: state.startupError }) && <WorkerStoppingBanner />}
-      {state.nextWakeupAt && idle && (
+      {active && state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}
       {state.monitorArmed && !state.nextWakeupAt && idle && (

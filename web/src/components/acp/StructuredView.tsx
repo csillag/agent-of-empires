@@ -254,6 +254,7 @@ function AcpChrome({
         snoozedUntil={view.snoozedUntil}
         onRestore={view.onRestore}
         dismissError={ctx.dismissError}
+        active={active}
       />
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
