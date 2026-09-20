@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { useRespawnSession } from "../../hooks/useRespawnSession";
 import type { AcpState } from "../../lib/acpTypes";
 import { StartupErrorBanner } from "./StartupErrorBanner";
-import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showStartupErrorBanner, showWorkerStoppingBanner } from "./workerStoppedBanner";
 
 /** Worker lifecycle and triage banners stacked above the transcript. */
 export function SessionBanners({
@@ -37,7 +37,9 @@ export function SessionBanners({
   const idle = healthy && !state.turnActive;
   return (
     <>
-      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
+      {showStartupErrorBanner({ startupError: state.startupError, acpWorkerState }) && state.startupError && (
+        <StartupErrorBanner sessionId={sessionId} message={state.startupError} />
+      )}
       {variant === "trashed" && <TrashedWorkerStoppedBanner sessionId={sessionId} onRestore={onRestore} />}
       {variant === "archived" && <ArchivedWorkerStoppedBanner sessionId={sessionId} />}
       {variant === "snoozed" && snoozedUntil && (
@@ -48,7 +50,8 @@ export function SessionBanners({
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {acpWorkerState === "resuming" &&
-        healthy &&
+        !state.workerStopped &&
+        !state.workerRestarting &&
         (state.lastSeq === 0 ? (
           <PulseBanner>Starting structured view worker for new session… this can take a few seconds.</PulseBanner>
         ) : (
