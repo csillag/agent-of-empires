@@ -2665,8 +2665,11 @@
       "id": "acp.startup-error-banner",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/__tests__/StartupErrorBanner.test.tsx"],
-      "components": ["web/src/components/acp/StructuredView.tsx"]
+      "specs": [
+        "src/components/acp/__tests__/StartupErrorBanner.test.tsx",
+        "src/components/acp/workerStoppedBanner.test.ts"
+      ],
+      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/workerStoppedBanner.ts"]
     },
     {
       "id": "acp.startup-error-banner-live",

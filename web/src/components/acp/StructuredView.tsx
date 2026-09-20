@@ -51,7 +51,7 @@ import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
-import { pickWorkerStoppedVariant, showWorkerStoppingBanner } from "./workerStoppedBanner";
+import { pickWorkerStoppedVariant, showStartupErrorBanner, showWorkerStoppingBanner } from "./workerStoppedBanner";
 import { pickStatusStrip } from "./statusStrip";
 import { BackgroundAgentsContext } from "./backgroundAgentsContext";
 import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
@@ -803,7 +803,9 @@ function AcpChrome({
         )}
       </RateLimitRecoverySection>
 
-      {state.startupError && <StartupErrorBanner sessionId={sessionId} message={state.startupError} />}
+      {showStartupErrorBanner({ startupError: state.startupError, acpWorkerState }) && (
+        <StartupErrorBanner sessionId={sessionId} message={state.startupError!} />
+      )}
       {(() => {
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
@@ -831,7 +833,6 @@ function AcpChrome({
         <WorkerRestartingBanner agentUnresponsive={state.agentUnresponsive} agentOrphaned={state.agentOrphaned} />
       )}
       {acpWorkerState === "resuming" &&
-        !state.startupError &&
         !state.workerStopped &&
         !state.workerRestarting &&
         (state.lastSeq === 0 ? <SpawningBanner /> : <WorkerResumingBanner />)}
