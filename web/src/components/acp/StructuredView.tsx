@@ -37,6 +37,7 @@ import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta }
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { recallScroll, rememberScroll } from "../../lib/suspendedScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { nextStick } from "../../lib/stickToBottom";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
@@ -410,6 +411,10 @@ function AcpChrome({
   // smooth scroll bypasses it; it only moves down, which never un-sticks.
   // See stickToBottom.ts.
   const lastScrollTopRef = useRef(0);
+  // The observers below outlive a suspension; a zero-sized hidden viewport must
+  // not be mistaken for a reader who scrolled. The handoff effect owns the
+  // write, so the ref also holds the previous value it compares against.
+  const activeScrollRef = useRef(active);
   const setScrollTop = useCallback((vp: HTMLElement, top: number) => {
     vp.scrollTop = top;
     lastScrollTopRef.current = vp.scrollTop;
@@ -638,7 +643,7 @@ function AcpChrome({
     // Re-pin on two elements: the chrome below the viewport (composer, queued
     // strips) and the viewport itself, because chrome *outside* this view can
     // resize it too (the App's header collapse).
-    const wasAtBottom = () => wasAtBottomRef.current;
+    const wasAtBottom = () => activeScrollRef.current && wasAtBottomRef.current;
     const repin = () => setScrollTop(vp, vp.scrollHeight);
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
@@ -653,6 +658,7 @@ function AcpChrome({
     //     bottom-following path; the viewport primitive's competing auto-scroll
     //     intent is disabled below.
     const contentRo = new ResizeObserver(() => {
+      if (!activeScrollRef.current) return;
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
@@ -677,6 +683,35 @@ function AcpChrome({
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
   }, [requestEarlierHistory, isCoarse, sessionId, setScrollTop]);
+
+  // Suspend / resume scroll handoff. On the way out the position comes from the
+  // sampler's record, not the DOM: by the time this runs the view is already
+  // display:none and reports zero. On the way back it is reapplied across the
+  // frames in which markdown, tool cards and images settle, the same ladder the
+  // mount-time restore uses.
+  useLayoutEffect(() => {
+    if (active === activeScrollRef.current) return;
+    activeScrollRef.current = active;
+    if (!active) {
+      rememberScroll(sessionId, { stuck: wasAtBottomRef.current, top: lastScrollTopRef.current });
+      return;
+    }
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const saved = recallScroll(sessionId);
+    if (saved) wasAtBottomRef.current = saved.stuck;
+    const apply = () => {
+      const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
+      if (top != null) setScrollTop(vp, top);
+    };
+    apply();
+    requestAnimationFrame(() => {
+      // The reactive mirror only drives the jump-to-bottom button, so it is set
+      // off the effect body rather than cascading a render out of the restore.
+      setAtBottom(wasAtBottomRef.current);
+      requestAnimationFrame(apply);
+    });
+  }, [active, sessionId, setScrollTop]);
 
   // Hold the bottom pin across a chrome transition that resizes the viewport:
   // the soft keyboard opening/closing, and the composer ("hide text input")
