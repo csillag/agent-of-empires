@@ -30,6 +30,9 @@ interface Props {
   snoozedUntil?: string | null;
   /** Render rows before the latest `/clear` instead of folding them. */
   showClearedTurns?: boolean;
+  /** False while this view is suspended in the keep-alive set: the tree stays
+   *  mounted, the socket and the timers do not. */
+  active?: boolean;
   children: (ctx: AcpContext) => ReactNode;
 }
 
@@ -109,9 +112,10 @@ export function AcpRuntime({
   archivedAt = null,
   snoozedUntil = null,
   showClearedTurns = false,
+  active = true,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, active);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const onCancel = useCancelEscalation(

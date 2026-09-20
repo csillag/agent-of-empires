@@ -20,6 +20,7 @@ export function useTranscriptScroll({
   promptSeq,
   hasEverOpened,
   localInflight,
+  active = true,
 }: {
   sessionId: string;
   canLoadEarlierHistory: boolean;
@@ -31,6 +32,8 @@ export function useTranscriptScroll({
   hasEverOpened: boolean;
   /** This client has an optimistic prompt row still awaiting its server echo. */
   localInflight: boolean;
+  /** Suspended views do not poll the visual viewport. */
+  active?: boolean;
 }) {
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
@@ -46,7 +49,7 @@ export function useTranscriptScroll({
   const lastAtBottomAtRef = useRef(0);
   const didRestoreScrollRef = useRef(false);
   const [atBottom, setAtBottom] = useState(true);
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
   const isCoarse = useIsCoarsePointer();
 
   /** An explicit "stick again": a programmatic scroll fires no gesture, so set

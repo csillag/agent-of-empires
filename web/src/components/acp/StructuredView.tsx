@@ -59,6 +59,9 @@ interface Props {
   fileRefSession?: FileRefSession | null;
   isSandboxed?: boolean;
   onOpenAgentsPane?: () => void;
+  /** False while this view sits suspended: it renders its last state and
+   *  holds no socket, spinner, or keyboard polling. */
+  active?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -68,8 +71,17 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, clearAliases, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } =
-    props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    clearAliases,
+    archivedAt,
+    snoozedUntil,
+    onOpenFileRef,
+    fileRefSession,
+    active = true,
+  } = props;
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
@@ -82,6 +94,7 @@ export function StructuredView(props: Props) {
             archivedAt={archivedAt}
             snoozedUntil={snoozedUntil}
             showClearedTurns={showClearedTurns}
+            active={active}
           >
             {(ctx) => (
               <BackgroundAgentsContext.Provider
@@ -112,8 +125,14 @@ export function structuredViewRootStyle(keyboardHeight: number): React.CSSProper
 
 /** Flex root publishing the keyboard reservation and both conversation font
  *  sizes (as rem); `index.css` picks the active size. */
-export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
-  const { keyboardHeight } = useMobileKeyboard();
+export function StructuredViewRoot({
+  active = true,
+  children,
+}: {
+  active?: boolean;
+  children: React.ReactNode;
+}) {
+  const { keyboardHeight } = useMobileKeyboard(active);
   const { settings } = useWebSettings();
   return (
     <div
@@ -151,7 +170,7 @@ function AcpChrome({
   toolDensity,
   onToggleToolDensity,
 }: ChromeProps) {
-  const { sessionId, acpWorkerState, acpAgent } = view;
+  const { sessionId, acpWorkerState, acpAgent, active = true } = view;
   const { state, status } = ctx;
   // Rows before the latest `/clear` divider are the hidden history.
   const hiddenCount = lastClearIndex(state.activity);
@@ -181,6 +200,7 @@ function AcpChrome({
     promptSeq: state.promptSeq,
     hasEverOpened: ctx.hasEverOpened,
     localInflight: state.inflightPromptIds.length > 0,
+    active,
   });
 
   // An adapter that failed the compatibility check never runs, so no chat surface.
@@ -192,7 +212,7 @@ function AcpChrome({
     );
   }
   return (
-    <StructuredViewRoot>
+    <StructuredViewRoot active={active}>
       <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
       <PlanStrip plan={state.plan} />
 
@@ -284,7 +304,7 @@ function AcpChrome({
 
               <ThreadPrimitive.If running>
                 {/* A turn parked on an approval or question is waiting on the user, not stalled. */}
-                {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                {active && state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
                   <div className="mt-3 ml-1">
                     <WorkingSpinner
                       thinking={state.thinking}
@@ -369,7 +389,7 @@ function ComposerDock({
   collapsed: boolean;
   onToggleCollapsed: () => void;
 }) {
-  const { sessionId, acpWorkerState, acpAgent } = view;
+  const { sessionId, acpWorkerState, acpAgent, active = true } = view;
   const { state, status } = ctx;
   return (
     <>
@@ -449,6 +469,7 @@ function ComposerDock({
           primerPrefill={primerPrefill}
           queuedPrompts={state.queuedPrompts}
           editQueuedPrompt={ctx.editQueuedPrompt}
+          active={active}
         />
       </CollapsibleRegion>
     </>

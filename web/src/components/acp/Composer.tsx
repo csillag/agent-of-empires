@@ -86,13 +86,15 @@ interface Props {
   /** Oldest first; source for ArrowUp/ArrowDown recall. */
   queuedPrompts: QueuedPrompt[];
   editQueuedPrompt: (id: string, text: string) => void;
+  /** Suspended views do not poll the visual viewport. */
+  active?: boolean;
 }
 
 const POPOVER_CLASS =
   "absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl";
 
 export function Composer(props: Props) {
-  const { sessionId, turnActive, connected, promptCapabilities, queuedPrompts } = props;
+  const { sessionId, turnActive, connected, promptCapabilities, queuedPrompts, active = true } = props;
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { client, composerText, draftTextRef } = useComposerClient();
@@ -101,7 +103,7 @@ export function Composer(props: Props) {
   const { fileAdapter, slashAdapter } = useTriggerAdapters(sessionId, props.availableCommands);
   const skillIndex = useSkillIndex();
   const isMobile = useIsMobileInput();
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
   // Regular iOS Safari already lifts the composer by keyboardHeight; only the PWA needs this.
   const iosPwa = useMemo(() => isIOS() && isStandalone(), []);
   const recall = useQueueRecall(queuedPrompts, client, loadText);
