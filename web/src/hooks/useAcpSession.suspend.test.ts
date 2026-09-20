@@ -140,6 +140,30 @@ describe("useAcpSession suspended mode", () => {
     expect(replayCalls.filter((u) => u.includes("since=") && !u.includes("view=rows"))).toHaveLength(1);
   });
 
+  it("reports a resume as connecting, not as a dropped socket", async () => {
+    const { result, rerender } = renderHook(
+      ({ active }: { active: boolean }) => useAcpSession("sess-suspend", "running", null, null, active),
+      { initialProps: { active: true } },
+    );
+    await flush();
+    act(() => sockets[0]!.onopen?.(new Event("open")));
+    expect(result.current.status).toBe("open");
+
+    rerender({ active: false });
+    await flush();
+    expect(result.current.status).toBe("closed");
+
+    rerender({ active: true });
+    await flush();
+    // The replay has landed and the socket is dialling. Saying "closed" here
+    // puts a "new messages disabled" strip over a view that is coming back.
+    expect(sockets).toHaveLength(2);
+    expect(result.current.status).toBe("connecting");
+
+    act(() => sockets[1]!.onopen?.(new Event("open")));
+    expect(result.current.status).toBe("open");
+  });
+
   it("ignores a visibility wakeup while suspended, and takes one once resumed", async () => {
     const { rerender } = renderHook(
       ({ active }: { active: boolean }) => useAcpSession("sess-suspend", "running", null, null, active),

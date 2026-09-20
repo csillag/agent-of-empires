@@ -1384,6 +1384,10 @@ export function useAcpSession(
       state: cacheGet(sessionId) ?? emptyAcpState(),
     });
     statusRef.current = "connecting";
+    // The state, not just the ref: a resumed view sets the status state to
+    // "closed" on suspend, and leaving it there reports a dropped socket for
+    // the whole handshake.
+    setStatusRef.current("connecting");
     retryCountRef.current = 0;
 
     // Set up cancellation so the cleanup function can stop a pending
