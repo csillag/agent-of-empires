@@ -259,6 +259,9 @@ export function useAcpConnection(
 
     const replay = async () => {
       if (lastSeqRef.current === 0) {
+        // A cold open has nothing to catch up on, and an older resume's
+        // failure is no longer this view's story.
+        setResumeFailed(false);
         await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
         return;
       }
