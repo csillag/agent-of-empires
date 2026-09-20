@@ -5,13 +5,21 @@
 // back to one paints its last state, its scroll position and its composer
 // draft at once instead of remounting. The set lives for this page load only.
 
-import { lazy, useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 
 import { KEEP_ALIVE_CAP, insertMru, pruneKept, renderOrder, sameIds } from "../lib/keepAliveSet";
 import type { FileRef } from "../lib/fileRef";
 import type { SessionResponse } from "../lib/types";
 
 const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
+
+function AcpLoadingFallback() {
+  return (
+    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
+      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
+    </div>
+  );
+}
 
 interface Props {
   activeSessionId: string;
@@ -59,23 +67,27 @@ export function SessionViewHost({
             hidden={!isActive}
             inert={!isActive}
           >
-            <StructuredView
-              sessionId={id}
-              active={isActive}
-              acpWorkerState={session.acp_worker_state ?? "absent"}
-              rateLimitAutoResume={session.rate_limit_auto_resume}
-              tool={session.tool}
-              acpAgent={session.acp_agent ?? null}
-              clearAliases={session.clear_aliases}
-              archivedAt={session.archived_at ?? null}
-              snoozedUntil={session.snoozed_until ?? null}
-              trashedAt={session.trashed_at ?? null}
-              onRestore={session.trashed_at ? () => onRestoreSession(id) : undefined}
-              onOpenFileRef={onOpenFileRef}
-              fileRefSession={session}
-              onOpenAgentsPane={onOpenAgentsPane}
-              isSandboxed={session.is_sandboxed}
-            />
+            {/* One boundary per layer: a view still loading must not take the
+                tree of the view on screen down with it. */}
+            <Suspense fallback={isActive ? <AcpLoadingFallback /> : null}>
+              <StructuredView
+                sessionId={id}
+                active={isActive}
+                acpWorkerState={session.acp_worker_state ?? "absent"}
+                rateLimitAutoResume={session.rate_limit_auto_resume}
+                tool={session.tool}
+                acpAgent={session.acp_agent ?? null}
+                clearAliases={session.clear_aliases}
+                archivedAt={session.archived_at ?? null}
+                snoozedUntil={session.snoozed_until ?? null}
+                trashedAt={session.trashed_at ?? null}
+                onRestore={session.trashed_at ? () => onRestoreSession(id) : undefined}
+                onOpenFileRef={onOpenFileRef}
+                fileRefSession={session}
+                onOpenAgentsPane={onOpenAgentsPane}
+                isSandboxed={session.is_sandboxed}
+              />
+            </Suspense>
           </div>
         );
       })}

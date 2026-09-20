@@ -5,17 +5,53 @@
 // WebSocket, so it is stubbed down to a probe that reports its id and its
 // active flag.
 
-import { Suspense } from "react";
-import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { Suspense, useEffect } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
 
 import type { SessionResponse } from "../../lib/types";
 
+// Sessions whose view has not finished loading. Rendering one throws its
+// promise, the way a lazy chunk or a `use()` does, until the test releases it.
+const loading = new Map<string, Promise<void>>();
+// Session ids whose probe has a live effect, so a test can tell a view that
+// stayed mounted from one React tore down to show a fallback.
+const live = new Set<string>();
+
+function holdView(sessionId: string): () => void {
+  let release = () => {};
+  const pending = new Promise<void>((resolve) => {
+    release = () => {
+      loading.delete(sessionId);
+      resolve();
+    };
+  });
+  loading.set(sessionId, pending);
+  return release;
+}
+
+function Probe({ sessionId, active }: { sessionId: string; active?: boolean }) {
+  useEffect(() => {
+    live.add(sessionId);
+    return () => {
+      live.delete(sessionId);
+    };
+  }, [sessionId]);
+  return <div data-testid={`view-${sessionId}`} data-active={String(active)} />;
+}
+
 vi.mock("../acp/StructuredView", () => ({
-  StructuredView: ({ sessionId, active }: { sessionId: string; active?: boolean }) => (
-    <div data-testid={`view-${sessionId}`} data-active={String(active)} />
-  ),
+  StructuredView: ({ sessionId, active }: { sessionId: string; active?: boolean }) => {
+    const pending = loading.get(sessionId);
+    if (pending) throw pending;
+    return <Probe sessionId={sessionId} active={active} />;
+  },
 }));
+
+afterEach(() => {
+  loading.clear();
+  live.clear();
+});
 
 import { SessionViewHost } from "../SessionViewHost";
 
@@ -179,5 +215,37 @@ describe("SessionViewHost", () => {
   it("keeps the session on screen even when it is trashed", async () => {
     mount("a", [session("a", { trashed_at: "2026-09-20T10:00:00Z" })]);
     expect((await screen.findByTestId("view-a")).dataset.active).toBe("true");
+  });
+
+  it("keeps the visible view mounted while a newly added layer is still loading", async () => {
+    const sessions = [session("a"), session("b")];
+    const { rerender } = mount("a", sessions);
+    await screen.findByTestId("view-a");
+    expect(live.has("a")).toBe(true);
+
+    const release = holdView("b");
+    rerender(
+      <Suspense fallback={null}>
+        <SessionViewHost
+          activeSessionId="b"
+          sessions={sessions}
+          onOpenFileRef={() => {}}
+          onOpenAgentsPane={() => {}}
+          onRestoreSession={() => {}}
+        />
+      </Suspense>,
+    );
+
+    // A layer that suspends must not take the layer on screen with it. React
+    // keeps a hidden boundary's tree mounted, so the effects survive either
+    // way; the display check is what catches the view going blank.
+    expect(live.has("a")).toBe(true);
+    expect(layerOf("a").style.display).not.toBe("none");
+
+    await act(async () => {
+      release();
+    });
+    expect(await screen.findByTestId("view-b")).toBeDefined();
+    expect(live.has("a")).toBe(true);
   });
 });

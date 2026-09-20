@@ -1,4 +1,4 @@
-import { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS } from "./lib/session";
@@ -1859,15 +1859,13 @@ function AppContent({
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
                   {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <SessionViewHost
-                        activeSessionId={activeSessionId!}
-                        sessions={sessions}
-                        onOpenFileRef={handleOpenFileRef}
-                        onOpenAgentsPane={openAgentsPane}
-                        onRestoreSession={(id) => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, id))}
-                      />
-                    </Suspense>
+                    <SessionViewHost
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions}
+                      onOpenFileRef={handleOpenFileRef}
+                      onOpenAgentsPane={openAgentsPane}
+                      onRestoreSession={(id) => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, id))}
+                    />
                   ) : (
                     <TerminalSessionStack
                       activeSessionId={activeSessionId!}
@@ -2384,13 +2382,5 @@ function AppContent({
         />
       </div>
     </AcpPrefsProvider>
-  );
-}
-
-function AcpLoadingFallback() {
-  return (
-    <div className="flex h-full items-center justify-center bg-surface-900 text-text-dim">
-      <div className="text-xs font-mono uppercase tracking-wide">Loading acp…</div>
-    </div>
   );
 }
