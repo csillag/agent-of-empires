@@ -265,23 +265,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(model) = model.clone() {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
         }
+        let session_dirs = crate::session::session_dirs::usable(&req.session_dirs);
         // The session's directory list. A host agent also gets it in its
         // environment, where a self-sandboxing agent's launcher reads it; a
         // container-sandboxed agent sees container paths, so it gets neither
         // the environment nor the read-only marking.
         let mut additional_dirs = req.additional_dirs.clone();
-        for path in crate::session::session_dirs::all_paths(&req.session_dirs) {
+        for path in crate::session::session_dirs::all_paths(&session_dirs) {
             if !additional_dirs.contains(&path) {
                 additional_dirs.push(path);
             }
         }
         let read_only_dirs = if req.sandbox_info.is_none() {
-            for (key, value) in crate::session::session_dirs::env_pairs(&req.session_dirs) {
+            for (key, value) in crate::session::session_dirs::env_pairs(&session_dirs) {
                 host_environment.retain(|(k, _)| k != &key);
                 host_environment.push((key, value));
             }
             crate::session::session_dirs::paths_with(
-                &req.session_dirs,
+                &session_dirs,
                 crate::session::session_dirs::DirAccess::ReadOnly,
             )
         } else {
@@ -550,8 +551,9 @@ impl<S: BroadcastSink> Supervisor<S> {
         sandbox: Option<SandboxInfo>,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
-        // The same split a fresh spawn makes: every listed path for the fs
-        // roots, read-only marking only for a host session.
+        // The same split a fresh spawn makes: every usable listed path for
+        // the fs roots, read-only marking only for a host session.
+        let session_dirs = crate::session::session_dirs::usable(&session_dirs);
         let additional_dirs = crate::session::session_dirs::all_paths(&session_dirs);
         let read_only_dirs = if sandbox.is_none() {
             crate::session::session_dirs::paths_with(
