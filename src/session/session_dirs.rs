@@ -39,7 +39,11 @@ pub struct SessionDir {
 
 /// Checks a requested list and returns it normalized (trailing `/` dropped).
 /// Every entry must be an absolute path without `:` (the environment
-/// separator) or a control character, and a path may appear once.
+/// separator) or a control character, and a path may appear once. An entry
+/// must not name a file: kernel sandboxes grant directories (grok's refuses
+/// to start on a file grant), so a single file is shared by putting it, or a
+/// hard link to it, in a directory of its own. A path that does not exist yet
+/// is accepted; an agent may create a read-write directory.
 pub fn validate(dirs: &[SessionDir]) -> Result<Vec<SessionDir>, String> {
     let mut out: Vec<SessionDir> = Vec::with_capacity(dirs.len());
     for dir in dirs {
@@ -62,6 +66,12 @@ pub fn validate(dirs: &[SessionDir]) -> Result<Vec<SessionDir>, String> {
         } else {
             raw
         };
+        if std::path::Path::new(path).exists() && !std::path::Path::new(path).is_dir() {
+            return Err(format!(
+                "{path:?} is not a directory: only directories can be listed (to share one \
+                 file, put it or a hard link to it in a directory of its own)"
+            ));
+        }
         if out.iter().any(|d| d.path == path) {
             return Err(format!("directory {path:?} is listed twice"));
         }
@@ -71,6 +81,29 @@ pub fn validate(dirs: &[SessionDir]) -> Result<Vec<SessionDir>, String> {
         });
     }
     Ok(out)
+}
+
+/// The entries a worker start may use: a stored path that has since become
+/// something other than a directory (sessions.json edited by hand, a
+/// directory replaced on disk) is dropped with a warning, because handing a
+/// file to a kernel sandbox stops the agent from starting at all. A path that
+/// does not exist is kept, as `validate` allows.
+pub fn usable(dirs: &[SessionDir]) -> Vec<SessionDir> {
+    dirs.iter()
+        .filter(|d| {
+            let p = std::path::Path::new(&d.path);
+            let ok = !p.exists() || p.is_dir();
+            if !ok {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    path = %d.path,
+                    "session directory is not a directory; left out of this worker start"
+                );
+            }
+            ok
+        })
+        .cloned()
+        .collect()
 }
 
 /// The environment entries that pass the list to the agent process. Both
@@ -138,6 +171,29 @@ mod tests {
             validate(&[dir("/", DirAccess::ReadOnly)]).unwrap()[0].path,
             "/"
         );
+    }
+
+    #[test]
+    fn a_file_is_refused_and_left_out_at_worker_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("report.md");
+        std::fs::write(&file, "x").unwrap();
+        let file = file.to_string_lossy().into_owned();
+        let dir_path = tmp.path().to_string_lossy().into_owned();
+        let missing = tmp.path().join("not-yet").to_string_lossy().into_owned();
+        assert!(validate(&[dir(&file, DirAccess::ReadOnly)]).is_err());
+        assert!(validate(&[
+            dir(&dir_path, DirAccess::ReadOnly),
+            dir(&missing, DirAccess::ReadWrite)
+        ])
+        .is_ok());
+        let stored = [
+            dir(&dir_path, DirAccess::ReadOnly),
+            dir(&file, DirAccess::ReadOnly),
+            dir(&missing, DirAccess::ReadWrite),
+        ];
+        let kept: Vec<String> = usable(&stored).into_iter().map(|d| d.path).collect();
+        assert_eq!(kept, vec![dir_path.clone(), missing]);
     }
 
     #[test]
