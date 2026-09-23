@@ -66,6 +66,20 @@ interface Props {
   agents?: AgentInfo[];
 }
 
+/** A title as one display line: control and bidi-format characters become
+ *  spaces and whitespace runs collapse. Code points are compared directly
+ *  (not a regex range) to stay clear of `no-control-regex`. */
+function oneLine(text: string): string {
+  return Array.from(text, (ch) => {
+    const c = ch.codePointAt(0) ?? 0;
+    const drop = c < 0x20 || (c >= 0x7f && c < 0xa0) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+    return drop ? " " : ch;
+  })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) {
   // `manualTab` is null until the user (or a select-and-jump action like
   // Browse/Clone) picks a tab explicitly. Until then the active tab is
@@ -153,7 +167,10 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
     onChange("useWorktree", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
-    if (s.title) onChange("title", s.title.slice(0, 60));
+    // The server flattens the title to one line; flatten again so an older
+    // server (or any stray control character) can't make the create call
+    // fail on "Invalid control character ... in title".
+    if (s.title) onChange("title", oneLine(s.title).slice(0, 60));
   };
 
   return (

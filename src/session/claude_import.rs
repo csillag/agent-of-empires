@@ -280,7 +280,31 @@ fn extract_user_title(record: &serde_json::Value) -> Option<String> {
         }),
         _ => None,
     }?;
-    Some(truncate(&text, 120))
+    Some(truncate(&one_line(&text), 120))
+}
+
+/// The text as a single display line: every control character (newline, tab,
+/// ...) and bidi format character becomes a space, and whitespace runs collapse
+/// to one. A first prompt often spans lines (a pasted block, a list), and the
+/// title is offered as the new session's name, which `validate_display_label`
+/// rejects if it carries a control character.
+fn one_line(text: &str) -> String {
+    const BIDI: &[char] = &[
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}',
+    ];
+    text.chars()
+        .map(|c| {
+            if c.is_control() || BIDI.contains(&c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A user message's displayable text, or `None` for the command wrappers and
@@ -317,6 +341,22 @@ mod tests {
             writeln!(f, "{l}").unwrap();
         }
         path
+    }
+
+    #[test]
+    fn title_is_a_single_line() {
+        assert_eq!(
+            one_line("Let's read \n\n<pasted>\n../X.md\n</pasted>\n\n . Go"),
+            "Let's read <pasted> ../X.md </pasted> . Go"
+        );
+        assert_eq!(one_line("a\tb\r\nc\u{7}d\u{202E}e"), "a b c d e");
+        let title = extract_user_title(&serde_json::json!({
+            "type": "user",
+            "message": {"content": "first line\nsecond line"}
+        }))
+        .unwrap();
+        assert_eq!(title, "first line second line");
+        assert!(!title.chars().any(char::is_control));
     }
 
     #[test]
