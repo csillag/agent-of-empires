@@ -348,6 +348,7 @@ pub(super) async fn run_connection_task<W, R>(
         default_model,
         source_profile,
         agent_cwd: resources.agent_cwd(),
+        local_io: resources.local_io,
         cmd_rx,
         lifecycle_rx,
     };

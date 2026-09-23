@@ -104,6 +104,8 @@ struct SessionResources {
     cwd: PathBuf,
     label: String,
     sandbox: Option<SessionSandbox>,
+    /// Withhold fs and terminal capabilities. See `[acp] local_io_agents`.
+    local_io: bool,
 }
 
 impl SessionResources {
@@ -113,6 +115,7 @@ impl SessionResources {
         additional_dirs: Vec<PathBuf>,
         label: String,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        local_io: bool,
     ) -> Self {
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
@@ -126,6 +129,7 @@ impl SessionResources {
             cwd,
             label,
             sandbox,
+            local_io,
         }
     }
 
@@ -153,6 +157,7 @@ struct Launch {
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
+    local_io: bool,
 }
 
 impl Launch {
@@ -183,6 +188,7 @@ impl Launch {
                 self.additional_dirs,
                 label.clone(),
                 self.sandbox,
+                self.local_io,
             ),
             mode: self.mode,
             ready_tx,
@@ -401,6 +407,7 @@ impl AcpClient {
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
+            local_io: handshake::uses_local_io(&[&config.agent_key, &config.tool]),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -533,6 +540,7 @@ impl AcpClient {
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
+            local_io: handshake::uses_local_io(&[&agent_key]),
         };
         Self::connect_via_socket(socket_path, launch).await
     }

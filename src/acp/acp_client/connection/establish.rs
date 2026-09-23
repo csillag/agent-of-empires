@@ -59,6 +59,7 @@ pub(super) struct EstablishCtx {
     pub(super) default_model: Option<String>,
     pub(super) source_profile: Option<String>,
     pub(super) agent_cwd: PathBuf,
+    pub(super) local_io: bool,
     pub(super) cmd_rx: mpsc::Receiver<ClientCmd>,
     pub(super) lifecycle_rx: mpsc::Receiver<LifecycleEnvelope>,
 }
@@ -74,14 +75,14 @@ pub(super) async fn establish(
     info!(target: "acp.protocol", session = %label, "initializing ACP agent");
     let init: InitializeResponse = match ctx.control.as_ref() {
         Some(control) => {
-            let params = serde_json::to_value(build_initialize_request())
+            let params = serde_json::to_value(build_initialize_request(ctx.local_io))
                 .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
             serde_json::from_value(control.initialize(params).await?)
                 .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
         }
         None => {
             connection
-                .send_request(build_initialize_request())
+                .send_request(build_initialize_request(ctx.local_io))
                 .block_task()
                 .await?
         }
