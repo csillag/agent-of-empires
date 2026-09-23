@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useState } from "react";
-import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
+import type { CreateSessionRequest, SessionDirInput, SessionResponse } from "../../lib/types";
 import {
   fetchAgents,
   fetchGroups,
@@ -20,6 +20,7 @@ import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { ProjectStep } from "./steps/ProjectStep";
 import { SessionStep } from "./steps/SessionStep";
+import { SessionDirsEditor } from "./steps/SessionDirsEditor";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
 import { AgentOptions } from "./steps/AgentOptions";
 import { LaunchFooter } from "./LaunchFooter";
@@ -118,6 +119,18 @@ interface Props {
   nameOnly?: boolean;
 }
 
+/** `[session] default_dirs` from `/api/settings`, keeping only well-formed
+ *  entries. The server re-validates whatever the wizard submits. */
+function parseSessionDirs(raw: unknown): SessionDirInput[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((entry) => {
+    const e = entry as { path?: unknown; access?: unknown };
+    if (typeof e?.path !== "string") return [];
+    const access = e.access === "read-write" ? "read-write" : e.access === "read-only" ? "read-only" : null;
+    return access ? [{ path: e.path, access }] : [];
+  });
+}
+
 export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }: Props) {
   const baseInitial = buildInitialData();
   const prefillData: WizardData = prefill
@@ -208,6 +221,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
         const env = Array.isArray(sandbox?.environment)
           ? (sandbox?.environment as unknown[]).filter((v): v is string => typeof v === "string")
           : [];
+        const sessionDirs = parseSessionDirs(session?.default_dirs);
         const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
         const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
         // Honor explicit prefill values so a caller that sets yoloMode/
@@ -221,6 +235,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           worktreeEnabled: (worktree?.enabled as boolean) ?? false,
           tool: defaultTool,
           extraEnv: env,
+          sessionDirs,
           agentModel: acpDefaults.model,
           agentEffort: acpDefaults.effort,
           skipIfDirty: true,
@@ -316,6 +331,11 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
+      // Empty rows (an "Add directory" left blank) are dropped; the server
+      // validates the rest and rejects the create on a bad path.
+      session_dirs: d.sessionDirs
+        .map((s) => ({ path: s.path.trim(), access: s.access }))
+        .filter((s) => s.path),
       profile: d.profile || undefined,
       // Structured view runs when the agent is ACP-capable and the user
       // kept the per-session toggle on (default). Capability comes from
@@ -445,6 +465,10 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
               <p className="text-sm text-text-muted mb-5">Pick the coding assistant for this session.</p>
               <AgentPickerEssentials data={state.data} onChange={handleChange} agents={state.agents} />
             </div>
+          )}
+
+          {!nameOnly && (
+            <SessionDirsEditor dirs={state.data.sessionDirs} onChange={(dirs) => handleChange("sessionDirs", dirs)} />
           )}
 
           {!nameOnly && (

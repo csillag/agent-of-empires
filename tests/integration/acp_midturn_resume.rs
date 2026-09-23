@@ -60,6 +60,7 @@ async fn attach_in_flight_synthesizes_reattach_idle_stopped() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         "test-acp-session-id".into(),
         true, // in_flight_turn
         AcpSessionId("midturn-true".into()),
@@ -99,6 +100,7 @@ async fn attach_idle_session_does_not_synthesize_stopped() {
     let mut client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         "test-acp-session-id".into(),
         false, // NOT in flight
@@ -160,6 +162,7 @@ async fn attach_in_flight_disarms_after_first_inbound_notification() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         session_id.into(),
         true, // in_flight_turn
         AcpSessionId("midturn-disarm".into()),
@@ -215,6 +218,7 @@ async fn socket_transport_round_trips_prompt_via_attach() {
     let mut client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         preseed.into(),
         false, // not in flight; this is a fresh round-trip
@@ -375,6 +379,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
         socket_path.clone(),
         std::env::temp_dir(),
         vec![],
+        vec![],
         acp_session_id.clone(),
         in_flight_turn,
         AcpSessionId(session.into()),
@@ -396,6 +401,7 @@ async fn replay_completion_after_disconnect(session: &str, in_flight_turn: bool)
     let reopened = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         acp_session_id,
         false,

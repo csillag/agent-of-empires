@@ -70,6 +70,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
         spec,
         cwd: tmp.path().to_path_buf(),
         additional_dirs: Vec::new(),
+        read_only_dirs: vec![],
         // Same as the reconciler/session-spawn paths: auth comes from the
         // daemon's inherited environment, not this field.
         provider_env: Vec::new(),

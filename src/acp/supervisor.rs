@@ -516,6 +516,11 @@ pub struct SpawnRequest {
     pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
+    /// The session's stored directory list (`Instance.session_dirs`). Every
+    /// path joins `additional_dirs` (ACP `additionalDirectories`, aoe's fs
+    /// roots); read-only ones are write-refused by aoe's fs handler; and the
+    /// list is exported to a host agent's environment for its own sandbox.
+    pub session_dirs: Vec<crate::session::session_dirs::SessionDir>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -1702,7 +1707,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             agent,
             tool,
             cwd,
-            additional_dirs,
+            mut additional_dirs,
+            session_dirs,
             provider_env,
             model,
             effort,
@@ -1907,6 +1913,28 @@ impl<S: BroadcastSink> Supervisor<S> {
             env.push(("AOE_AGENT_MODEL".into(), model));
         }
 
+        // The session's directory list. A host agent also gets it in its
+        // environment, where a self-sandboxing agent's launcher reads it; a
+        // container-sandboxed agent sees container paths, so it gets neither
+        // the environment nor the read-only marking.
+        for path in crate::session::session_dirs::all_paths(&session_dirs) {
+            if !additional_dirs.contains(&path) {
+                additional_dirs.push(path);
+            }
+        }
+        let read_only_dirs = if sandbox_info.is_none() {
+            for (key, value) in crate::session::session_dirs::env_pairs(&session_dirs) {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+            crate::session::session_dirs::paths_with(
+                &session_dirs,
+                crate::session::session_dirs::DirAccess::ReadOnly,
+            )
+        } else {
+            Vec::new()
+        };
+
         // Every structured view worker runs through `aoe __acp-runner` so it
         // survives `aoe serve --stop`. The runner binds the socket path
         // computed here and the daemon dials it.
@@ -1956,6 +1984,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             spec,
             cwd,
             additional_dirs,
+            read_only_dirs,
             provider_env: env,
             host_environment,
             default_effort: effort,
@@ -3343,7 +3372,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         cwd: PathBuf,
-        additional_dirs: Vec<PathBuf>,
+        session_dirs: Vec<crate::session::session_dirs::SessionDir>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
     ) -> Result<(), SupervisorError> {
@@ -3356,7 +3385,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.attach_inner(
             session_id,
             cwd,
-            additional_dirs,
+            session_dirs,
             in_flight_turn,
             sandbox,
             reservation,
@@ -3370,11 +3399,22 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         cwd: PathBuf,
-        additional_dirs: Vec<PathBuf>,
+        session_dirs: Vec<crate::session::session_dirs::SessionDir>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
+        // The same split a fresh spawn makes (`spawn_inner`): every listed
+        // path for the fs roots, read-only marking only for a host session.
+        let additional_dirs = crate::session::session_dirs::all_paths(&session_dirs);
+        let read_only_dirs = if sandbox.is_none() {
+            crate::session::session_dirs::paths_with(
+                &session_dirs,
+                crate::session::session_dirs::DirAccess::ReadOnly,
+            )
+        } else {
+            Vec::new()
+        };
         let lease = reservation.lease().clone();
         let record = match crate::process::worker_registry::load(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
@@ -3500,6 +3540,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             record.socket_path.clone(),
             cwd,
             additional_dirs,
+            read_only_dirs,
             stored_acp_session_id,
             in_flight_turn,
             acp_session_id,
@@ -4432,6 +4473,7 @@ mod tests {
             spec: spec("claude-agent-acp", &[]),
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![
                 ("AOE_AGENT_MODEL".into(), "model-a".into()),
                 ("OTHER".into(), "kept".into()),
@@ -4564,6 +4606,7 @@ mod tests {
             spec: spec("claude-agent-acp", &[]),
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![("AOE_AGENT_MODEL".into(), "model-a".into())],
             host_environment: vec![],
             default_effort: Some("low".into()),
@@ -5022,6 +5065,7 @@ mod tests {
                 // not the adapter binary exists on this machine.
                 cwd: tmp.path().join("does-not-exist"),
                 additional_dirs: vec![],
+                session_dirs: vec![],
                 provider_env: vec![],
                 model: None,
                 effort: None,
@@ -5256,6 +5300,7 @@ cursor-acp-bridge = "agent acp"
                 tool: "no-such-agent".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
+                session_dirs: vec![],
                 provider_env: vec![],
                 model: None,
                 effort: None,
@@ -5291,6 +5336,7 @@ cursor-acp-bridge = "agent acp"
                 tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
+                session_dirs: vec![],
                 provider_env: vec![],
                 model: None,
                 effort: None,
@@ -5502,6 +5548,7 @@ cursor-acp-bridge = "agent acp"
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -5591,6 +5638,7 @@ cursor-acp-bridge = "agent acp"
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -5696,6 +5744,7 @@ cursor-acp-bridge = "agent acp"
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -5772,6 +5821,7 @@ cursor-acp-bridge = "agent acp"
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -5918,6 +5968,7 @@ cursor-acp-bridge = "agent acp"
                 spec: dummy_spec,
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
+                read_only_dirs: vec![],
                 provider_env: vec![],
                 host_environment: vec![],
                 default_effort: None,
@@ -7095,6 +7146,7 @@ cursor-acp-bridge = "agent acp"
             tool: "claude-code".into(),
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            session_dirs: vec![],
             provider_env: vec![],
             model: None,
             effort: None,
@@ -7123,6 +7175,7 @@ cursor-acp-bridge = "agent acp"
             },
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -7892,6 +7945,7 @@ cursor-acp-bridge = "agent acp"
                 tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
+                session_dirs: vec![],
                 provider_env: vec![],
                 model: None,
                 effort: None,
@@ -7965,6 +8019,7 @@ cursor-acp-bridge = "agent acp"
                 tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
+                session_dirs: vec![],
                 provider_env: vec![],
                 model: None,
                 effort: None,

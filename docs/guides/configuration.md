@@ -152,6 +152,33 @@ Notification = "waiting"
 | `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
 | `agents.<name>.status_rules` | `[]` | Trusted global/profile-only declarative pane status rules (`[[agents.<name>.status_rules]]` array of tables). Each rule has `status` (`running`, `waiting`, `idle`, or `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex, matched as written; use `(?i)` for case-insensitive). Rules are evaluated in order against the ANSI-stripped pane snapshot; first match wins, no match reports `idle`. Rules take precedence over `agent_detect_as`, over a built-in detector of the same name, and over a status hook the agent writes. Invalid rules are skipped with a warning in the debug log. Takes effect on the next config resolve (TUI or daemon start). |
 
+### Session directories
+
+Each session has a list of directories its agent may reach besides its working
+directory, each `read-only` or `read-write`. The web wizard shows it under
+"Directories", pre-filled from `default_dirs`; every entry can be edited or
+removed per session. A session created through the API or CLI gets exactly
+the list its request names. The code default is empty.
+
+```toml
+[session]
+default_dirs = [
+    { path = "/home/me/shared-notes", access = "read-write" },
+    { path = "/srv/reference", access = "read-only" },
+]
+```
+
+The list is applied at every worker start (spawn, respawn, reattach):
+
+- aoe's own `fs/*` handler allows the listed directories and refuses writes
+  into read-only ones.
+- Every host agent process gets `AOE_SESSION_DIRS_READ_ONLY` and
+  `AOE_SESSION_DIRS_READ_WRITE` (colon-separated), so a launcher can hand the
+  list to an agent that sandboxes itself.
+- ACP `additionalDirectories` at `session/new` carries every listed path.
+  That scopes agents that honor it, but it is not a sandbox and cannot
+  express read-only.
+
 ## Status Hooks
 
 Status hooks run local shell commands when the TUI sees a session status change. They are disabled by default and are intended for personal machine behavior such as desktop notifications.

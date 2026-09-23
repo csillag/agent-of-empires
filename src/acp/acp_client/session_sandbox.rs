@@ -346,6 +346,7 @@ mod tests {
             },
             cwd,
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -423,6 +424,7 @@ mod tests {
             },
             cwd,
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
             host_environment: vec![],
@@ -535,6 +537,7 @@ mod tests {
             },
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,

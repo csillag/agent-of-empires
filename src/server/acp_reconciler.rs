@@ -1689,12 +1689,13 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                 }
                 let supervisor = Arc::clone(&state.acp_supervisor);
                 let cwd = PathBuf::from(&target.project_path);
-                let sandbox_for_attach = {
+                let (sandbox_for_attach, session_dirs_for_attach) = {
                     let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
+                    let inst = instances.iter().find(|i| i.id == id);
+                    (
+                        inst.and_then(|i| i.sandbox_info.clone()),
+                        inst.map(|i| i.session_dirs.clone()).unwrap_or_default(),
+                    )
                 };
                 let lease = reservation.take().expect("attach lease held");
                 let attach_res = timeout(
@@ -1702,7 +1703,7 @@ async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> ResumeOutcome
                     supervisor.attach_inner(
                         id.clone(),
                         cwd,
-                        vec![],
+                        session_dirs_for_attach,
                         in_flight_turn,
                         sandbox_for_attach,
                         lease,
@@ -2043,12 +2044,23 @@ async fn build_spawn_request(
     // spawn path resolves agent_acp_cmd and worker env from it, so a
     // non-sandbox session on a non-default profile must not fall back to
     // the default profile.
+    // Read at spawn time, not snapshotted into `ResumeTarget`: a list edited
+    // since the snapshot must still reach the next worker.
+    let session_dirs = service
+        .instances
+        .read()
+        .await
+        .iter()
+        .find(|i| i.id == target.id)
+        .map(|i| i.session_dirs.clone())
+        .unwrap_or_default();
     Ok(crate::acp::supervisor::SpawnRequest {
         session_id: target.id.clone(),
         agent,
         tool: target.tool.clone(),
         cwd,
         additional_dirs: vec![],
+        session_dirs,
         provider_env: vec![],
         model: target.model.clone(),
         effort: acp_effort.clone(),

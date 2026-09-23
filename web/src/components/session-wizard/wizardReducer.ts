@@ -7,7 +7,7 @@
 // keeping the reducer in this file lets us unit-test the merge rules
 // without mounting React.
 
-import type { AgentInfo, GroupInfo, ProfileInfo } from "../../lib/types";
+import type { AgentInfo, GroupInfo, ProfileInfo, SessionDirInput } from "../../lib/types";
 import { applyBranchOverride, slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -31,6 +31,9 @@ export interface WizardData {
   sandboxEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  /** Directories the agent may reach besides its working directory, each
+   *  read-only or read-write. Seeded from `[session] default_dirs`. */
+  sessionDirs: SessionDirInput[];
   /** Additional repo paths to include in the multi-repo workspace.
    *  Free-text paths and registered project paths flow into the same list. */
   extraRepoPaths: string[];
@@ -105,6 +108,9 @@ export type Action =
       worktreeEnabled: boolean;
       tool: string;
       extraEnv: string[];
+      /** Omitted by callers that have no directory defaults to apply (the
+       *  profile picker), which leaves the current list alone. */
+      sessionDirs?: SessionDirInput[];
       agentModel?: string;
       agentEffort?: string;
       /** When true, skip the apply if the user has already edited an
@@ -134,6 +140,7 @@ export const initialData: WizardData = {
   sandboxEnabled: false,
   sandboxImage: "",
   extraEnv: [],
+  sessionDirs: [],
   extraRepoPaths: [],
   repoBases: {},
   advancedEnabled: false,
@@ -210,7 +217,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
       if (
-        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"].includes(
+        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "sessionDirs", "agentModel", "agentEffort"].includes(
           action.field,
         )
       ) {
@@ -253,6 +260,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           useWorktree: state.data.scratch ? false : action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
+          sessionDirs: action.sessionDirs ?? state.data.sessionDirs,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           profileDirty: false,

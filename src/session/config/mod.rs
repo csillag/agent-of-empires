@@ -1166,6 +1166,15 @@ pub struct SessionConfig {
     )]
     pub custom_agents: HashMap<String, String>,
 
+    /// Directories the new-session wizard pre-fills into a session's list,
+    /// each read-only or read-write (see `crate::session::session_dirs`).
+    /// Host policy, set in the config file; the code default is empty. Each
+    /// entry can be removed or changed per session, and a session created
+    /// without the wizard gets exactly the list its request names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[setting(skip)]
+    pub default_dirs: Vec<crate::session::session_dirs::SessionDir>,
+
     /// Status detection mapping: agent=builtin (e.g. lenovo-claude=claude).
     /// Maps a custom (or built-in) agent to another agent's status detection
     /// heuristics.
@@ -1770,6 +1779,7 @@ impl Default for SessionConfig {
             mouse_capture: true,
             host_tab_title: true,
             custom_agents: HashMap::new(),
+            default_dirs: Vec::new(),
             agent_detect_as: HashMap::new(),
             agent_config_dir: HashMap::new(),
             agent_acp_cmd: HashMap::new(),

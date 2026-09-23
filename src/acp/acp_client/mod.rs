@@ -393,6 +393,7 @@ impl AcpClient {
                 config.cwd,
                 config.additional_dirs,
                 local_io,
+                config.read_only_dirs,
                 mode,
                 session_id,
                 pending_responders,
@@ -421,6 +422,7 @@ impl AcpClient {
             config.cwd,
             config.additional_dirs,
             local_io,
+            config.read_only_dirs,
             mode,
             session_id,
             child,
@@ -445,6 +447,7 @@ impl AcpClient {
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         local_io: bool,
+        read_only_dirs: Vec<PathBuf>,
         mode: ConnectMode,
         session_id: AcpSessionId,
         child: Arc<Mutex<tokio::process::Child>>,
@@ -488,7 +491,16 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                // Read-only session dirs ride in `additional_dirs` too (for ACP
+                // additionalDirectories), so take them back out of the writable
+                // roots; the cwd always stays writable.
+                roots.retain(|r| r == &cwd || !read_only_dirs.contains(r));
+                (
+                    None,
+                    Arc::new(FsPolicy::with_read_only(roots, read_only_dirs)),
+                )
+            }
         };
         let resources = SessionResources {
             fs_policy,
@@ -560,6 +572,7 @@ impl AcpClient {
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
         local_io: bool,
+        read_only_dirs: Vec<PathBuf>,
         mode: ConnectMode,
         session_id: AcpSessionId,
         pending_responders: PendingResponders,
@@ -603,7 +616,16 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                // Read-only session dirs ride in `additional_dirs` too (for ACP
+                // additionalDirectories), so take them back out of the writable
+                // roots; the cwd always stays writable.
+                roots.retain(|r| r == &cwd || !read_only_dirs.contains(r));
+                (
+                    None,
+                    Arc::new(FsPolicy::with_read_only(roots, read_only_dirs)),
+                )
+            }
         };
         let resources = SessionResources {
             fs_policy,
@@ -728,6 +750,7 @@ impl AcpClient {
         socket_path: PathBuf,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        read_only_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
         session_id: AcpSessionId,
@@ -761,6 +784,7 @@ impl AcpClient {
             cwd,
             additional_dirs,
             handshake::uses_local_io(&[agent_key.as_str()]),
+            read_only_dirs,
             mode,
             session_id,
             pending_responders,

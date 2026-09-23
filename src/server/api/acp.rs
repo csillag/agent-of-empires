@@ -483,6 +483,7 @@ pub async fn spawn_acp(
             tool: instance.tool.clone(),
             cwd,
             additional_dirs: req.additional_dirs,
+            session_dirs: instance.session_dirs.clone(),
             provider_env,
             model,
             effort,
@@ -1108,6 +1109,7 @@ pub async fn switch_acp_agent(
             tool: instance.tool.clone(),
             cwd,
             additional_dirs: vec![],
+            session_dirs: instance.session_dirs.clone(),
             provider_env: vec![],
             model: model.clone(),
             // Effort vocabularies are adapter-specific ("high" on one adapter,
@@ -2163,6 +2165,7 @@ pub async fn acp_enable(
         &instance.command,
     );
     let tool_for_spawn = instance.tool.clone();
+    let session_dirs_for_spawn = instance.session_dirs.clone();
     let state_for_spawn = state.clone();
     let inst_lock_for_spawn = inst_lock.clone();
     tokio::spawn(async move {
@@ -2206,6 +2209,7 @@ pub async fn acp_enable(
                 tool: tool_for_spawn,
                 cwd,
                 additional_dirs: vec![],
+                session_dirs: session_dirs_for_spawn,
                 provider_env: vec![],
                 model,
                 effort,

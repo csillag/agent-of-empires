@@ -36,6 +36,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
         },
         cwd,
         additional_dirs: vec![],
+        read_only_dirs: vec![],
         provider_env: vec![(
             "SHIM_MCP_RECORD_FILE".into(),
             record_path.to_string_lossy().to_string(),

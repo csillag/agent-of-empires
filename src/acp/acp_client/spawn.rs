@@ -32,6 +32,9 @@ pub struct SpawnConfig {
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
+    /// The subset of `additional_dirs` that is read-only: aoe's `fs/*`
+    /// handler refuses writes there (the session's read-only directories).
+    pub read_only_dirs: Vec<PathBuf>,
     /// Provider env vars to forward (after applying the agent's allowlist).
     pub provider_env: Vec<(String, String)>,
     /// Trusted global/profile `environment` entries ("Host Environment"),
@@ -548,6 +551,7 @@ mod tests {
             },
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,
@@ -589,6 +593,7 @@ mod tests {
             },
             cwd: missing.clone(),
             additional_dirs: vec![],
+            read_only_dirs: vec![],
             provider_env: vec![],
             host_environment: vec![],
             default_effort: None,

@@ -53,6 +53,12 @@ pub struct CreateSessionBody {
     pub command_override: String,
     #[serde(default)]
     pub custom_instruction: Option<String>,
+    /// Directories the agent may reach besides its working directory, each
+    /// read-only or read-write. Stored on the session and applied at every
+    /// spawn (see `crate::session::session_dirs`). The wizard pre-fills it
+    /// from `[session] default_dirs`; other callers get exactly what they send.
+    #[serde(default)]
+    pub session_dirs: Vec<crate::session::session_dirs::SessionDir>,
     pub profile: Option<String>,
     /// How the new session should render: `structured` or `terminal`. The
     /// bundled wizard sends an explicit value (`structured` for ACP-capable
@@ -1046,6 +1052,17 @@ pub async fn create_session(
         None
     };
 
+    let session_dirs = match crate::session::session_dirs::validate(&body.session_dirs) {
+        Ok(dirs) => dirs,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "validation_failed", "message": msg})),
+            )
+                .into_response();
+        }
+    };
+
     let profile = body.profile.unwrap_or_else(|| state.profile.clone());
 
     let spec = crate::server::session_spawn::StructuredSessionSpec {
@@ -1087,6 +1104,7 @@ pub async fn create_session(
         agent_effort: body.agent_effort,
         import_acp_session_id: body.import_acp_session_id,
         fork_seed,
+        session_dirs,
     };
 
     match state

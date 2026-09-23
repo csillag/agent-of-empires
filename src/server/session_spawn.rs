@@ -66,6 +66,8 @@ pub(crate) struct StructuredSessionSpec {
     pub agent_effort: Option<String>,
     pub import_acp_session_id: Option<String>,
     pub fork_seed: Option<crate::session::ForkSeed>,
+    /// Validated directory list (`crate::session::session_dirs::validate`).
+    pub session_dirs: Vec<crate::session::session_dirs::SessionDir>,
 }
 
 /// What the create core returns to its caller once the session exists in state.
@@ -147,6 +149,7 @@ pub(crate) async fn spawn_structured_session(
             agent_effort,
             import_acp_session_id,
             fork_seed,
+            session_dirs,
         } = spec;
 
         let config = Config::load_or_warn();
@@ -228,6 +231,7 @@ pub(crate) async fn spawn_structured_session(
         instance.acp_mode_id = acp_mode_id;
         instance.callback_url = callback_url;
         instance.idempotency_key = idempotency_key;
+        instance.session_dirs = session_dirs;
         let build_warnings = build_result.warnings;
         let created_worktree = build_result.created_worktree;
         let created_workspace_worktrees = build_result.created_workspace_worktrees;
@@ -500,6 +504,14 @@ pub(crate) async fn spawn_structured_session(
                 let cwd = std::path::PathBuf::from(project_path);
                 let supervisor = service.acp_supervisor.clone();
                 let service_for_check = service.clone();
+                let session_dirs = service
+                    .instances
+                    .read()
+                    .await
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| i.session_dirs.clone())
+                    .unwrap_or_default();
                 let has_pending_initial_turn = {
                     let instances = service.instances.read().await;
                     instances
@@ -537,6 +549,7 @@ pub(crate) async fn spawn_structured_session(
                             tool,
                             cwd,
                             additional_dirs: vec![],
+                            session_dirs,
                             provider_env: vec![],
                             model,
                             effort,

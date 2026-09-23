@@ -130,6 +130,7 @@ async fn cost_bearing_wrap_up_without_response_ends_as_prompt_complete() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         preseed.to_string(),
         false,
         AcpSessionId("silent-orphan-positive".into()),
@@ -195,6 +196,7 @@ async fn silent_orphan_fires_when_the_turn_never_wraps_up() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         preseed.to_string(),
         false,
         AcpSessionId("silent-orphan-no-cost".into()),
@@ -255,6 +257,7 @@ async fn silent_orphan_suppressed_during_normal_turn() {
     let client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         preseed.to_string(),
         false,
@@ -321,6 +324,7 @@ async fn silent_orphan_disabled_by_zero_grace() {
     let client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         preseed.to_string(),
         false,
@@ -390,6 +394,7 @@ async fn silent_orphan_suppressed_during_async_agent_wait() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         preseed.to_string(),
         false,
         AcpSessionId("silent-orphan-async-agent".into()),
@@ -453,6 +458,7 @@ async fn silent_orphan_suppressed_during_background_bash() {
     let client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         preseed.to_string(),
         false,
@@ -521,6 +527,7 @@ async fn background_bash_wrap_up_ends_as_prompt_complete() {
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         preseed.to_string(),
         false,
         AcpSessionId("silent-orphan-background-bash-wrap-up".into()),
@@ -582,6 +589,7 @@ async fn silent_orphan_suppressed_during_scheduled_wakeup() {
     let client = AcpClient::attach(
         socket_path,
         std::env::temp_dir(),
+        vec![],
         vec![],
         preseed.to_string(),
         false,
@@ -647,6 +655,7 @@ async fn usage_evidence_survives_activity_and_drain() {
         let mut client = AcpClient::attach(
             socket_path,
             std::env::temp_dir(),
+            vec![],
             vec![],
             preseed.to_string(),
             false,
