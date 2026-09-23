@@ -170,6 +170,24 @@ pub struct PendingApproval {
 /// client's list. `id` identifies the row, so a row without one is unusable
 /// rather than degraded, and no daemon version omits it. Serialization is
 /// unaffected; the JSON the daemon emits is unchanged.
+/// How a session's ACP thought chunks are shown (see
+/// `SessionResponse::thought_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThoughtDisplay {
+    /// Narration addressed to the user: shown as "update" message rows.
+    #[default]
+    Update,
+    /// Raw reasoning: shown as a collapsed thinking block.
+    Reasoning,
+}
+
+impl ThoughtDisplay {
+    pub fn is_update(&self) -> bool {
+        *self == ThoughtDisplay::Update
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
     pub id: String,
@@ -429,6 +447,12 @@ pub struct SessionResponse {
     /// Omitted for agents with no clear alias.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_aliases: Vec<String>,
+    /// How the web renders this session's thought chunks: `update` rows (a
+    /// narration channel, claude) or a collapsed `reasoning` block (a raw
+    /// reasoning channel, per `[acp] reasoning_agents`). Set by the session
+    /// list's per-profile config overlay; defaults to `update`.
+    #[serde(default, skip_serializing_if = "ThoughtDisplay::is_update")]
+    pub thought_display: ThoughtDisplay,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip

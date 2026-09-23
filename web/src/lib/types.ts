@@ -183,6 +183,10 @@ export interface SessionResponse {
    *  queued-prompt clear-boundary hint read this instead of a client-side
    *  per-agent mirror. Absent (read as empty) for agents with no clear alias. */
   clear_aliases?: string[];
+  /** How this session's thought chunks are shown: `update` rows (claude's
+   *  narration channel) or a collapsed `reasoning` block (an agent listed in
+   *  `[acp] reasoning_agents`, e.g. grok). Absent reads as `update`. */
+  thought_display?: ThoughtDisplay;
   /** True when this session's agent can run a structured ACP `session/fork`:
    *  it maps to a built-in ACP adapter verified to implement the handshake
    *  (today claude alone). Resume-only ACP agents (e.g. `aoe-agent`, which
@@ -748,3 +752,6 @@ export interface SettingsFieldDescriptor {
    *  omitted for core fields (their value always exists in the config). */
   default?: unknown;
 }
+
+/** How a session's thought chunks are shown. Mirrors Rust `ThoughtDisplay`. */
+export type ThoughtDisplay = "update" | "reasoning";

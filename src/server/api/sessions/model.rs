@@ -175,6 +175,8 @@ impl SessionResponse {
             .iter()
             .map(|s| s.to_string())
             .collect(),
+            // Overlaid per profile by list_sessions from `[acp] reasoning_agents`.
+            thought_display: Default::default(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:

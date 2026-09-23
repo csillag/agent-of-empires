@@ -50,7 +50,8 @@ import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
-import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAgentProfile, useThoughtDisplay } from "../../lib/agentProfileContext";
+import type { ThoughtDisplay } from "../../lib/types";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
 import { useCancelEscalation } from "./useCancelEscalation";
 
@@ -159,6 +160,7 @@ export function AcpRuntime({
 }: Props) {
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
+  const thoughtDisplay = useThoughtDisplay();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the
   // latest value without going stale. See #1000 / #965.
@@ -247,8 +249,9 @@ export function AcpRuntime({
         showClearedTurns,
         agentProfile.capabilities.todos,
         agentProfile,
+        thoughtDisplay,
       ),
-    [displayActivity, visiblyBusy, showClearedTurns, agentProfile],
+    [displayActivity, visiblyBusy, showClearedTurns, agentProfile, thoughtDisplay],
   );
 
   // Read from the same rows as the fold, so the key and the truncation agree.
@@ -368,6 +371,7 @@ export function activityToThreadMessages(
   showClearedTurns = false,
   todosEnabled = true,
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
+  thoughtDisplay: ThoughtDisplay = "update",
 ): ThreadMessageLike[] {
   // Fold pre-clear turns by default: after a `/clear` those rows describe a
   // conversation the model has forgotten. The ClearedTurnsBanner in
@@ -529,7 +533,7 @@ export function activityToThreadMessages(
     }
 
     if (!currentAssistant) {
-      currentAssistant = new AssistantBuilder(row.id, row.at);
+      currentAssistant = new AssistantBuilder(row.id, row.at, thoughtDisplay);
     }
 
     if (row.kind === "message") {
@@ -595,6 +599,7 @@ function parseDate(iso: string): Date | undefined {
 // per-tool renderer (ToolCards.tsx) reads the rest off `argsText`.
 type DraftPart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -620,10 +625,15 @@ class AssistantBuilder {
   private thoughtRunOpen = false;
   /** Verbatim text of the open update, as streamed. */
   private thoughtRaw = "";
+  /** `update`: thought rows are narration shown as tagged message text.
+   *  `reasoning`: raw reasoning, kept as one assistant-ui `reasoning` part
+   *  per run, which StructuredView renders collapsed. */
+  private thoughtDisplay: ThoughtDisplay;
 
-  constructor(id: string, createdAtIso: string) {
+  constructor(id: string, createdAtIso: string, thoughtDisplay: ThoughtDisplay = "update") {
     this.id = `assistant-${id}`;
     this.createdAt = parseDate(createdAtIso);
+    this.thoughtDisplay = thoughtDisplay;
   }
 
   appendText(text: string) {
@@ -649,6 +659,18 @@ class AssistantBuilder {
   appendThought(text: string) {
     if (!text) return;
     const last = this.parts[this.parts.length - 1];
+    if (this.thoughtDisplay === "reasoning") {
+      // Raw reasoning: one part per run, joined verbatim (token fragments,
+      // lone spaces included), never shown as message text.
+      if (this.thoughtRunOpen && last && last.type === "reasoning") {
+        last.text += text;
+        return;
+      }
+      if (!text.trim()) return;
+      this.parts.push({ type: "reasoning", text });
+      this.thoughtRunOpen = true;
+      return;
+    }
     if (this.thoughtRunOpen && last && last.type === "text") {
       this.thoughtRaw += text;
       last.text = formatUpdate(this.thoughtRaw);

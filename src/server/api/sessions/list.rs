@@ -190,6 +190,24 @@ pub async fn list_sessions(
         }
     }
 
+    // Overlay how each session's thought chunks are shown, from the per-profile
+    // `[acp] reasoning_agents` list. Resolved once per distinct profile.
+    {
+        use std::collections::HashMap;
+        let mut reasoning_cache: HashMap<String, Vec<String>> = HashMap::new();
+        for session in &mut sessions {
+            let agents = reasoning_cache
+                .entry(session.profile.clone())
+                .or_insert_with(|| {
+                    crate::session::config::profile_config::resolve_config_or_warn(&session.profile)
+                        .acp
+                        .reasoning_agents
+                });
+            session.thought_display =
+                thought_display_for(agents, &session.tool, session.acp_agent.as_deref());
+        }
+    }
+
     // Inputs for the rate-limit park overlay below, snapshotted here so the
     // blocking batch can run once the registry read lock is released. A live
     // worker is never parked, so only workerless sessions pay for the probe.
@@ -377,6 +395,21 @@ pub async fn list_sessions(
 // branchless session gets its own workspace at `${repoPath}::__session__::${id}`.
 // `repoPath` strips trailing slashes so the server and client compute the
 // same string for the same session row.
+/// `reasoning` when `[acp] reasoning_agents` names the session's resolved
+/// agent or its tool, otherwise `update`.
+fn thought_display_for(
+    reasoning_agents: &[String],
+    tool: &str,
+    acp_agent: Option<&str>,
+) -> crate::daemon::ThoughtDisplay {
+    let agent = acp_agent.filter(|a| !a.is_empty()).unwrap_or(tool);
+    if reasoning_agents.iter().any(|a| a == agent || a == tool) {
+        crate::daemon::ThoughtDisplay::Reasoning
+    } else {
+        crate::daemon::ThoughtDisplay::Update
+    }
+}
+
 fn workspace_id_for_session(s: &SessionResponse) -> String {
     let raw = s.main_repo_path.as_deref().unwrap_or(&s.project_path);
     let repo_path = raw.trim_end_matches('/');
@@ -579,6 +612,27 @@ mod workspace_ordering_tests {
         isolate_app_dir_at(temp)
     }
 
+    #[test]
+    fn thought_display_follows_reasoning_agents() {
+        use crate::daemon::ThoughtDisplay::{Reasoning, Update};
+        let listed = vec!["grok".to_string()];
+        assert_eq!(thought_display_for(&listed, "grok", None), Reasoning);
+        assert_eq!(
+            thought_display_for(&listed, "grok", Some("grok")),
+            Reasoning
+        );
+        assert_eq!(
+            thought_display_for(&listed, "claude", Some("claude")),
+            Update
+        );
+        assert_eq!(thought_display_for(&[], "grok", None), Update);
+        // A switched agent counts, and so does the session's tool.
+        assert_eq!(
+            thought_display_for(&listed, "claude", Some("grok")),
+            Reasoning
+        );
+    }
+
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
         SessionResponse {
             id: id.to_string(),
@@ -634,6 +688,7 @@ mod workspace_ordering_tests {
             acp_can_fork: false,
             keeps_context: false,
             clear_aliases: Vec::new(),
+            thought_display: Default::default(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),
