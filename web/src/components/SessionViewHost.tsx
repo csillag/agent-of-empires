@@ -89,6 +89,7 @@ function sameLayerProps(a: SessionResponse, b: SessionResponse): boolean {
     a.main_repo_path === b.main_repo_path &&
     a.artifact_dir === b.artifact_dir &&
     sameStrings(a.clear_aliases, b.clear_aliases) &&
+    a.thought_display === b.thought_display &&
     sameRepos(a.workspace_repos, b.workspace_repos) &&
     sameBackground(a.background, b.background)
   );
@@ -127,6 +128,7 @@ const SessionLayer = memo(
             tool={session.tool}
             acpAgent={session.acp_agent ?? null}
             clearAliases={session.clear_aliases}
+            thoughtDisplay={session.thought_display}
             archivedAt={session.archived_at ?? null}
             snoozedUntil={session.snoozed_until ?? null}
             trashedAt={session.trashed_at ?? null}

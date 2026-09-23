@@ -486,6 +486,19 @@ pub struct AcpConfig {
         web = "elevation:changes where coding agents run commands and file access"
     )]
     pub local_io_agents: Vec<String>,
+    /// Agents whose ACP thought channel carries raw reasoning rather than
+    /// narration addressed to the user (e.g. grok). The web dashboard shows
+    /// their thinking as a collapsed "Thinking" block instead of "update"
+    /// message rows. Matched against the session's agent key and its tool
+    /// name. Claude's thought channel (with `thinking.display: "updates"`)
+    /// is narration, so it is not listed by default.
+    #[serde(default)]
+    #[setting(
+        label = "Agents whose thinking is raw reasoning",
+        widget = "list",
+        advanced
+    )]
+    pub reasoning_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -658,6 +671,7 @@ impl Default for AcpConfig {
             restrict_agents: false,
             allowed_agents: Vec::new(),
             local_io_agents: Vec::new(),
+            reasoning_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),

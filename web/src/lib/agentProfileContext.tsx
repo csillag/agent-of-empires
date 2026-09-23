@@ -18,6 +18,7 @@
 import { createContext, useContext, type ReactNode } from "react";
 
 import { DEFAULT_AGENT_PROFILE, resolveAgentProfile, type AgentProfile } from "./agentProfiles";
+import type { ThoughtDisplay } from "./types";
 
 const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 
@@ -25,20 +26,25 @@ const AgentProfileContext = createContext<AgentProfile>(DEFAULT_AGENT_PROFILE);
 // whose agent has no clear alias) never gets a fresh array each render.
 const NO_CLEAR_ALIASES: readonly string[] = [];
 const ClearAliasesContext = createContext<readonly string[]>(NO_CLEAR_ALIASES);
+const ThoughtDisplayContext = createContext<ThoughtDisplay>("update");
 
 export function AgentProfileProvider({
   toolKey,
   clearAliases,
+  thoughtDisplay,
   children,
 }: {
   toolKey: string | null | undefined;
   clearAliases?: readonly string[];
+  thoughtDisplay?: ThoughtDisplay;
   children: ReactNode;
 }) {
   const profile = resolveAgentProfile(toolKey);
   return (
     <AgentProfileContext.Provider value={profile}>
-      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>{children}</ClearAliasesContext.Provider>
+      <ClearAliasesContext.Provider value={clearAliases ?? NO_CLEAR_ALIASES}>
+        <ThoughtDisplayContext.Provider value={thoughtDisplay ?? "update"}>{children}</ThoughtDisplayContext.Provider>
+      </ClearAliasesContext.Provider>
     </AgentProfileContext.Provider>
   );
 }
@@ -52,4 +58,10 @@ export function useAgentProfile(): AgentProfile {
  *  alias or when rendered outside a provider. */
 export function useClearAliases(): readonly string[] {
   return useContext(ClearAliasesContext);
+}
+
+/** How the active session's thought chunks are shown
+ *  (`SessionResponse.thought_display`). `update` outside a provider. */
+export function useThoughtDisplay(): ThoughtDisplay {
+  return useContext(ThoughtDisplayContext);
 }
