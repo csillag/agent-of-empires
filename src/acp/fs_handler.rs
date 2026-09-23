@@ -88,6 +88,40 @@ impl SandboxPathMap {
     }
 }
 
+/// The `[acp] extra_fs_roots` directories from the global config, which
+/// every host (non-sandboxed) session may reach on top of its own roots.
+/// Global only: a profile must not widen what agents may touch, the same
+/// rule `crate::acp::agent_policy` applies to the agent allowlist.
+pub fn configured_extra_roots() -> Vec<PathBuf> {
+    let entries = crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .map(|c| c.acp.extra_fs_roots)
+        .unwrap_or_default();
+    extra_roots_from(&entries)
+}
+
+/// Keeps the absolute entries of `extra_fs_roots`, in order. A relative or
+/// empty entry has no meaning without a session to resolve it against, so it
+/// is dropped with a warning rather than guessed at.
+pub fn extra_roots_from(entries: &[String]) -> Vec<PathBuf> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let path = PathBuf::from(entry);
+            if entry.trim().is_empty() || !path.is_absolute() {
+                tracing::warn!(
+                    target: "acp.fs",
+                    "acp.extra_fs_roots: ignoring {entry:?}, not an absolute path"
+                );
+                None
+            } else {
+                Some(path)
+            }
+        })
+        .collect()
+}
+
 /// Per-session allowed-roots policy. The session's worktree path plus any
 /// additional dirs declared at `session/new` time.
 #[derive(Debug, Clone)]
@@ -266,6 +300,51 @@ mod tests {
         let outside = std::env::temp_dir().join("definitely-not-in-temp-dir-of-test");
         let result = policy.resolve_inside(&outside);
         assert!(matches!(result, Err(FsError::OutsideRoots(_))));
+    }
+
+    #[test]
+    fn extra_roots_keep_absolute_entries_in_order() {
+        let entries = [
+            "/home/u/commissura".to_string(),
+            "relative/dir".to_string(),
+            String::new(),
+            "   ".to_string(),
+            "/srv/shared".to_string(),
+        ];
+        assert_eq!(
+            extra_roots_from(&entries),
+            vec![
+                PathBuf::from("/home/u/commissura"),
+                PathBuf::from("/srv/shared")
+            ]
+        );
+    }
+
+    /// The shape the connection builds for a host session: its cwd plus the
+    /// configured extra roots. A file in the extra root reads and writes; a
+    /// sibling of the extra root is still outside.
+    #[test]
+    fn extra_root_is_reachable_and_its_sibling_is_not() {
+        let cwd = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let mut roots = vec![cwd.path().to_path_buf()];
+        roots.extend(extra_roots_from(&[shared
+            .path()
+            .to_string_lossy()
+            .into_owned()]));
+        let policy = FsPolicy::new(roots);
+
+        let inside = shared.path().join("crew.md");
+        handle_write(&policy, "s-1", &inside, "a line").unwrap();
+        assert_eq!(handle_read(&policy, "s-1", &inside).unwrap(), "a line");
+
+        let outside = sibling.path().join("secret");
+        fs::write(&outside, "no").unwrap();
+        assert!(matches!(
+            handle_read(&policy, "s-1", &outside),
+            Err(FsError::OutsideRoots(_))
+        ));
     }
 
     #[test]

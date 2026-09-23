@@ -463,6 +463,26 @@ pub struct AcpConfig {
         web = "elevation:restricts which coding agents a session may run"
     )]
     pub allowed_agents: Vec<String>,
+    /// Extra directories every structured view session may read and write
+    /// through the ACP `fs/*` requests, on top of its own working directory.
+    /// Absolute paths only; anything else is ignored with a warning. For a
+    /// shared directory every agent must reach, such as a coordination
+    /// directory outside all projects. Agents that read files themselves
+    /// (claude) are not affected; agents that delegate file access to aoe
+    /// (grok) otherwise get "path is outside session roots". Not applied to
+    /// container-sandboxed sessions, whose paths are container paths.
+    ///
+    /// This widens what agents may touch, so like `allowed_agents` it is read
+    /// from the global config only and the web surface requires elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Extra file roots",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:widens which directories coding agents may read and write"
+    )]
+    pub extra_fs_roots: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -637,6 +657,7 @@ impl Default for AcpConfig {
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
+            extra_fs_roots: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),

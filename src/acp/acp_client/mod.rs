@@ -481,7 +481,10 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                roots.extend(crate::acp::fs_handler::configured_extra_roots());
+                (None, Arc::new(FsPolicy::new(roots)))
+            }
         };
         let resources = SessionResources {
             fs_policy,
@@ -594,7 +597,10 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                roots.extend(crate::acp::fs_handler::configured_extra_roots());
+                (None, Arc::new(FsPolicy::new(roots)))
+            }
         };
         let resources = SessionResources {
             fs_policy,
