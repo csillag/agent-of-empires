@@ -1168,6 +1168,7 @@ mod tests {
                     socket,
                     tmp.path().into(),
                     vec![],
+                    vec![],
                     "sid-stored".into(),
                     false,
                     AcpSessionId("resume".into()),
@@ -1340,6 +1341,7 @@ mod tests {
                 socket,
                 temp.path().into(),
                 vec![],
+                vec![],
                 "stale".into(),
                 true,
                 AcpSessionId("native-resume".into()),
@@ -1466,6 +1468,7 @@ mod tests {
             let mut client = AcpClient::attach(
                 socket,
                 temp.path().into(),
+                vec![],
                 vec![],
                 "stale".into(),
                 true,

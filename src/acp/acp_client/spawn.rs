@@ -22,6 +22,9 @@ pub struct SpawnConfig {
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
+    /// The subset of `additional_dirs` that is read-only: aoe's `fs/*`
+    /// handler refuses writes there (the session's read-only directories).
+    pub read_only_dirs: Vec<PathBuf>,
     /// Request-sourced provider env, filtered by `provider_env_denyreason`.
     pub provider_env: Vec<(String, String)>,
     /// Trusted operator `environment` entries, empty for sandboxed agents.

@@ -175,17 +175,18 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                         "adopting build-stale structured view worker to drain in-flight turn before respawn"
                     );
                 }
-                let sandbox = {
+                let (sandbox, session_dirs) = {
                     let instances = state.instances.read().await;
-                    instances
-                        .iter()
-                        .find(|i| i.id == id)
-                        .and_then(|i| i.sandbox_info.clone())
+                    let inst = instances.iter().find(|i| i.id == id);
+                    (
+                        inst.and_then(|i| i.sandbox_info.clone()),
+                        inst.map(|i| i.session_dirs.clone()).unwrap_or_default(),
+                    )
                 };
                 let attach = state.acp_supervisor.attach_inner(
                     id.clone(),
                     PathBuf::from(&target.project_path),
-                    vec![],
+                    session_dirs,
                     in_flight_turn,
                     sandbox,
                     reservation,
@@ -326,6 +327,7 @@ async fn build_spawn_request(
         acp_effort,
         agent_model,
         claude_store_pin,
+        session_dirs,
     ) = {
         let _guard = inst_lock.lock().await;
         let instances = service.instances.read().await;
@@ -341,6 +343,7 @@ async fn build_spawn_request(
             inst.agent_model.clone(),
             inst.selected_claude_conversation()
                 .and_then(|(_, execution)| crate::session::capture::ClaudeStorePin::of(execution)),
+            inst.session_dirs.clone(),
         )
     };
     let agent = supervisor
@@ -374,6 +377,7 @@ async fn build_spawn_request(
         tool: target.tool.clone(),
         cwd,
         additional_dirs: vec![],
+        session_dirs,
         provider_env: vec![],
         model: agent_model,
         // `acp_effort` only holds a user-set effort, so presence is its provenance.

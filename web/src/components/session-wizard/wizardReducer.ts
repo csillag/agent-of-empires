@@ -1,4 +1,4 @@
-import type { AgentInfo, GroupInfo, ProfileInfo } from "../../lib/types";
+import type { AgentInfo, GroupInfo, ProfileInfo, SessionDirInput } from "../../lib/types";
 import { slugifyBranch } from "./sessionNames";
 
 export interface WizardData {
@@ -25,6 +25,9 @@ export interface WizardData {
   sandboxEnabled: boolean;
   sandboxImage: string;
   extraEnv: string[];
+  /** Directories the agent may reach besides its working directory, each
+   *  read-only or read-write. Seeded from `[session] default_dirs`. */
+  sessionDirs: SessionDirInput[];
   extraRepoPaths: string[];
   /** Per extra repo base branch, keyed by path; outranks `baseBranch`. */
   repoBases: Record<string, string>;
@@ -76,6 +79,9 @@ export type Action =
       worktreeEnabled: boolean;
       tool: string;
       extraEnv: string[];
+      /** Omitted by callers that have no directory defaults to apply (the
+       *  profile picker), which leaves the current list alone. */
+      sessionDirs?: SessionDirInput[];
       agentModel?: string;
       agentEffort?: string;
       useStructuredView?: boolean;
@@ -106,6 +112,7 @@ export const initialData: WizardData = {
   sandboxEnabled: false,
   sandboxImage: "",
   extraEnv: [],
+  sessionDirs: [],
   extraRepoPaths: [],
   repoBases: {},
   profileDirty: false,
@@ -122,7 +129,7 @@ export const initialData: WizardData = {
 };
 
 // Tracked even without a profile so mount-time seeding does not stomp early edits.
-const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"];
+const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "sessionDirs", "agentModel", "agentEffort"];
 
 function setField(data: WizardData, field: string, value: unknown): WizardData {
   const next = { ...data, [field]: value };
@@ -235,6 +242,7 @@ export function reducer(state: WizardState, action: Action): WizardState {
           profileWorktreeDefault: action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
+          sessionDirs: action.sessionDirs ?? state.data.sessionDirs,
           agentModel: action.agentModel ?? "",
           agentEffort: action.agentEffort ?? "",
           useStructuredView,

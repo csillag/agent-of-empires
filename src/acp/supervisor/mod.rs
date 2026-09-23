@@ -218,6 +218,11 @@ pub struct SpawnRequest {
     pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
+    /// The session's stored directory list (`Instance.session_dirs`). Every
+    /// path joins `additional_dirs` (ACP additionalDirectories, aoe's fs
+    /// roots); read-only ones are write-refused by aoe's fs handler; and the
+    /// list is exported to a host agent's environment for its own sandbox.
+    pub session_dirs: Vec<crate::session::session_dirs::SessionDir>,
     pub provider_env: Vec<(String, String)>,
     pub model: Option<String>,
     pub effort: Option<String>,

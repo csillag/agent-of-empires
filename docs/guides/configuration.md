@@ -108,6 +108,34 @@ sidebar_position = "left" # left | right; TUI session list
 
 Per-agent structured view defaults live under `[acp]`, not `[session]`:
 
+### Session directories
+
+Each session has a list of directories its agent may reach besides its working
+directory, each `read-only` or `read-write`. The web wizard shows it under
+"Directories", pre-filled from `default_dirs`; every entry can be edited or
+removed per session. A session created through the API or CLI gets exactly
+the list its request names. The code default is empty.
+
+```toml
+[session]
+default_dirs = [
+    { path = "/home/me/shared-notes", access = "read-write" },
+    { path = "/srv/reference", access = "read-only" },
+]
+```
+
+The list is applied at every worker start (spawn, respawn, reattach):
+
+- aoe's own `fs/*` handler allows the listed directories and refuses writes
+  into read-only ones.
+- Every host agent process gets `AOE_SESSION_DIRS_READ_ONLY` and
+  `AOE_SESSION_DIRS_READ_WRITE` (colon-separated), so a launcher can hand the
+  list to an agent that sandboxes itself.
+- ACP `additionalDirectories` at `session/new` carries every listed path.
+  That scopes agents that honor it, but it is not a sandbox and cannot
+  express read-only.
+
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `acp.offer_structured_in_new_session` | `false` | Offer the structured view in the TUI: the Structured toggle in the new-session dialog, and switching a terminal session into it. Off, every TUI-created session is a terminal. The web dashboard always offers it. |

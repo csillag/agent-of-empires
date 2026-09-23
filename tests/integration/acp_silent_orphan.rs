@@ -106,6 +106,7 @@ async fn observe_parked_turn(
         socket_path,
         std::env::temp_dir(),
         vec![],
+        vec![],
         preseed.to_string(),
         false,
         AcpSessionId(preseed.into()),
@@ -352,6 +353,7 @@ async fn usage_evidence_survives_activity_and_drain() {
         let mut client = AcpClient::attach(
             socket_path,
             std::env::temp_dir(),
+            vec![],
             vec![],
             preseed.to_string(),
             false,
