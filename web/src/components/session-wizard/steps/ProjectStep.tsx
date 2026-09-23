@@ -22,6 +22,20 @@ interface Props {
   onSelectSavedProject?: (override: boolean | undefined) => void;
 }
 
+/** A title as one display line: control and bidi-format characters become
+ *  spaces and whitespace runs collapse. Code points are compared directly
+ *  (not a regex range) to stay clear of `no-control-regex`. */
+function oneLine(text: string): string {
+  return Array.from(text, (ch) => {
+    const c = ch.codePointAt(0) ?? 0;
+    const drop = c < 0x20 || (c >= 0x7f && c < 0xa0) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069);
+    return drop ? " " : ch;
+  })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectSavedProject }: Props) {
   // Until a tab is picked, show Recent while loading, when there are picks, or
   // when a remembered path is set (so its selection shows); else Browse.
@@ -68,7 +82,10 @@ export function ProjectStep({ data, onChange, initialTab, agents = [], onSelectS
     onChange("useWorktree", false);
     onChange("attachExisting", false);
     onChange("importAcpSessionId", s.session_id);
-    if (s.title) onChange("title", s.title.slice(0, 60));
+    // The server flattens the title to one line; flatten again so an older
+    // server (or any stray control character) can't make the create call
+    // fail on "Invalid control character ... in title".
+    if (s.title) onChange("title", oneLine(s.title).slice(0, 60));
   };
 
   return (
