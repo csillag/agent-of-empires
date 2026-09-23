@@ -574,6 +574,14 @@ export interface DockerStatusResponse {
 }
 
 /** Request body for POST /api/sessions */
+/** One entry of a session's directory list: a directory the agent may reach
+ *  besides its working directory. Mirrors `SessionDir` in
+ *  `src/session/session_dirs.rs`. */
+export interface SessionDirInput {
+  path: string;
+  access: "read-only" | "read-write";
+}
+
 export interface CreateSessionRequest {
   title?: string;
   path: string;
@@ -600,6 +608,9 @@ export interface CreateSessionRequest {
   repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
+  /** Directories the agent may reach besides its working directory. The
+   *  wizard pre-fills them from `[session] default_dirs`. */
+  session_dirs?: SessionDirInput[];
   profile?: string;
   /** Substrate selection: true → ACP-based acp (Beta),
    *  false → tmux passthrough (legacy). Server defaults to true on

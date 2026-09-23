@@ -93,6 +93,9 @@ impl SandboxPathMap {
 #[derive(Debug, Clone)]
 pub struct FsPolicy {
     pub allowed_roots: Vec<PathBuf>,
+    /// Roots that may be read but not written (a session's read-only
+    /// directories, `crate::session::session_dirs`).
+    pub read_only_roots: Vec<PathBuf>,
     /// When set, agent-reported paths are translated through this map
     /// before the inside-roots check. The agent lives inside the
     /// container; allowed_roots are host paths.
@@ -103,6 +106,17 @@ impl FsPolicy {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
             allowed_roots: roots,
+            read_only_roots: Vec::new(),
+            sandbox_map: None,
+        }
+    }
+
+    /// Readable and writable `roots`, plus `read_only` roots that reads may
+    /// reach and writes may not.
+    pub fn with_read_only(roots: Vec<PathBuf>, read_only: Vec<PathBuf>) -> Self {
+        Self {
+            allowed_roots: roots,
+            read_only_roots: read_only,
             sandbox_map: None,
         }
     }
@@ -110,6 +124,7 @@ impl FsPolicy {
     pub fn with_sandbox_map(roots: Vec<PathBuf>, map: SandboxPathMap) -> Self {
         Self {
             allowed_roots: roots,
+            read_only_roots: Vec::new(),
             sandbox_map: Some(map),
         }
     }
@@ -125,6 +140,16 @@ impl FsPolicy {
     /// closes the TOCTOU between policy check and the actual `write`
     /// (which follows symlinks by default).
     pub fn resolve_inside(&self, path: &Path) -> Result<PathBuf, FsError> {
+        self.resolve(path, true)
+    }
+
+    /// Like [`Self::resolve_inside`], but only writable roots qualify: a path
+    /// under a read-only root is `OutsideRoots` for a write.
+    pub fn resolve_writable(&self, path: &Path) -> Result<PathBuf, FsError> {
+        self.resolve(path, false)
+    }
+
+    fn resolve(&self, path: &Path, include_read_only: bool) -> Result<PathBuf, FsError> {
         if !path.is_absolute() {
             return Err(FsError::NotAbsolute(path.to_path_buf()));
         }
@@ -162,7 +187,12 @@ impl FsPolicy {
             }
         }
 
-        for root in &self.allowed_roots {
+        let read_only: &[PathBuf] = if include_read_only {
+            &self.read_only_roots
+        } else {
+            &[]
+        };
+        for root in self.allowed_roots.iter().chain(read_only) {
             let root_canonical = root.canonicalize().unwrap_or_else(|_| root.clone());
             if canonical.starts_with(&root_canonical) {
                 return Ok(canonical);
@@ -187,7 +217,7 @@ pub fn handle_write(
     path: &Path,
     contents: &str,
 ) -> Result<(), FsError> {
-    let resolved = policy.resolve_inside(path)?;
+    let resolved = policy.resolve_writable(path)?;
     if let Some(parent) = resolved.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -266,6 +296,25 @@ mod tests {
         let outside = std::env::temp_dir().join("definitely-not-in-temp-dir-of-test");
         let result = policy.resolve_inside(&outside);
         assert!(matches!(result, Err(FsError::OutsideRoots(_))));
+    }
+
+    #[test]
+    fn read_only_root_reads_but_refuses_writes() {
+        let cwd = tempfile::tempdir().unwrap();
+        let reference = tempfile::tempdir().unwrap();
+        let file = reference.path().join("notes.md");
+        fs::write(&file, "ref").unwrap();
+        let policy = FsPolicy::with_read_only(
+            vec![cwd.path().to_path_buf()],
+            vec![reference.path().to_path_buf()],
+        );
+        assert_eq!(handle_read(&policy, "s-1", &file).unwrap(), "ref");
+        assert!(matches!(
+            handle_write(&policy, "s-1", &file, "changed"),
+            Err(FsError::OutsideRoots(_))
+        ));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "ref");
+        handle_write(&policy, "s-1", &cwd.path().join("out.md"), "ok").unwrap();
     }
 
     #[test]

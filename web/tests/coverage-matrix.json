@@ -3132,6 +3132,19 @@
       "components": ["web/src/components/diff/DiffFileList.tsx"]
     },
     {
+      "id": "wizard.session-directories",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/components/session-wizard/steps/__tests__/SessionDirsEditor.test.tsx",
+        "src/components/session-wizard/wizardReducer.test.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/steps/SessionDirsEditor.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ]
+    },
+    {
       "id": "wizard.per-repo-base-branch",
       "kind": "vitest",
       "risk": "medium",

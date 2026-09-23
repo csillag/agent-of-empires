@@ -601,6 +601,12 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
+    /// Directories this session's agent may reach besides its working
+    /// directory, each read-only or read-write. Set at creation, passed to
+    /// every spawn, respawn and reattach (see `crate::session::session_dirs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_dirs: Vec<crate::session::session_dirs::SessionDir>,
+
     // Live process state and durable capture-generation guards.
     /// Latest ACP initialize result for session/load. A daemon restart returns
     /// this to unknown until the worker reconnects.

@@ -508,6 +508,7 @@ async fn admit_and_create(
         agent_effort: None,
         import_acp_session_id: None,
         fork_seed: None,
+        session_dirs: Vec::new(),
     };
 
     // Resolve an idempotent replay/conflict BEFORE charging admission, so a

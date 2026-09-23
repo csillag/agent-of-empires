@@ -31,6 +31,7 @@ pub mod sandbox_store_reclaim;
 pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
+pub mod session_dirs;
 pub mod skills_model;
 pub mod smart_rename;
 pub mod stop;

@@ -463,6 +463,29 @@ pub struct AcpConfig {
         web = "elevation:restricts which coding agents a session may run"
     )]
     pub allowed_agents: Vec<String>,
+    /// Agents that are NOT offered aoe's ACP terminal and file-system
+    /// capabilities, so they run shell commands and read and write files
+    /// themselves. Matched against the session's agent key and its tool name
+    /// (a custom agent's `[session.custom_agents]` name, e.g. grok).
+    ///
+    /// For an agent that sandboxes itself: commands aoe runs on its behalf
+    /// run in aoe's own context, outside that sandbox. grok is the case in
+    /// point, and it also sends a whole shell line as `terminal/create`'s
+    /// program name, which aoe cannot exec. Applied when a worker starts;
+    /// a reattached worker keeps what its runner negotiated.
+    ///
+    /// Changes where an agent's commands run, so like `allowed_agents` it is
+    /// read from the global config only and the web surface requires
+    /// elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Agents that do their own I/O",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:changes where coding agents run commands and file access"
+    )]
+    pub local_io_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -634,6 +657,7 @@ impl Default for AcpConfig {
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
+            local_io_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),
@@ -1138,6 +1162,15 @@ pub struct SessionConfig {
         category = "Agents"
     )]
     pub custom_agents: HashMap<String, String>,
+
+    /// Directories the new-session wizard pre-fills into a session's list,
+    /// each read-only or read-write (see `crate::session::session_dirs`).
+    /// Host policy, set in the config file; the code default is empty. Each
+    /// entry can be removed or changed per session, and a session created
+    /// without the wizard gets exactly the list its request names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[setting(skip)]
+    pub default_dirs: Vec<crate::session::session_dirs::SessionDir>,
 
     /// Status detection mapping: agent=builtin (e.g. lenovo-claude=claude).
     /// Maps a custom (or built-in) agent to another agent's status detection
@@ -1743,6 +1776,7 @@ impl Default for SessionConfig {
             mouse_capture: true,
             host_tab_title: true,
             custom_agents: HashMap::new(),
+            default_dirs: Vec::new(),
             agent_detect_as: HashMap::new(),
             agent_config_dir: HashMap::new(),
             agent_acp_cmd: HashMap::new(),

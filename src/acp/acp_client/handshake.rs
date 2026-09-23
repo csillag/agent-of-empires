@@ -24,12 +24,16 @@ pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) 
 /// `client_info` is mandatory here: strict agent backends (Mistral Vibe's
 /// `vibe-acp`) reject an initialize whose `client_name`/`client_version` are
 /// empty strings, which is what omitting it serializes to. See issue #2767.
-pub(super) fn build_initialize_request() -> InitializeRequest {
+///
+/// `local_io` withholds the fs and terminal capabilities, so the agent does
+/// its own file and shell I/O (see `[acp] local_io_agents`).
+pub(super) fn build_initialize_request(local_io: bool) -> InitializeRequest {
+    let delegate = !local_io;
     let capabilities = ClientCapabilities::new()
         .fs(FileSystemCapabilities::new()
-            .read_text_file(true)
-            .write_text_file(true))
-        .terminal(true)
+            .read_text_file(delegate)
+            .write_text_file(delegate))
+        .terminal(delegate)
         // Advertise form-mode elicitation so claude-agent-acp
         // (>=0.44) re-enables AskUserQuestion and routes it to us as
         // an `elicitation/create` request. Without this the adapter
@@ -41,6 +45,23 @@ pub(super) fn build_initialize_request() -> InitializeRequest {
             Implementation::new("agent-of-empires", env!("CARGO_PKG_VERSION"))
                 .title("Agent of Empires"),
         )
+}
+
+/// True when `[acp] local_io_agents` (global config only) names any of
+/// `names`: the session's agent key and its tool.
+pub(super) fn uses_local_io(names: &[&str]) -> bool {
+    let listed = crate::session::config::load_config()
+        .ok()
+        .flatten()
+        .map(|c| c.acp.local_io_agents)
+        .unwrap_or_default();
+    local_io_listed(&listed, names)
+}
+
+fn local_io_listed(listed: &[String], names: &[&str]) -> bool {
+    names
+        .iter()
+        .any(|name| !name.is_empty() && listed.iter().any(|l| l == name))
 }
 
 /// Wait for the connection task to finish the ACP handshake (or fail).
@@ -113,10 +134,37 @@ mod tests {
         // Regression for #2767: strict agent backends (Mistral Vibe) reject an
         // initialize whose client_name/client_version are empty. Our request
         // must always send a populated client_info.
-        let req = build_initialize_request();
+        let req = build_initialize_request(false);
         let info = req.client_info.expect("client_info must be set");
         assert_eq!(info.name, "agent-of-empires");
         assert!(!info.version.is_empty());
+    }
+
+    #[test]
+    fn delegating_agents_are_offered_fs_and_terminal() {
+        let caps = build_initialize_request(false).client_capabilities;
+        assert!(caps.terminal);
+        assert!(caps.fs.read_text_file && caps.fs.write_text_file);
+        assert!(caps.elicitation.is_some());
+    }
+
+    #[test]
+    fn local_io_agents_are_offered_neither_but_keep_elicitation() {
+        let caps = build_initialize_request(true).client_capabilities;
+        assert!(!caps.terminal);
+        assert!(!caps.fs.read_text_file && !caps.fs.write_text_file);
+        assert!(caps.elicitation.is_some());
+    }
+
+    #[test]
+    fn local_io_matches_agent_key_or_tool_exactly() {
+        let listed = vec!["grok".to_string()];
+        assert!(local_io_listed(&listed, &["default", "grok"]));
+        assert!(local_io_listed(&listed, &["grok", ""]));
+        assert!(!local_io_listed(&listed, &["claude", "claude"]));
+        assert!(!local_io_listed(&listed, &["grok-build", "groks"]));
+        assert!(!local_io_listed(&[], &["grok"]));
+        assert!(!local_io_listed(&["".to_string()], &["", ""]));
     }
 
     #[test]

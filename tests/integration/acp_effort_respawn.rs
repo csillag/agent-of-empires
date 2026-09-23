@@ -38,6 +38,7 @@ fn spawn_config(
         },
         cwd: std::env::temp_dir(),
         additional_dirs: vec![],
+        read_only_dirs: vec![],
         provider_env: env,
         host_environment: vec![],
         default_effort_explicit: default_effort.is_some(),

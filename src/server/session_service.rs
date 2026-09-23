@@ -1848,6 +1848,7 @@ mod tests {
             agent_effort: None,
             import_acp_session_id: None,
             fork_seed: None,
+            session_dirs: Vec::new(),
         }
     }
 

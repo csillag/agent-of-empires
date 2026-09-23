@@ -256,6 +256,7 @@ pub(super) async fn run_connection_task<W, R>(
     let mut lifecycle_signal_rx = lifecycle_signal_rx;
     let current_prompt_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let current_prompt_epoch_for_notif = current_prompt_epoch.clone();
+    let local_io = resources.local_io;
     let res_read = resources.clone();
     let res_write = resources.clone();
     let res_term_create = resources.clone();
@@ -937,14 +938,14 @@ pub(super) async fn run_connection_task<W, R>(
             // the daemon requests it over the control channel. Direct stdio
             // sends the same request through the crate connection.
             let init: InitializeResponse = if let Some(control) = control_client.as_ref() {
-                let params = serde_json::to_value(build_initialize_request())
+                let params = serde_json::to_value(build_initialize_request(local_io))
                     .map_err(|e| acp_internal_error(format!("serialize initialize params: {e}")))?;
                 let result = control.initialize(params).await?;
                 serde_json::from_value(result)
                     .map_err(|e| acp_internal_error(format!("deserialize initialize result: {e}")))?
             } else {
                 connection
-                    .send_request(build_initialize_request())
+                    .send_request(build_initialize_request(local_io))
                     .block_task()
                     .await?
             };
@@ -3419,6 +3420,7 @@ mod cancel_fairness_tests {
             cwd: cwd.clone(),
             label: "s-fair".to_string(),
             sandbox: None,
+            local_io: false,
         };
         let (paused_tx, mut paused_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();

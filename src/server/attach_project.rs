@@ -350,6 +350,7 @@ async fn spawn_worker(state: &Arc<AppState>, id: &str) -> WorkerOutcome {
             // attach converted the session, not the path it started from.
             cwd: PathBuf::from(&inst.project_path),
             additional_dirs: vec![],
+            session_dirs: inst.session_dirs.clone(),
             provider_env: vec![],
             model: inst.agent_model.clone(),
             assert_model: inst.agent_model_pending,

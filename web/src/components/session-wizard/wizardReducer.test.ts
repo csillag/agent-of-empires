@@ -454,3 +454,54 @@ describe("SessionWizard reducer / worktree gating on non-git paths", () => {
     expect(scratchOn.data.pathIsGitRepo).toBe(true);
   });
 });
+
+describe("SessionWizard reducer / session directories", () => {
+  it("seeds the directory list from the defaults on mount", () => {
+    const dirs = [{ path: "/home/u/commissura", access: "read-write" as const }];
+    const next = reducer(makeState(), {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      sessionDirs: dirs,
+      skipIfDirty: true,
+    });
+    expect(next.data.sessionDirs).toEqual(dirs);
+  });
+
+  it("keeps the current list when the defaults carry none (profile picker)", () => {
+    const dirs = [{ path: "/srv/ref", access: "read-only" as const }];
+    const state = makeState({ data: { ...initialData, sessionDirs: dirs } });
+    const next = reducer(state, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: true,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+    });
+    expect(next.data.sessionDirs).toEqual(dirs);
+  });
+
+  it("an edit to the list marks the wizard dirty, so a late seed does not clobber it", () => {
+    const edited = reducer(makeState(), {
+      type: "SET_FIELD",
+      field: "sessionDirs",
+      value: [{ path: "/mine", access: "read-only" }],
+    });
+    expect(edited.data.profileDirty).toBe(true);
+    const seeded = reducer(edited, {
+      type: "APPLY_PROFILE_DEFAULTS",
+      yoloMode: false,
+      sandboxEnabled: false,
+      worktreeEnabled: false,
+      tool: "claude",
+      extraEnv: [],
+      sessionDirs: [{ path: "/default", access: "read-write" }],
+      skipIfDirty: true,
+    });
+    expect(seeded.data.sessionDirs).toEqual([{ path: "/mine", access: "read-only" }]);
+  });
+});

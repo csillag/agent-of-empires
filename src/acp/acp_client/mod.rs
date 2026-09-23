@@ -120,6 +120,8 @@ struct SessionResources {
     cwd: PathBuf,
     label: String,
     sandbox: Option<SessionSandbox>,
+    /// Advertise no fs/terminal capabilities (`[acp] local_io_agents`).
+    local_io: bool,
 }
 
 impl AcpClient {
@@ -365,6 +367,8 @@ impl AcpClient {
         //  - Stdio (in-proc): the legacy direct-spawn path. Retained for
         //    tests where we don't want to depend on `current_exe()` being
         //    a real `aoe` binary, and as a safety valve.
+        // Decided before `config` is taken apart below; see `[acp] local_io_agents`.
+        let local_io = handshake::uses_local_io(&[config.agent_key.as_str(), config.tool.as_str()]);
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
             seed_history_replay: config.seed_history_replay,
@@ -410,6 +414,8 @@ impl AcpClient {
                 socket_path,
                 config.cwd,
                 config.additional_dirs,
+                local_io,
+                config.read_only_dirs,
                 mode,
                 session_id,
                 pending_responders,
@@ -438,6 +444,8 @@ impl AcpClient {
         Self::start_with_stdio(
             config.cwd,
             config.additional_dirs,
+            local_io,
+            config.read_only_dirs,
             mode,
             session_id,
             child,
@@ -462,6 +470,8 @@ impl AcpClient {
     async fn start_with_stdio(
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        local_io: bool,
+        read_only_dirs: Vec<PathBuf>,
         mode: ConnectMode,
         session_id: AcpSessionId,
         child: Arc<Mutex<tokio::process::Child>>,
@@ -506,7 +516,16 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                // Read-only session dirs ride in `additional_dirs` too (for ACP
+                // additionalDirectories), so take them back out of the writable
+                // roots; the cwd always stays writable.
+                roots.retain(|r| r == &cwd || !read_only_dirs.contains(r));
+                (
+                    None,
+                    Arc::new(FsPolicy::with_read_only(roots, read_only_dirs)),
+                )
+            }
         };
         let resources = SessionResources {
             fs_policy,
@@ -514,6 +533,7 @@ impl AcpClient {
             cwd: cwd.clone(),
             label: session_label.clone(),
             sandbox: sandbox_handle,
+            local_io,
         };
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
@@ -580,6 +600,8 @@ impl AcpClient {
         socket_path: PathBuf,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        local_io: bool,
+        read_only_dirs: Vec<PathBuf>,
         mode: ConnectMode,
         session_id: AcpSessionId,
         pending_responders: PendingResponders,
@@ -624,7 +646,16 @@ impl AcpClient {
                 Some(handle),
                 Arc::new(FsPolicy::with_sandbox_map(roots, path_map)),
             ),
-            None => (None, Arc::new(FsPolicy::new(roots))),
+            None => {
+                // Read-only session dirs ride in `additional_dirs` too (for ACP
+                // additionalDirectories), so take them back out of the writable
+                // roots; the cwd always stays writable.
+                roots.retain(|r| r == &cwd || !read_only_dirs.contains(r));
+                (
+                    None,
+                    Arc::new(FsPolicy::with_read_only(roots, read_only_dirs)),
+                )
+            }
         };
         let resources = SessionResources {
             fs_policy,
@@ -632,6 +663,7 @@ impl AcpClient {
             cwd: cwd.clone(),
             label: session_id.0.clone(),
             sandbox: sandbox_handle,
+            local_io,
         };
 
         let session_label = session_id.0.clone();
@@ -752,6 +784,7 @@ impl AcpClient {
         socket_path: PathBuf,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        read_only_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
         session_id: AcpSessionId,
@@ -784,6 +817,8 @@ impl AcpClient {
             socket_path,
             cwd,
             additional_dirs,
+            handshake::uses_local_io(&[agent_key.as_str()]),
+            read_only_dirs,
             mode,
             session_id,
             pending_responders,
