@@ -2033,6 +2033,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             env.push(("AOE_AGENT_MODEL".into(), model));
         }
 
+        let session_dirs = crate::session::session_dirs::usable(&session_dirs);
         // The session's directory list. A host agent also gets it in its
         // environment, where a self-sandboxing agent's launcher reads it; a
         // container-sandboxed agent sees container paths, so it gets neither
@@ -3712,8 +3713,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         sandbox: Option<SandboxInfo>,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
-        // The same split a fresh spawn makes (`spawn_inner`): every listed
-        // path for the fs roots, read-only marking only for a host session.
+        // The same split a fresh spawn makes (`spawn_inner`): every usable
+        // listed path for the fs roots, read-only marking only for a host
+        // session.
+        let session_dirs = crate::session::session_dirs::usable(&session_dirs);
         let additional_dirs = crate::session::session_dirs::all_paths(&session_dirs);
         let read_only_dirs = if sandbox.is_none() {
             crate::session::session_dirs::paths_with(
