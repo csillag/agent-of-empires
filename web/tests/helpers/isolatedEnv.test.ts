@@ -92,6 +92,11 @@ const INHERITED_BY_CONTRACT = new Set([
   "AOE_TEST_TOKEN_LIFETIME_SECS",
   // Rust test-binary re-entry marker, compiled out of aoe serve.
   "AOE_AGENT_PROBE_TEST_CHILD",
+  // The session's directory list, which aoe WRITES into each agent process's
+  // environment (`src/session/session_dirs.rs`) and never reads; an inherited
+  // value is overwritten at spawn and cannot steer the daemon.
+  "AOE_SESSION_DIRS_READ_ONLY",
+  "AOE_SESSION_DIRS_READ_WRITE",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",
