@@ -463,6 +463,29 @@ pub struct AcpConfig {
         web = "elevation:restricts which coding agents a session may run"
     )]
     pub allowed_agents: Vec<String>,
+    /// Agents that are NOT offered aoe's ACP terminal and file-system
+    /// capabilities, so they run shell commands and read and write files
+    /// themselves. Matched against the session's agent key and its tool name
+    /// (a custom agent's `[session.custom_agents]` name, e.g. grok).
+    ///
+    /// For an agent that sandboxes itself: commands aoe runs on its behalf
+    /// run in aoe's own context, outside that sandbox. grok is the case in
+    /// point, and it also sends a whole shell line as `terminal/create`'s
+    /// program name, which aoe cannot exec. Applied when a worker starts;
+    /// a reattached worker keeps what its runner negotiated.
+    ///
+    /// Changes where an agent's commands run, so like `allowed_agents` it is
+    /// read from the global config only and the web surface requires
+    /// elevation.
+    #[serde(default)]
+    #[setting(
+        label = "Agents that do their own I/O",
+        widget = "list",
+        global_only,
+        advanced,
+        web = "elevation:changes where coding agents run commands and file access"
+    )]
+    pub local_io_agents: Vec<String>,
     /// Hard cap on simultaneously running acp agent subprocesses;
     /// additional sessions queue.
     #[serde(default = "default_max_workers")]
@@ -637,6 +660,7 @@ impl Default for AcpConfig {
             default_agent: default_agent(),
             restrict_agents: false,
             allowed_agents: Vec::new(),
+            local_io_agents: Vec::new(),
             max_concurrent_workers: default_max_workers(),
             replay_events: default_replay_events(),
             node_path: String::new(),
