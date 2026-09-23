@@ -249,9 +249,11 @@ pub(super) fn map_update_to_events(
         // text block, so without this the user sees a turn of bare tool calls
         // and the only record of what the agent thought it said is discarded.
         // Adapters stream signature-only chunks with empty text; those carry
-        // no words and stay activity-only.
+        // no words and stay activity-only. A whitespace-only chunk is NOT
+        // wordless: token streams (grok) send the space between two words as
+        // its own chunk, and dropping it glues them ("section5", "all8").
         SessionUpdate::AgentThoughtChunk(chunk) => match chunk.content {
-            ContentBlock::Text(text) if !text.text.trim().is_empty() => vec![
+            ContentBlock::Text(text) if !text.text.is_empty() => vec![
                 Event::ThinkingStarted,
                 Event::AgentThoughtChunk { text: text.text },
             ],
@@ -1088,14 +1090,16 @@ mod tests {
     fn map_agent_thought_chunk_keeps_text_and_still_signals_activity() {
         use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
         // (chunk text, expected event kinds)
-        let cases: [(&str, &[&str]); 4] = [
+        let cases: [(&str, &[&str]); 5] = [
             (
                 "Both port forwards verified; handing to the implementer now.",
                 &["thinking_started", "agent_thought_chunk"],
             ),
             ("", &["thinking_started"]),
-            // Whitespace-only is as wordless as empty.
-            ("  \n ", &["thinking_started"]),
+            // A lone space is the gap between two streamed words, not noise:
+            // it is kept verbatim so the words don't glue together.
+            (" ", &["thinking_started", "agent_thought_chunk"]),
+            ("  \n ", &["thinking_started", "agent_thought_chunk"]),
             ("x", &["thinking_started", "agent_thought_chunk"]),
         ];
         for (text, want) in cases {
