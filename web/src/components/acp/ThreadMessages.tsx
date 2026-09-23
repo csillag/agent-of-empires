@@ -58,9 +58,31 @@ export function AssistantMessage() {
   return (
     <MessagePrimitive.Root className="group mt-4 mr-auto w-full">
       <div className="text-sm text-text-primary leading-relaxed">
-        <MessagePrimitive.Parts components={{ Text: AssistantText, tools: { Override: AssistantToolCall } }} />
+        <MessagePrimitive.Parts
+          components={{
+            Text: AssistantText,
+            Reasoning: AssistantReasoning,
+            tools: { Override: AssistantToolCall },
+          }}
+        />
       </div>
     </MessagePrimitive.Root>
+  );
+}
+
+/** Raw reasoning from an agent listed in `[acp] reasoning_agents` (e.g.
+ *  grok): one collapsed "Thinking" block per run, so it doesn't read as a
+ *  second reply interleaved with the real one. Narration-style thinking
+ *  (claude) stays as "update" text rows and never reaches here. */
+function AssistantReasoning({ text }: { text: string }) {
+  if (!text.trim()) return null;
+  return (
+    <details className="my-2 text-text-dim">
+      <summary className="cursor-pointer select-none text-xs italic">Thinking…</summary>
+      <div className="mt-1 border-l-2 border-surface-700 pl-3 text-xs">
+        <Markdown text={text.trim()} smooth={false} />
+      </div>
+    </details>
   );
 }
 

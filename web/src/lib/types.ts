@@ -78,6 +78,10 @@ export interface SessionResponse {
   keeps_context?: boolean;
   /** Slash commands that reset the conversation for this agent. */
   clear_aliases?: string[];
+  /** How this session's thought chunks are shown: `update` rows (claude's
+   *  narration channel) or a collapsed `reasoning` block (an agent listed in
+   *  `[acp] reasoning_agents`, e.g. grok). Absent reads as `update`. */
+  thought_display?: ThoughtDisplay;
   /** The agent implements ACP `session/fork` (resume-only agents do not). */
   acp_can_fork?: boolean;
   /** Claude's fullscreen renderer is on, so mobile skips copy-mode scrollback workarounds. */
@@ -494,3 +498,6 @@ export interface SettingsFieldDescriptor {
   /** Present only on plugin fields, which have no stored value until saved. */
   default?: unknown;
 }
+
+/** How a session's thought chunks are shown. Mirrors Rust `ThoughtDisplay`. */
+export type ThoughtDisplay = "update" | "reasoning";

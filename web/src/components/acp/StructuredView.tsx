@@ -12,6 +12,7 @@ import { useRespawnSession } from "../../hooks/useRespawnSession";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import { AgentProfileProvider } from "../../lib/agentProfileContext";
+import type { ThoughtDisplay } from "../../lib/types";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
@@ -49,6 +50,9 @@ interface Props {
   acpAgent: string | null;
   /** Server-owned conversation-reset slash aliases (`/clear`, `/new`). */
   clearAliases?: readonly string[];
+  /** `SessionResponse.thought_display`: `reasoning` renders thought chunks
+   *  as a collapsed thinking block instead of "update" rows. */
+  thoughtDisplay?: ThoughtDisplay;
   archivedAt: string | null;
   snoozedUntil: string | null;
   /** Trashed sessions are read-only: no composer or queue strips. */
@@ -68,13 +72,22 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, clearAliases, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } =
-    props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    clearAliases,
+    thoughtDisplay,
+    archivedAt,
+    snoozedUntil,
+    onOpenFileRef,
+    fileRefSession,
+  } = props;
   const [showClearedTurns, setShowClearedTurns] = useState(false);
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
+      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases} thoughtDisplay={thoughtDisplay}>
         <ToolDisplayModeProvider density={toolDensity}>
           <AcpRuntime
             sessionId={sessionId}

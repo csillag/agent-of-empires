@@ -9,6 +9,7 @@ import { hasTodoArrayArgsText, parseJsonObject } from "../../lib/acpArgs";
 import { lastClearIndex } from "../../lib/acpHistoryWindow";
 import type { ActivityRow, ToolCall } from "../../lib/acpTypes";
 import { type AgentProfile, DEFAULT_AGENT_PROFILE, isSubagentToolName } from "../../lib/agentProfiles";
+import type { ThoughtDisplay } from "../../lib/types";
 
 /** Synthetic part for a subagent Task with its child tool calls. */
 export const SUBAGENT_TASK_NAME = "_aoe_subagent_task";
@@ -51,6 +52,7 @@ export function activityToThreadMessages(
   showClearedTurns = false,
   todosEnabled = true,
   profile: AgentProfile = DEFAULT_AGENT_PROFILE,
+  thoughtDisplay: ThoughtDisplay = "update",
 ): ThreadMessageLike[] {
   // Turns before the last /clear are forgotten by the model, so they fold by default.
   const start = showClearedTurns ? -1 : lastClearIndex(rows);
@@ -108,7 +110,7 @@ export function activityToThreadMessages(
       continue;
     }
 
-    currentAssistant ??= new AssistantBuilder(row.id, row.at);
+    currentAssistant ??= new AssistantBuilder(row.id, row.at, thoughtDisplay);
     if (row.kind === "tool_start" && row.tool) {
       currentAssistant.appendToolCall(row.tool);
     } else if (row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") {
@@ -145,6 +147,7 @@ type ToolResult = { content: string; endedAt?: string; stopped?: boolean; async?
 // Loose part shape, cast at build time; the renderer parses argsText itself.
 type DraftPart =
   | { type: "text"; text: string }
+  | { type: "reasoning"; text: string }
   | {
       type: "tool-call";
       toolCallId: string;
@@ -168,10 +171,15 @@ class AssistantBuilder {
   private thoughtRunOpen = false;
   /** Verbatim text of the open update, as streamed. */
   private thoughtRaw = "";
+  /** `update`: thought rows are narration shown as tagged message text.
+   *  `reasoning`: raw reasoning, kept as one assistant-ui `reasoning` part
+   *  per run, which ThreadMessages renders collapsed. */
+  private thoughtDisplay: ThoughtDisplay;
 
-  constructor(id: string, createdAtIso: string) {
+  constructor(id: string, createdAtIso: string, thoughtDisplay: ThoughtDisplay = "update") {
     this.id = `assistant-${id}`;
     this.createdAt = parseDate(createdAtIso);
+    this.thoughtDisplay = thoughtDisplay;
   }
 
   appendText(text: string) {
@@ -191,6 +199,18 @@ class AssistantBuilder {
   appendThought(text: string) {
     if (!text) return;
     const last = this.parts[this.parts.length - 1];
+    if (this.thoughtDisplay === "reasoning") {
+      // Raw reasoning: one part per run, joined verbatim (token fragments,
+      // lone spaces included), never shown as message text.
+      if (this.thoughtRunOpen && last && last.type === "reasoning") {
+        last.text += text;
+        return;
+      }
+      if (!text.trim()) return;
+      this.parts.push({ type: "reasoning", text });
+      this.thoughtRunOpen = true;
+      return;
+    }
     if (this.thoughtRunOpen && last && last.type === "text") {
       this.thoughtRaw += text;
       last.text = formatUpdate(this.thoughtRaw);
