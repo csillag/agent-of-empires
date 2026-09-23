@@ -217,9 +217,16 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
       if (
-        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "sessionDirs", "agentModel", "agentEffort"].includes(
-          action.field,
-        )
+        [
+          "yoloMode",
+          "sandboxEnabled",
+          "useWorktree",
+          "tool",
+          "extraEnv",
+          "sessionDirs",
+          "agentModel",
+          "agentEffort",
+        ].includes(action.field)
       ) {
         newData.profileDirty = true;
       }

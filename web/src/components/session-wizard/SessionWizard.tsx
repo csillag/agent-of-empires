@@ -333,9 +333,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
       custom_instruction: d.customInstruction || undefined,
       // Empty rows (an "Add directory" left blank) are dropped; the server
       // validates the rest and rejects the create on a bad path.
-      session_dirs: d.sessionDirs
-        .map((s) => ({ path: s.path.trim(), access: s.access }))
-        .filter((s) => s.path),
+      session_dirs: d.sessionDirs.map((s) => ({ path: s.path.trim(), access: s.access })).filter((s) => s.path),
       profile: d.profile || undefined,
       // Structured view runs when the agent is ACP-capable and the user
       // kept the per-session toggle on (default). Capability comes from
