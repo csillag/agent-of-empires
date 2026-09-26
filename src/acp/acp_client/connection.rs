@@ -57,7 +57,7 @@ use super::session_identity::{
     ordered_session_request, SessionIngress, SessionIngressNotification,
 };
 use super::session_sandbox::agent_request_cwd;
-use super::steer::{first_text_block, SteerOutcome, SteerRequest};
+use super::steer::{first_text_block, GrokSteerRequest, SteerOutcome, SteerRequest};
 use super::terminal_handlers::{
     handle_create_terminal, handle_kill_terminal, handle_release_terminal, handle_terminal_output,
     handle_wait_for_terminal_exit,
@@ -1026,6 +1026,14 @@ pub(super) async fn run_connection_task<W, R>(
             // cannot leave a client holding a stale `true` after a
             // downgrade. See #2805.
             let steering_capable = agent_compat::supports_steering(expected_agent, &init);
+            // Same `_meta` object as `steering`. Grok sets this on initialize.
+            // Its ACP 0.10 stack strips one `_` before dispatch; see GrokSteerRequest.
+            let grok_shell = init
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("grokShell"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
             let prompt_caps = &init.agent_capabilities.prompt_capabilities;
             let _ = event_tx_for_block
                 .send(Event::PromptCapabilities {
@@ -2171,19 +2179,35 @@ pub(super) async fn run_connection_task<W, R>(
                                 if steer_fut.is_some() {
                                     steer_backlog.push_back(blocks);
                                 } else {
+                                    let method = if grok_shell {
+                                        "__session/steering"
+                                    } else {
+                                        "_session/steering"
+                                    };
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
-                                        "sending _session/steering during in-flight prompt ({} content blocks)",
+                                        method,
+                                        "sending steering during in-flight prompt ({} content blocks)",
                                         blocks.len()
                                     );
-                                    let sent = connection.send_request(SteerRequest::new(
-                                        acp_session_id.clone(),
-                                        blocks.clone(),
-                                    ));
-                                    steer_fut = Some(Box::pin(async move {
-                                        (blocks, sent.block_task().await)
-                                    }));
+                                    if grok_shell {
+                                        let sent = connection.send_request(GrokSteerRequest::new(
+                                            acp_session_id.clone(),
+                                            blocks.clone(),
+                                        ));
+                                        steer_fut = Some(Box::pin(async move {
+                                            (blocks, sent.block_task().await)
+                                        }));
+                                    } else {
+                                        let sent = connection.send_request(SteerRequest::new(
+                                            acp_session_id.clone(),
+                                            blocks.clone(),
+                                        ));
+                                        steer_fut = Some(Box::pin(async move {
+                                            (blocks, sent.block_task().await)
+                                        }));
+                                    }
                                 }
                             }};
                         }
