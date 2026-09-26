@@ -1,0 +1,70 @@
+#!/bin/bash
+# rebuild-chroot [--host <node>] [--swap]   (run on superego as csillag)
+#
+# Rebuilds a brain cell's AoE build chroot (default g4) so its toolchain and
+# -dev libraries match
+# superego's installed versions. Builds into /srv/aoe-build/excalibur-arm64.new
+# and verifies it; the live chroot is untouched unless --swap is given.
+# --swap waits for the job lock, then replaces the live chroot and carries
+# /home/csillag (bare repo, worktree, target dir) over.
+#
+# Pins: every superego package whose installed version is not excalibur's
+# gets "Pin: version <superego's>" at priority 1001. Versions that have left
+# the freia mirror are dpkg-repacked from superego (REPACK below); extend that
+# list when the install step reports a pinned version as unavailable.
+# A host without a chroot yet (a first --swap there) gets /srv/aoe-build and
+# the bootstrap's host tools, installed with --no-upgrade so nothing else on
+# the node moves.
+set -u
+NODE=g4
+SWAP=0
+while [ $# -gt 0 ]; do
+    case $1 in
+      --host) NODE=$2; shift 2 ;;
+      --swap) SWAP=1; shift ;;
+      *) echo "usage: rebuild-chroot [--host <node>] [--swap]" >&2; exit 2 ;;
+    esac
+done
+G4=root@brain-cell-$NODE.lan
+D=/srv/aoe-build
+HOSTTOOLS="mmdebstrap git rsync zstd"
+PKGS="rustc cargo rustfmt rust-clippy libgit2-dev libsqlite3-dev libllhttp-dev nodejs npm"
+REPACK="nodejs libnode137 libnode-dev libsimdutf33"
+CHECK="rustc cargo rustfmt rust-clippy libgit2-dev libsqlite3-dev libssl-dev libzstd-dev libc6-dev nodejs npm tmux git"
+HERE=$(dirname "$(readlink -f "$0")")
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+
+echo "== pins from superego's non-excalibur packages"
+dpkg-query -W -f='${Package} ${Version}\n' | while read -r p v; do
+    apt-cache policy "$p" 2>/dev/null | grep -A1 -F " $v " | grep -q excalibur || echo "$p $v"
+done | awk '{print "Package: "$1"\nPin: version "$2"\nPin-Priority: 1001\n"}' > "$W/superego-pins"
+grep -c '^Package:' "$W/superego-pins"
+
+echo "== repacking from superego: $REPACK"
+( cd "$W" && apt-get download dpkg-repack >/dev/null && dpkg-deb -x dpkg-repack_*.deb x &&
+  for p in $REPACK; do PERL5LIB=x/usr/share/perl5 fakeroot -u perl x/usr/bin/dpkg-repack "$p" >/dev/null || exit 1; done &&
+  mkdir debs && mv ./*_arm64.deb debs/ ) || { echo "repack failed"; exit 1; }
+ls "$W/debs"
+
+echo "== host tools and $D on $NODE"
+ssh -o BatchMode=yes "$G4" "mkdir -p $D && for t in $HOSTTOOLS; do command -v \$t >/dev/null || m=\"\$m \$t\"; done
+    [ -z \"\${m:-}\" ] || DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-upgrade \$m" || { echo "host tools failed on $NODE"; exit 1; }
+
+echo "== bootstrapping $D/excalibur-arm64.new on $NODE"
+scp -q "$W/superego-pins" "$G4:$D/superego-pins" && scp -q "$W"/debs/*.deb "$HERE/bootstrap-chroot" "$G4:$D/" &&
+ssh -o BatchMode=yes -o ServerAliveInterval=30 "$G4" "sh $D/bootstrap-chroot '$PKGS'" || { echo "bootstrap failed"; exit 1; }
+
+echo "== version check against superego"
+dpkg-query -W -f='${Package} ${Version}\n' $CHECK | sort > "$W/want"
+ssh -o BatchMode=yes "$G4" "chroot $D/excalibur-arm64.new dpkg-query -W -f='\${Package} \${Version}\n' $CHECK" | sort > "$W/have"
+if diff "$W/want" "$W/have"; then echo "versions match"; else echo "VERSION MISMATCH (< superego, > chroot): not swapping"; exit 1; fi
+
+[ $SWAP = 1 ] || { echo "built $D/excalibur-arm64.new; rerun with --swap to make it live"; exit 0; }
+ssh -o BatchMode=yes "$G4" "set -e; cd $D; exec 9>job.lock; flock 9
+    if [ -d excalibur-arm64 ]; then
+        rm -rf excalibur-arm64.new/home/csillag
+        mv excalibur-arm64/home/csillag excalibur-arm64.new/home/csillag
+        mv excalibur-arm64 excalibur-arm64.old
+    fi
+    mv excalibur-arm64.new excalibur-arm64
+    rm -rf excalibur-arm64.old; echo swapped"
