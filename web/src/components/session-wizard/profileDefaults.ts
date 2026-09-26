@@ -44,11 +44,13 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
  *  the caller should leave the current list alone. */
 function parseSessionDirs(raw: unknown): SessionDirInput[] | undefined {
   if (!Array.isArray(raw)) return undefined;
-  const dirs = raw.flatMap((entry) => {
+  const dirs = raw.flatMap((entry): SessionDirInput[] => {
     const e = entry as { path?: unknown; access?: unknown };
-    if (typeof e?.path !== "string" || !e.path) return [];
-    if (e.access !== "read-only" && e.access !== "read-write") return [];
-    return [{ path: e.path, access: e.access }];
+    if (typeof e.path !== "string" || e.path.length === 0) return [];
+    if (e.access === "read-only" || e.access === "read-write") {
+      return [{ path: e.path, access: e.access }];
+    }
+    return [];
   });
   return dirs.length > 0 ? dirs : undefined;
 }
