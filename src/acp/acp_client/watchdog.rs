@@ -831,7 +831,7 @@ mod tests {
         let t0 = tokio::time::Instant::now();
         let wall = chrono::Utc::now();
         let arm = |running: bool| {
-            let mut w = SilentOrphanWatchdog::new();
+            let mut w = SilentOrphanWatchdog::default();
             w.apply_signal(L::Progress, t0, wall, CFG);
             w.apply_signal(start("tc", false), t0, wall, CFG);
             w.apply_signal(done("tc", true, Some(K::AsyncAgent)), t0, wall, CFG);

@@ -37,7 +37,6 @@ impl<S: BroadcastSink> Supervisor<S> {
     ) -> JoinHandle<()> {
         let drain = Drain {
             session_id,
-            sink: Arc::clone(&self.sink),
             workers: Arc::clone(&self.workers),
             publisher: Arc::clone(&self.publisher),
             incompatible_binaries: Arc::clone(&self.incompatible_binaries),
@@ -60,7 +59,6 @@ impl<S: BroadcastSink> Supervisor<S> {
 
 struct Drain<S: BroadcastSink> {
     session_id: String,
-    sink: Arc<S>,
     workers: Workers,
     publisher: Arc<SessionPublisher<S>>,
     incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
