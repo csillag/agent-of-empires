@@ -26,7 +26,9 @@ use crate::acp::acp_client::rate_limit::{
     captured_rate_limit_resets_at, classify_rate_limit_error, is_unsupported_session_error,
 };
 use crate::acp::acp_client::reset::ResetSessionOutcome;
-use crate::acp::acp_client::steer::{first_text_block, SteerOutcome, SteerRequest};
+use crate::acp::acp_client::steer::{
+    first_text_block, GrokSteerRequest, SteerOutcome, SteerRequest,
+};
 use crate::acp::acp_client::watchdog::{
     silent_orphan_check_interval, silent_orphan_fast_grace, silent_orphan_grace,
     terminal_stop_reason, SilentOrphanWatchdog, SilentOrphanWatchdogConfig,
@@ -457,17 +459,31 @@ impl Session {
             turn.steer_backlog.push_back(blocks);
             return;
         }
+        let method = if self.grok_shell {
+            "__session/steering"
+        } else {
+            "_session/steering"
+        };
         info!(
             target: "acp.protocol",
             session = %self.shared.session_label,
-            "sending _session/steering during in-flight prompt ({} content blocks)",
+            method,
+            "sending steering during in-flight prompt ({} content blocks)",
             blocks.len()
         );
-        let sent = self.connection.send_request(SteerRequest::new(
-            self.acp_session_id.clone(),
-            blocks.clone(),
-        ));
-        turn.steer_fut = Some(Box::pin(async move { (blocks, sent.block_task().await) }));
+        if self.grok_shell {
+            let sent = self.connection.send_request(GrokSteerRequest::new(
+                self.acp_session_id.clone(),
+                blocks.clone(),
+            ));
+            turn.steer_fut = Some(Box::pin(async move { (blocks, sent.block_task().await) }));
+        } else {
+            let sent = self.connection.send_request(SteerRequest::new(
+                self.acp_session_id.clone(),
+                blocks.clone(),
+            ));
+            turn.steer_fut = Some(Box::pin(async move { (blocks, sent.block_task().await) }));
+        }
     }
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {

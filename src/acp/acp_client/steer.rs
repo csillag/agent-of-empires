@@ -27,9 +27,41 @@ impl SteerRequest {
         Self {
             session_id,
             prompt,
-            meta: serde_json::json!({ "steering": { "idleBehavior": "promptRequired" } }),
+            meta: steer_meta(),
         }
     }
+}
+
+/// Same body as [`SteerRequest`], different wire method.
+///
+/// Grok is built on ACP 0.10. That crate strips one leading `_` from a
+/// custom method before the agent handler sees it, and Grok's handler is
+/// registered as `_session/steering`. Sending `_session/steering` therefore
+/// arrives as `session/steering` and comes back `method not found`, which
+/// AoE surfaces as "Agent was busy; prompt was not sent." The extra
+/// underscore survives the strip. Other agents keep [`SteerRequest`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "__session/steering", response = serde_json::Value)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GrokSteerRequest {
+    session_id: SessionId,
+    prompt: Vec<ContentBlock>,
+    #[serde(rename = "_meta")]
+    meta: serde_json::Value,
+}
+
+impl GrokSteerRequest {
+    pub(super) fn new(session_id: SessionId, prompt: Vec<ContentBlock>) -> Self {
+        Self {
+            session_id,
+            prompt,
+            meta: steer_meta(),
+        }
+    }
+}
+
+fn steer_meta() -> serde_json::Value {
+    serde_json::json!({ "steering": { "idleBehavior": "promptRequired" } })
 }
 
 /// Text of the first text block, for the retry pill on a refused prompt.
@@ -94,6 +126,20 @@ mod tests {
         assert_eq!(wire["sessionId"], "sess-1");
         assert_eq!(wire["_meta"]["steering"]["idleBehavior"], "promptRequired");
         assert_eq!(wire["prompt"][0]["text"], "also check the tests");
+    }
+
+    /// Grok's ACP 0.10 decoder strips one `_`. The method it matches is
+    /// `_session/steering`, so the wire method has two.
+    #[test]
+    fn grok_steer_keeps_the_underscore_its_handler_matches() {
+        use agent_client_protocol::JsonRpcMessage;
+        assert!(SteerRequest::matches_method("_session/steering"));
+        assert!(!SteerRequest::matches_method("__session/steering"));
+        assert!(GrokSteerRequest::matches_method("__session/steering"));
+        assert!(!GrokSteerRequest::matches_method("_session/steering"));
+        let req = GrokSteerRequest::new(SessionId::new("sess-1"), Vec::new());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["_meta"]["steering"]["idleBehavior"], "promptRequired");
     }
 
     /// An outcome this build has never seen must land on `Unknown`, which

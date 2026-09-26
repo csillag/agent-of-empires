@@ -111,6 +111,14 @@ pub(super) async fn establish(
     // Re-derived on every connect (a respawn may land on another adapter
     // build) and emitted even when false so replay cannot keep a stale true.
     let steering_capable = agent_compat::supports_steering(ctx.expected_agent, &init);
+    // Same `_meta` object as `steering`. Grok sets `grokShell: true` on initialize.
+    // Its ACP 0.10 stack strips one `_` before dispatch; see GrokSteerRequest.
+    let grok_shell = init
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.get("grokShell"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let prompt_caps = &init.agent_capabilities.prompt_capabilities;
     shared
         .emit(Event::PromptCapabilities {
@@ -164,6 +172,7 @@ pub(super) async fn establish(
         session_from_storage: matches!(ctx.mode, ConnectMode::Resume { .. }),
         channels: SessionChannels::default(),
         steering_capable,
+        grok_shell,
         source_profile: ctx.source_profile,
         default_effort: ctx.default_effort,
         default_mode: ctx.default_mode,
