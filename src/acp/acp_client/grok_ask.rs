@@ -623,11 +623,9 @@ mod tests {
         let request = recipe_dsl_request();
         let handle = tokio::spawn(handle_grok_ask_request(request, event_tx, pending.clone()));
 
-        let elicitation = loop {
-            match event_rx.recv().await.expect("card event") {
-                Event::ElicitationRequested { elicitation } => break elicitation,
-                other => panic!("unexpected event {other:?}"),
-            }
+        let elicitation = match event_rx.recv().await.expect("card event") {
+            Event::ElicitationRequested { elicitation } => elicitation,
+            other => panic!("unexpected event {other:?}"),
         };
         assert_eq!(
             elicitation.questions[0].options[2].label,
