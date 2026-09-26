@@ -34,6 +34,7 @@ async fn a_post_load_notification_moves_the_live_clock() {
         },
         cwd: std::env::temp_dir(),
         additional_dirs: vec![],
+        read_only_dirs: vec![],
         // Resume via session/load (so replay suppression is armed), then emit
         // one unsolicited chunk after the handshake with no prompt issued.
         provider_env: vec![
