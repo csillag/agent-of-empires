@@ -12,6 +12,7 @@ mod control;
 mod delete;
 mod errors;
 mod fs_handlers;
+mod grok_ask;
 mod handshake;
 mod lifecycle;
 mod opencode;
