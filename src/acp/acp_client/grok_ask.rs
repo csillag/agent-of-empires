@@ -1,9 +1,10 @@
 //! Grok's `ask_user_question` tool.
 //!
-//! Grok does not send `elicitation/create`. The shell coordinator calls the
-//! client with ACP method `x.ai/ask_user_question` and waits for a tagged
-//! `{ "outcome": ... }` result (see grok-build
-//! `AskUserQuestionExtRequest` / `AskUserQuestionExtResponse`). AoE already
+//! Grok does not send `elicitation/create`. The shell coordinator calls
+//! `ext_method("x.ai/ask_user_question")`. ACP puts that on the wire as
+//! `_x.ai/ask_user_question` and waits for a tagged `{ "outcome": ... }`
+//! result (see grok-build `AskUserQuestionExtRequest` /
+//! `AskUserQuestionExtResponse`). AoE already
 //! renders that shape of question as an [`Elicitation`] card, so this module
 //! turns the Grok payload into that card and turns the card's answer back
 //! into the JSON Grok deserializes.
@@ -36,12 +37,15 @@ use super::pending::{
     ElicitationResolutionMessage, PendingResolver, PendingResponder, PendingResponders,
 };
 
-const ASK_METHOD: &str = "x.ai/ask_user_question";
+/// Wire method. Grok calls `ext_method("x.ai/ask_user_question")`, and ACP
+/// puts extension methods on the wire with a leading `_`. The params are the
+/// question object itself, not wrapped again.
+const ASK_METHOD: &str = "_x.ai/ask_user_question";
 
 /// Wire params of `x.ai/ask_user_question`. camelCase, matching the object
 /// Grok's coordinator serializes.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
-#[request(method = "x.ai/ask_user_question", response = serde_json::Value)]
+#[request(method = "_x.ai/ask_user_question", response = serde_json::Value)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct GrokAskUserQuestionRequest {
     pub(super) session_id: String,
@@ -371,6 +375,11 @@ mod tests {
     #[test]
     fn method_is_the_grok_ext_method() {
         assert!(GrokAskUserQuestionRequest::matches_method(ASK_METHOD));
+        // The name inside Grok's ExtRequest has no underscore. ACP adds it
+        // on the wire; a handler for the bare name never sees the call.
+        assert!(!GrokAskUserQuestionRequest::matches_method(
+            "x.ai/ask_user_question"
+        ));
         assert!(!GrokAskUserQuestionRequest::matches_method(
             "elicitation/create"
         ));
