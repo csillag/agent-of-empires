@@ -47,8 +47,8 @@ function parseSessionDirs(raw: unknown): SessionDirInput[] | undefined {
   const dirs = raw.flatMap((entry) => {
     const e = entry as { path?: unknown; access?: unknown };
     if (typeof e?.path !== "string" || !e.path) return [];
-    const access = e.access === "read-write" ? "read-write" : e.access === "read-only" ? "read-only" : null;
-    return access ? [{ path: e.path, access }] : [];
+    if (e.access !== "read-only" && e.access !== "read-write") return [];
+    return [{ path: e.path, access: e.access }];
   });
   return dirs.length > 0 ? dirs : undefined;
 }
