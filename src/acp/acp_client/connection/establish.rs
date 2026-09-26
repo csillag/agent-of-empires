@@ -211,9 +211,7 @@ pub(super) async fn establish(
                 .await?
         }
     };
-    session
-        .task_notifications
-        .follow(&session.acp_session_id.0);
+    session.task_notifications.follow(&session.acp_session_id.0);
     session.apply_default_model().await;
     session.apply_default_effort().await;
     if arm_resume_watchdog {

@@ -507,16 +507,24 @@ mod tests {
             Event::RateLimitAutoResumed { resets_at: ts, .. } if *ts == resets_at
         ));
         assert_eq!(
-            sup.publisher
-                .publish("s-2", &Event::AgentStartupError { message: "probe".into() }),
+            sup.publisher.publish(
+                "s-2",
+                &Event::AgentStartupError {
+                    message: "probe".into()
+                }
+            ),
             1,
             "sessions count separately"
         );
 
         sup.forget_session("s-1");
         assert_eq!(
-            sup.publisher
-                .publish("s-1", &Event::AgentStartupError { message: "again".into() }),
+            sup.publisher.publish(
+                "s-1",
+                &Event::AgentStartupError {
+                    message: "again".into()
+                }
+            ),
             1
         );
     }

@@ -427,7 +427,10 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub fn respawn_pending_ids(&self) -> Vec<String> {
-        self.respawn_pending().into_iter().map(|(id, _)| id).collect()
+        self.respawn_pending()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     pub fn clear_respawn_pending(&self, session_id: &str) {

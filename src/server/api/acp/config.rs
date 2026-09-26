@@ -94,7 +94,9 @@ pub struct SetConfigOptionResponse {
 
 impl SetConfigOptionResponse {
     const LIVE: Self = Self { applied: "live" };
-    const DEFERRED: Self = Self { applied: "deferred" };
+    const DEFERRED: Self = Self {
+        applied: "deferred",
+    };
 }
 
 /// Write a picked value into memory (read by the reconciler) and to disk.
@@ -258,7 +260,11 @@ pub async fn acp_set_config_option(
                 }
             }
             persist_selector(&state, &id, selector, &req.value, true).await;
-            (StatusCode::ACCEPTED, Json(SetConfigOptionResponse::DEFERRED)).into_response()
+            (
+                StatusCode::ACCEPTED,
+                Json(SetConfigOptionResponse::DEFERRED),
+            )
+                .into_response()
         }
         Err(e) => supervisor_error_response("set_config_option failed", &e),
     }

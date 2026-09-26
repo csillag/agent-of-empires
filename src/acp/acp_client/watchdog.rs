@@ -698,7 +698,12 @@ mod tests {
         let wall = chrono::Utc::now();
         let mut w = SilentOrphanWatchdog::default();
         w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
-        w.apply_signal(start("tc-edit", false), t0 + Duration::from_secs(1), wall, CFG);
+        w.apply_signal(
+            start("tc-edit", false),
+            t0 + Duration::from_secs(1),
+            wall,
+            CFG,
+        );
         let steer = t0 + Duration::from_secs(4);
         w.apply_steer_injected(steer, wall, CFG);
         w.apply_signal(
@@ -720,7 +725,12 @@ mod tests {
         let wall = chrono::Utc::now();
         let mut w = SilentOrphanWatchdog::default();
         w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
-        w.apply_signal(start("tc-suspect", false), t0 + Duration::from_secs(1), wall, CFG);
+        w.apply_signal(
+            start("tc-suspect", false),
+            t0 + Duration::from_secs(1),
+            wall,
+            CFG,
+        );
         let steer = t0 + Duration::from_secs(2);
         w.apply_steer_injected(steer, wall, CFG);
         w.apply_signal(
@@ -729,7 +739,12 @@ mod tests {
             wall,
             CFG,
         );
-        w.apply_signal(start("tc-unrelated", false), steer + Duration::from_secs(5), wall, CFG);
+        w.apply_signal(
+            start("tc-unrelated", false),
+            steer + Duration::from_secs(5),
+            wall,
+            CFG,
+        );
         assert!(!w.should_fire(
             t0 + OFF_PROTOCOL_WORK_GRACE_FLOOR + Duration::from_secs(60),
             CFG
@@ -744,7 +759,12 @@ mod tests {
         w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
         let steer = t0 + Duration::from_secs(1);
         w.apply_steer_injected(steer, wall, CFG);
-        w.apply_signal(start("tc-late", false), steer + Duration::from_secs(2), wall, CFG);
+        w.apply_signal(
+            start("tc-late", false),
+            steer + Duration::from_secs(2),
+            wall,
+            CFG,
+        );
         assert!(!w.should_fire(steer + STEER_ORPHAN_AFTER + Duration::from_secs(60), CFG));
     }
 
@@ -754,7 +774,12 @@ mod tests {
         let wall = chrono::Utc::now();
         let mut w = SilentOrphanWatchdog::default();
         w.apply_signal(LifecycleSignal::Progress, t0, wall, CFG);
-        w.apply_signal(start("tc-not-yet", false), t0 + Duration::from_secs(1), wall, CFG);
+        w.apply_signal(
+            start("tc-not-yet", false),
+            t0 + Duration::from_secs(1),
+            wall,
+            CFG,
+        );
         let steer = t0 + Duration::from_secs(2);
         w.apply_steer_injected(steer, wall, CFG);
         assert!(!w.should_fire(steer + STEER_ORPHAN_AFTER - Duration::from_secs(1), CFG));

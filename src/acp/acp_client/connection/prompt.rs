@@ -494,8 +494,7 @@ impl Session {
             .bg_agents
             .lock()
             .is_ok_and(|agents| agents.is_empty());
-        turn.watchdog
-            .release_async_agent_floor(sub_agents_running);
+        turn.watchdog.release_async_agent_floor(sub_agents_running);
         let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {
@@ -557,11 +556,8 @@ impl Session {
                 info!(target: "acp.protocol", session = %label, "_session/steering injected into the running turn");
                 // The running turn still owns its Stopped. The cost report
                 // that closes the pre-empted generation is not the wrap-up.
-                turn.watchdog.apply_steer_injected(
-                    Instant::now(),
-                    chrono::Utc::now(),
-                    turn.cfg,
-                );
+                turn.watchdog
+                    .apply_steer_injected(Instant::now(), chrono::Utc::now(), turn.cfg);
             }
             Ok(SteerOutcome::PromptRequired) => {
                 // The turn settled first and the content is untouched: run it

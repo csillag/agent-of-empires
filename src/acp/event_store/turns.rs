@@ -7,8 +7,8 @@ use rusqlite::{params, OptionalExtension};
 use super::{decode, logged, query_strings, EventStore, NON_SUBSTANTIVE_EVENT_DISCRIMINANTS};
 use crate::acp::approvals::{Approval, Nonce};
 use crate::acp::state::{Event, Plan};
-use tracing::warn;
 use crate::events;
+use tracing::warn;
 
 /// A background agent silent this long without completing no longer holds a turn open.
 const BACKGROUND_AGENT_STALE_AFTER_MS: i64 = 6 * 60 * 1000;
@@ -445,7 +445,10 @@ impl EventStore {
                 return true;
             }
         };
-        if chrono::Utc::now().timestamp_millis().saturating_sub(created_at) > AGENT_TURN_STALE_AFTER_MS
+        if chrono::Utc::now()
+            .timestamp_millis()
+            .saturating_sub(created_at)
+            > AGENT_TURN_STALE_AFTER_MS
         {
             return false;
         }
@@ -608,7 +611,9 @@ impl EventStore {
                     refused = Some(text);
                     TurnRole::Neutral
                 }
-                Some(Event::UserPromptSent { text, .. }) if refused.as_deref() == Some(text.as_str()) => {
+                Some(Event::UserPromptSent { text, .. })
+                    if refused.as_deref() == Some(text.as_str()) =>
+                {
                     refused = None;
                     TurnRole::Neutral
                 }

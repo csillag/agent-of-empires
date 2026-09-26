@@ -5,9 +5,7 @@ use rusqlite::{params, OptionalExtension};
 use tracing::{debug, trace, warn};
 
 use super::EventStore;
-use crate::acp::state::{
-    BackgroundEndReason, BackgroundItem, BackgroundLossCause, Event,
-};
+use crate::acp::state::{BackgroundEndReason, BackgroundItem, BackgroundLossCause, Event};
 use crate::events;
 
 impl EventStore {
@@ -255,15 +253,17 @@ impl EventStore {
         let any_new_loss = match conn
             .prepare(&background_ends_sql(self.schema.events_table()))
             .and_then(|mut stmt| {
-            stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
-        }) {
-            Ok(rows) => rows.iter().any(|json| match serde_json::from_str::<Event>(json) {
-                Ok(Event::BackgroundItemEnded {
-                    reason, cause, at, ..
-                }) => is_waking_loss(reason, cause, at),
-                _ => false,
-            }),
+                stmt.query_map(params![session_id], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            }) {
+            Ok(rows) => rows
+                .iter()
+                .any(|json| match serde_json::from_str::<Event>(json) {
+                    Ok(Event::BackgroundItemEnded {
+                        reason, cause, at, ..
+                    }) => is_waking_loss(reason, cause, at),
+                    _ => false,
+                }),
             Err(e) => {
                 warn!(target: "acp.event_store", session = %session_id, "unnoted_background_losses: {e}");
                 return Vec::new();

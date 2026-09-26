@@ -183,11 +183,13 @@ pub async fn list_sessions(
         use std::collections::HashMap;
         let mut reasoning_cache: HashMap<String, Vec<String>> = HashMap::new();
         for session in &mut sessions {
-            let agents = reasoning_cache.entry(session.profile.clone()).or_insert_with(|| {
-                crate::session::config::profile_config::resolve_config_or_warn(&session.profile)
-                    .acp
-                    .reasoning_agents
-            });
+            let agents = reasoning_cache
+                .entry(session.profile.clone())
+                .or_insert_with(|| {
+                    crate::session::config::profile_config::resolve_config_or_warn(&session.profile)
+                        .acp
+                        .reasoning_agents
+                });
             session.thought_display =
                 thought_display_for(agents, &session.tool, session.acp_agent.as_deref());
         }

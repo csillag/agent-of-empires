@@ -16,9 +16,9 @@ use super::launch::{
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, BroadcastSink, Launcher, PendingContextReset, ResumeReservation, SessionPublisher,
-    SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
-    RESTART_WINDOW,
+    lock_recover, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
+    SessionPublisher, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW,
+    RESPAWN_BACKOFF, RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
 use crate::acp::runner_lifecycle::{
@@ -131,11 +131,7 @@ impl<S: BroadcastSink> Drain<S> {
                 } else {
                     crate::acp::state::BackgroundLossCause::Respawn
                 };
-                super::publish::mark_background_lost_via(
-                    &self.publisher,
-                    &self.session_id,
-                    cause,
-                );
+                super::publish::mark_background_lost_via(&self.publisher, &self.session_id, cause);
             }
             if end.agent_unresponsive {
                 // The runner deletes its own registry record as it exits, and a
@@ -325,7 +321,11 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
-    async fn approve_respawn(&self, lease: &Lease, killed_as_unresponsive: bool) -> Option<SpawnConfig> {
+    async fn approve_respawn(
+        &self,
+        lease: &Lease,
+        killed_as_unresponsive: bool,
+    ) -> Option<SpawnConfig> {
         let session_id = &self.session_id;
         match restart_decision(&self.workers, session_id, killed_as_unresponsive).await {
             RestartDecision::Respawn(config) => {

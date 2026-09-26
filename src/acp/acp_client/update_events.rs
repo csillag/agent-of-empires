@@ -609,7 +609,6 @@ mod tests {
         assert!(!d.observe(&text_chunk("ab", Some("m5"))));
     }
 
-
     /// A thought chunk with words must keep them. Signature-only chunks stay
     /// activity-only: recent models route narration into this channel instead
     /// of a text block, and dropping the words loses the only record.
@@ -918,7 +917,10 @@ mod tests {
             })),
         )
         .iter()
-        .any(|e| matches!(e, Event::MonitorArmed { .. } | Event::BackgroundItemStarted { .. })));
+        .any(|e| matches!(
+            e,
+            Event::MonitorArmed { .. } | Event::BackgroundItemStarted { .. }
+        )));
     }
 
     #[test]

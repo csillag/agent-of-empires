@@ -117,7 +117,9 @@ impl Shared {
             agent_msg_dedup: Default::default(),
             tool_context_cache: Arc::new(std::sync::Mutex::new(ToolCallContextCache::default())),
             bg_transcript_source,
-            recent_tool_labels: std::sync::Mutex::new(crate::acp::background::RecentToolLabels::default()),
+            recent_tool_labels: std::sync::Mutex::new(
+                crate::acp::background::RecentToolLabels::default(),
+            ),
         }
     }
 

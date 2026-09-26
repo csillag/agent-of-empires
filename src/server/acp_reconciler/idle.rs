@@ -219,7 +219,12 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
         tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now();
             ids.into_iter()
-                .filter(|id| store.background_items(id, now).iter().any(|item| item.is_live()))
+                .filter(|id| {
+                    store
+                        .background_items(id, now)
+                        .iter()
+                        .any(|item| item.is_live())
+                })
                 .collect()
         })
         .await
@@ -330,16 +335,16 @@ mod tests {
     fn should_auto_stop_policy() {
         const HOUR_MS: i64 = 3_600_000;
         let cases = [
-            ("disabled threshold", HOUR_MS * 24, Some(0), None, 0, false, false),
             (
-                "in flight",
+                "disabled threshold",
                 HOUR_MS * 24,
                 Some(0),
                 None,
-                3600,
-                true,
+                0,
+                false,
                 false,
             ),
+            ("in flight", HOUR_MS * 24, Some(0), None, 3600, true, false),
             (
                 "idle past threshold",
                 HOUR_MS * 2,
