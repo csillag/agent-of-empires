@@ -279,10 +279,11 @@ pub(super) async fn run_connection_task<W, R>(
             {
                 let event_tx = event_tx.clone();
                 let ingress = ingress.clone();
+                let pending = pending_responders.clone();
                 move |request: CreateElicitationRequest,
                       responder: Responder<CreateElicitationResponse>,
                       _conn| {
-                    let (event_tx, pending) = (event_tx.clone(), pending_responders.clone());
+                    let (event_tx, pending) = (event_tx.clone(), pending.clone());
                     let ingress = ingress.clone();
                     async move {
                         // Only a session-scoped elicitation carries an identity

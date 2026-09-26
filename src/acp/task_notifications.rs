@@ -80,7 +80,7 @@ fn claude_project_dir(cwd: &Path) -> Option<PathBuf> {
     use crate::session::capture::{
         canonicalize_or_raw, claude_home_for_host_environment, encode_claude_project_path,
     };
-    let home = claude_home_for_host_environment(&[]).ok()?;
+    let home = claude_home_for_host_environment(None, &[]).ok()?;
     let cwd = canonicalize_or_raw(&cwd.to_string_lossy());
     Some(
         home.join("projects")

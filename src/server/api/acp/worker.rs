@@ -125,6 +125,7 @@ pub async fn spawn_acp(
     // An explicit resume overrides a stop kept from a resume that failed
     // before it installed; only the reconciler's fallback must honor it.
     state.acp_supervisor.forget_stale_cancel(&id);
+    let assert_model = req.model.is_some() || instance.agent_model_pending;
     let request = SpawnRequest {
         additional_dirs: req.additional_dirs,
         provider_env: req
@@ -133,7 +134,7 @@ pub async fn spawn_acp(
             .map(|p| (p.key, p.value))
             .collect(),
         model: req.model.or_else(|| instance.agent_model.clone()),
-        assert_model: req.model.is_some() || instance.agent_model_pending,
+        assert_model,
         ..spawn_request_for(&instance, agent.clone(), sandbox_info)
     };
     match state.acp_supervisor.spawn(request).await {

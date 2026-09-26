@@ -58,7 +58,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 }
 
-struct Drain<S> {
+struct Drain<S: BroadcastSink> {
     session_id: String,
     sink: Arc<S>,
     workers: Workers,

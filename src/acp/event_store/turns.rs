@@ -671,6 +671,7 @@ impl TurnRole {
             | Event::ThinkingStarted
             | Event::ThinkingEnded
             | Event::AgentMessageChunk { .. }
+            | Event::AgentThoughtChunk { .. }
             | Event::CancelRequested { .. }
             | Event::UserPromptSent { .. }
             | Event::UserDiffCommentsPrompt { .. }
@@ -692,6 +693,9 @@ impl TurnRole {
             | Event::BackgroundAgentLaunched { .. }
             | Event::BackgroundAgentProgress { .. }
             | Event::BackgroundAgentCompleted { .. }
+            | Event::BackgroundItemStarted { .. }
+            | Event::BackgroundItemEnded { .. }
+            | Event::BackgroundLossNoted { .. }
             | Event::PromptCapabilities { .. }
             | Event::PromptRejected { .. }
             | Event::AcpSessionAssigned { .. }

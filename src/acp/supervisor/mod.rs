@@ -355,11 +355,12 @@ impl<S: BroadcastSink> Supervisor<S> {
     }
 
     pub fn with_capacity(sink: Arc<S>, max_concurrent_workers: u32) -> Self {
+        let publisher = Arc::new(SessionPublisher::new(Arc::clone(&sink)));
         Self {
             sink,
             registry: Arc::new(Mutex::new(AgentRegistry::with_defaults())),
             workers: Arc::default(),
-            publisher: Arc::new(SessionPublisher::new(Arc::clone(&sink))),
+            publisher,
             lifecycle: Arc::new(std::sync::Mutex::new(LifecycleTable::new(
                 chrono::Utc::now().timestamp_millis().max(1) as u64,
             ))),
