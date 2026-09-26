@@ -37,6 +37,7 @@ use super::control::{establish_session_v3, prompt_outcome_to_response, DaemonCon
 use super::delete::handle_delete_session_cmd;
 use super::errors::{acp_internal_error, AcpError, IncompatibleAgentError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
+use super::grok_ask::{handle_grok_ask_request, GrokAskUserQuestionRequest};
 use super::handshake::{build_initialize_request, should_fork};
 use super::lifecycle::{
     forward_lifecycle_signals, LifecycleEnvelope, LifecycleSignal, OffProtocolWorkKind,
@@ -210,6 +211,7 @@ pub(super) async fn run_connection_task<W, R>(
     let ingress_for_notif = ingress.clone();
     let ingress_for_perm = ingress.clone();
     let ingress_for_elicit = ingress.clone();
+    let ingress_for_grok_ask = ingress.clone();
     let ingress_for_read = ingress.clone();
     let ingress_for_write = ingress.clone();
     let ingress_for_term_create = ingress.clone();
@@ -222,9 +224,11 @@ pub(super) async fn run_connection_task<W, R>(
     let event_tx_for_notif = event_tx.clone();
     let event_tx_for_perm = event_tx.clone();
     let event_tx_for_elicit = event_tx.clone();
+    let event_tx_for_grok_ask = event_tx.clone();
     let event_tx_for_block = event_tx.clone();
     let pending_for_perm = pending_responders.clone();
     let pending_for_elicit = pending_responders.clone();
+    let pending_for_grok_ask = pending_responders.clone();
     let tool_context_cache: ToolContextCache =
         Arc::new(std::sync::Mutex::new(ToolCallContextCache::default()));
     let tool_context_cache_for_notif = tool_context_cache.clone();
@@ -811,6 +815,29 @@ pub(super) async fn run_connection_task<W, R>(
                     reply(
                         responder,
                         handle_elicitation_request(request, event_tx, pending).await,
+                    )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            move |request: GrokAskUserQuestionRequest,
+                  responder: Responder<serde_json::Value>,
+                  _conn| {
+                let event_tx = event_tx_for_grok_ask.clone();
+                let pending = pending_for_grok_ask.clone();
+                let ingress = ingress_for_grok_ask.clone();
+                async move {
+                    // Same session fence as the other agent-to-client calls.
+                    // Grok puts the ACP session id on `sessionId`.
+                    let session_id = SessionId::from(request.session_id.clone());
+                    let _guard = match ingress.request(&session_id).await {
+                        Ok(guard) => guard,
+                        Err(error) => return reply(responder, Err(error)),
+                    };
+                    reply(
+                        responder,
+                        handle_grok_ask_request(request, event_tx, pending).await,
                     )
                 }
             },

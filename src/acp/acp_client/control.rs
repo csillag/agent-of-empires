@@ -451,7 +451,7 @@ pub(super) async fn connect_runner_control_v3(
                 }
                 // #2977 reverse lane: an agent-to-client request. Injected
                 // into the crate transport as an ordinary JSON-RPC request
-                // under a synthetic id, so the nine `on_receive_request`
+                // under a synthetic id, so the `on_receive_request`
                 // handlers serve it exactly as they did off the relay. The
                 // ordered SDK dispatcher starts each handler before reading
                 // the next frame; SessionReady must publish its candidate first.
