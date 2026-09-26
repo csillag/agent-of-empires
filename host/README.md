@@ -2,7 +2,7 @@
 
 This directory is the copy that matters. It is local to this fork and is **not
 for an upstream pull request**. `local/host-ops` carries it, cut from the
-release tag `v1.16.1`, and `kitchensink` merges that branch last so a rebuild
+release tag `v1.17.2`, and `kitchensink` merges that branch last so a rebuild
 does not drop the scripts.
 
 An older, longer copy still sits in `~/brain/aoe-build-cookbook.md` and
@@ -28,14 +28,12 @@ every local patch.
 | where the compile happens | `host/g4.md` |
 
 The base is the latest release tag we have chosen to track, **not**
-`origin/main`. That tag is `v1.16.1`. Tags `v1.17.0` and `v1.17.1` exist
-upstream. Stay on `v1.16.1` until the owner says the infrastructure is ready
-to move.
+`origin/main`. That tag is `v1.17.2`.
 
 ## Branch layout
 
 `main` tracks `origin/main` and never carries our commits. One topic branch
-per change, cut from `v1.16.1` or from the branch it builds on. Stacking is
+per change, cut from `v1.17.2` or from the branch it builds on. Stacking is
 normal. Record the parent in `host/branches.txt`.
 
 `kitchensink` is the only branch we build. It is upstream's tag plus a merge
