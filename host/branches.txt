@@ -1,0 +1,41 @@
+# Topic branches merged into kitchensink, oldest first.
+# Blank lines and # comments are ignored. kitchensink is never listed.
+# local/host-ops is last so this directory survives every rebuild.
+#
+# Not a promise of a clean merge. Several branches are stacked, and some
+# kitchensink merges were resolved by hand. Read host/README.md before
+# rebasing. Dropped branches are commented out and must not be merged.
+#
+# Stacks (rebase the parent first, then the child with --onto):
+#   fix/no-persisted-server-state  onto  fix/stick-to-bottom-programmatic-scroll
+#   feature/live-session-tabs      onto  fix/no-persisted-server-state
+#   feat/reasoning-thought-display onto  fix/thought-whitespace-chunks
+# feat/agent-local-io is inside feat/session-dirs, not merged on its own.
+# feat/session-dirs was merged more than once (web gate, then reject-file).
+# feat/grok-ask-user-question was cut from kitchensink 492aea38, not from
+# the tag: it builds on the elicitation client that lives in that tree.
+devendor-c-deps
+feat/thought-chunk-rows
+fix/loud-shim-setup-error
+fix/orphan-watchdog-floor
+fix/model-pick-while-parked
+fix/unresponsive-respawn
+fix/build-stale-agent-turn
+fix/idle-reap-live-activity
+fix/stale-question-cards
+feat/update-check-on-navigation
+fix/watchdog-close-releases-prompt
+feat/background-registry
+fix/stick-to-bottom-programmatic-scroll
+fix/ordered-session-broadcast
+fix/deploy-drain
+fix/no-persisted-server-state
+feature/live-session-tabs
+feat/session-dirs
+fix/import-title-one-line
+fix/thought-whitespace-chunks
+feat/reasoning-thought-display
+feat/grok-ask-user-question
+local/host-ops
+# dropped: fix/replay-tail-after-wake (v1.16.1, upstream took the barrier)
+# dropped: feat/extra-fs-roots (2026-09-23, replaced by feat/session-dirs)
