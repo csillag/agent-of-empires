@@ -6,9 +6,8 @@ import { renderHook, act } from "@testing-library/react";
 import { useQueuedCountForSessions } from "../useAcpQueueCount";
 import { STORAGE_KEY_PREFIX, clearQueueCount, getQueuedCount, setQueueCount } from "../../lib/acpStateStorage";
 
-function entry(id: string, queued: number, savedAt = Date.now()): string {
-  const queuedPrompts = Array.from({ length: queued }, (_, i) => ({ id: `${id}-${i}`, text: `q${i}`, queuedAt: "t" }));
-  return JSON.stringify({ savedAt, state: { lastSeq: 0, activity: [], queuedPrompts } });
+function entry(_id: string, queued: number, savedAt = Date.now()): string {
+  return JSON.stringify({ savedAt, queuedCount: queued });
 }
 
 function dispatchStorage(id: string, queued: number): void {

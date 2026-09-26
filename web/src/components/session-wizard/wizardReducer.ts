@@ -129,7 +129,16 @@ export const initialData: WizardData = {
 };
 
 // Tracked even without a profile so mount-time seeding does not stomp early edits.
-const PROFILE_FIELDS = ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "sessionDirs", "agentModel", "agentEffort"];
+const PROFILE_FIELDS = [
+  "yoloMode",
+  "sandboxEnabled",
+  "useWorktree",
+  "tool",
+  "extraEnv",
+  "sessionDirs",
+  "agentModel",
+  "agentEffort",
+];
 
 function setField(data: WizardData, field: string, value: unknown): WizardData {
   const next = { ...data, [field]: value };

@@ -227,7 +227,7 @@ describe("SessionWizard reducer / session directories", () => {
 
   it("keeps the current list when the defaults carry none (profile picker)", () => {
     const dirs = [{ path: "/srv/ref", access: "read-only" as const }];
-    const state = makeState({ data: { ...initialData, sessionDirs: dirs } });
+    const state = makeState({ sessionDirs: dirs });
     const next = reducer(state, {
       type: "APPLY_PROFILE_DEFAULTS",
       yoloMode: true,

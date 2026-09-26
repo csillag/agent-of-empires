@@ -2535,16 +2535,16 @@
       "risk": "high",
       "specs": [
         "src/hooks/useAcpSession.noPersist.test.ts",
-        "src/hooks/useAcpSession.queue.test.ts",
+        "src/hooks/__tests__/useAcpQueueCount.test.tsx",
         "src/lib/acpStateStorage.test.ts",
-        "src/lib/acpDrafts.test.ts",
-        "src/components/acp/Composer.draft.test.tsx"
+        "src/lib/acpDrafts.test.ts"
       ],
       "components": [
         "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/useAcpQueueCount.ts",
         "web/src/lib/acpStateStorage.ts",
         "web/src/lib/acpDrafts.ts",
-        "web/src/components/acp/Composer.tsx"
+        "web/src/components/acp/useComposerHooks.ts"
       ]
     },
     {

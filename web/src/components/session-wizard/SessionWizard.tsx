@@ -304,10 +304,7 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
           </div>
 
           {!nameOnly && (
-            <SessionDirsEditor
-              dirs={state.data.sessionDirs}
-              onChange={(dirs) => handleChange("sessionDirs", dirs)}
-            />
+            <SessionDirsEditor dirs={state.data.sessionDirs} onChange={(dirs) => handleChange("sessionDirs", dirs)} />
           )}
 
           {!nameOnly && (

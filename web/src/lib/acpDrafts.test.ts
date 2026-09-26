@@ -14,9 +14,17 @@ import {
   setDraftAttachments,
   subscribeDrafts,
   sweepOrphanDrafts,
+  unsentDraftOnUnload,
 } from "./acpDrafts";
-import type { PromptAttachmentInput } from "./acpTypes";
+import type { PromptAttachmentInput, QueuedPrompt } from "./acpTypes";
 import { toastBus } from "./toastBus";
+
+const q = (id: string, text: string, pending: boolean): QueuedPrompt => ({
+  id,
+  text,
+  queuedAt: "t",
+  pending,
+});
 
 const img = (dataB64 = "AAAA", name?: string): PromptAttachmentInput => ({
   kind: "image",

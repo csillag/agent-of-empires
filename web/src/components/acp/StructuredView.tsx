@@ -135,13 +135,7 @@ export function structuredViewRootStyle(keyboardHeight: number): React.CSSProper
 
 /** Flex root publishing the keyboard reservation and both conversation font
  *  sizes (as rem); `index.css` picks the active size. */
-export function StructuredViewRoot({
-  active = true,
-  children,
-}: {
-  active?: boolean;
-  children: React.ReactNode;
-}) {
+export function StructuredViewRoot({ active = true, children }: { active?: boolean; children: React.ReactNode }) {
   const { keyboardHeight } = useMobileKeyboard(active);
   const { settings } = useWebSettings();
   return (
