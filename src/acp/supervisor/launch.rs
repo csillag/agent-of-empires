@@ -267,6 +267,28 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(model) = model.clone() {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
         }
+        let session_dirs = crate::session::session_dirs::usable(&req.session_dirs);
+        // A host agent gets the list in its environment. A container sandbox
+        // bind-mounts the directories itself, so it gets neither this
+        // environment nor the host read-only fs marking.
+        let mut additional_dirs = req.additional_dirs.clone();
+        for path in crate::session::session_dirs::all_paths(&session_dirs) {
+            if !additional_dirs.contains(&path) {
+                additional_dirs.push(path);
+            }
+        }
+        let read_only_dirs = if req.sandbox_info.is_none() {
+            for (key, value) in crate::session::session_dirs::env_pairs(&session_dirs) {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+            crate::session::session_dirs::paths_with(
+                &session_dirs,
+                crate::session::session_dirs::DirAccess::ReadOnly,
+            )
+        } else {
+            Vec::new()
+        };
         // Every worker runs through `aoe __acp-runner` so it survives `aoe serve --stop`.
         let socket_path = worker_registry::socket_path_for(&req.session_id).map_err(|e| {
             SupervisorError::Acp(AcpError::Spawn(format!("worker socket path: {e}")))
@@ -345,7 +367,8 @@ impl<S: BroadcastSink> Supervisor<S> {
                 tool: req.tool.clone(),
                 spec,
                 cwd: req.cwd.clone(),
-                additional_dirs: req.additional_dirs.clone(),
+                additional_dirs,
+                read_only_dirs,
                 provider_env,
                 host_environment,
                 default_effort: effort,
@@ -506,13 +529,13 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         cwd: PathBuf,
-        additional_dirs: Vec<PathBuf>,
+        session_dirs: Vec<crate::session::session_dirs::SessionDir>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
     ) -> Result<(), SupervisorError> {
         match self.begin_resume(&session_id, ResumeKind::Attach).await? {
             ResumeReservationOutcome::Reserved(r) => {
-                self.attach_inner(session_id, cwd, additional_dirs, in_flight_turn, sandbox, r)
+                self.attach_inner(session_id, cwd, session_dirs, in_flight_turn, sandbox, r)
                     .await
             }
             ResumeReservationOutcome::AlreadyPresent => {
@@ -526,11 +549,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         &self,
         session_id: String,
         cwd: PathBuf,
-        additional_dirs: Vec<PathBuf>,
+        session_dirs: Vec<crate::session::session_dirs::SessionDir>,
         in_flight_turn: bool,
         sandbox: Option<SandboxInfo>,
         reservation: ResumeReservation,
     ) -> Result<(), SupervisorError> {
+        // The same split a fresh spawn makes: every usable listed path for
+        // the fs roots, read-only marking only for a host session.
+        let session_dirs = crate::session::session_dirs::usable(&session_dirs);
+        let additional_dirs = crate::session::session_dirs::all_paths(&session_dirs);
+        let read_only_dirs = if sandbox.is_none() {
+            crate::session::session_dirs::paths_with(
+                &session_dirs,
+                crate::session::session_dirs::DirAccess::ReadOnly,
+            )
+        } else {
+            Vec::new()
+        };
         let record = match worker_registry::load(&session_id)
             .map_err(|e| SupervisorError::Acp(AcpError::Spawn(format!("registry load: {e}"))))?
         {
@@ -641,6 +676,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             record.socket_path.clone(),
             cwd,
             additional_dirs,
+            read_only_dirs,
             stored_acp_session_id,
             in_flight_turn,
             AcpSessionId(session_id.clone()),

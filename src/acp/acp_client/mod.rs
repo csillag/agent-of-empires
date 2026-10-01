@@ -106,21 +106,32 @@ struct SessionResources {
     cwd: PathBuf,
     label: String,
     sandbox: Option<SessionSandbox>,
+    /// Withhold fs and terminal capabilities. See `[acp] local_io_agents`.
+    local_io: bool,
 }
 
 impl SessionResources {
     /// Allowed fs roots are the cwd plus any additional directories.
+    /// Read-only session dirs ride in `additional_dirs` too (for ACP
+    /// additionalDirectories), so a host session takes them back out of the
+    /// writable roots. The cwd always stays writable. A container session
+    /// does not mark anything read-only: those paths are container paths.
     fn new(
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        read_only_dirs: Vec<PathBuf>,
         label: String,
         sandbox: Option<(SessionSandbox, SandboxPathMap)>,
+        local_io: bool,
     ) -> Self {
         let mut roots = vec![cwd.clone()];
         roots.extend(additional_dirs);
         let (sandbox, fs_policy) = match sandbox {
             Some((handle, path_map)) => (Some(handle), FsPolicy::with_sandbox_map(roots, path_map)),
-            None => (None, FsPolicy::new(roots)),
+            None => {
+                roots.retain(|r| r == &cwd || !read_only_dirs.contains(r));
+                (None, FsPolicy::with_read_only(roots, read_only_dirs))
+            }
         };
         Self {
             fs_policy: Arc::new(fs_policy),
@@ -128,6 +139,7 @@ impl SessionResources {
             cwd,
             label,
             sandbox,
+            local_io,
         }
     }
 
@@ -147,6 +159,7 @@ struct Launch {
     mode: ConnectMode,
     cwd: PathBuf,
     additional_dirs: Vec<PathBuf>,
+    read_only_dirs: Vec<PathBuf>,
     sandbox: Option<(SessionSandbox, SandboxPathMap)>,
     profile: &'static agent_profiles::AgentProfile,
     install_binary: String,
@@ -155,6 +168,7 @@ struct Launch {
     default_mode: Option<String>,
     default_model: Option<String>,
     mcp_servers: Vec<McpServer>,
+    local_io: bool,
 }
 
 impl Launch {
@@ -184,8 +198,10 @@ impl Launch {
             resources: SessionResources::new(
                 self.cwd,
                 self.additional_dirs,
+                self.read_only_dirs,
                 label.clone(),
                 self.sandbox,
+                self.local_io,
             ),
             mode: self.mode,
             ready_tx,
@@ -412,6 +428,7 @@ impl AcpClient {
             session_id: session_id.clone(),
             cwd: config.cwd.clone(),
             additional_dirs: config.additional_dirs.clone(),
+            read_only_dirs: config.read_only_dirs.clone(),
             sandbox,
             profile: agent_profiles::resolve(&config.agent_key),
             install_binary: config.spec.command.clone(),
@@ -420,6 +437,7 @@ impl AcpClient {
             default_mode: config.default_mode.clone(),
             default_model: config.default_model.clone(),
             mcp_servers: config.mcp_servers.clone(),
+            local_io: handshake::uses_local_io(&[&config.agent_key, &config.tool]),
         };
 
         if let Some(socket_path) = config.socket_path.clone() {
@@ -521,6 +539,7 @@ impl AcpClient {
         socket_path: PathBuf,
         cwd: PathBuf,
         additional_dirs: Vec<PathBuf>,
+        read_only_dirs: Vec<PathBuf>,
         stored_acp_session_id: String,
         in_flight_turn: bool,
         session_id: AcpSessionId,
@@ -542,6 +561,7 @@ impl AcpClient {
             },
             cwd,
             additional_dirs,
+            read_only_dirs,
             sandbox,
             profile: agent_profiles::resolve(&agent_key),
             install_binary,
@@ -552,6 +572,7 @@ impl AcpClient {
             default_mode: None,
             default_model: None,
             mcp_servers: Vec::new(),
+            local_io: handshake::uses_local_io(&[&agent_key]),
         };
         Self::connect_via_socket(socket_path, launch).await
     }

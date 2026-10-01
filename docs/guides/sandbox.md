@@ -2,6 +2,8 @@
 
 A sandboxed session runs its agent in its own container with the project mounted at `/workspace`, so the agent reaches your code but not the rest of your machine. Agent credentials are seeded into a private per-session store, so you do not log in again.
 
+The container is the confinement. AoE does not trust an agent to sandbox itself. A command that is an absolute path on the host is bind-mounted read-only at that same path, and so is the program a small wrapper script `exec`s. The session's directory list is bind-mounted the same way, read-only when the entry says so. The container environment sets `AOE_CONTAINER_SANDBOX=1`, which a host wrapper uses to skip the agent's own sandbox flag. Grok's `auth.json`, `config.toml`, and `models_cache.json` are copied into a private directory and mounted at `/root/.grok`; the host `~/.grok` tree is not mounted.
+
 Docker is the default runtime; [Podman](#podman) and [Apple Container](#apple-container) work too.
 
 ## Creating one

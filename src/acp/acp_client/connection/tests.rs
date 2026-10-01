@@ -96,6 +96,7 @@ async fn cancel_under_flood() {
         cwd,
         label: "s-fair".to_string(),
         sandbox: None,
+        local_io: false,
     };
     let (paused_tx, mut paused_rx) = oneshot::channel();
     let (resume_tx, resume_rx) = oneshot::channel();

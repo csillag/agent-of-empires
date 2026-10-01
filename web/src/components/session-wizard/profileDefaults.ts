@@ -1,4 +1,5 @@
 import type { fetchSettings } from "../../lib/api";
+import type { SessionDirInput } from "../../lib/types";
 import type { Action } from "./wizardReducer";
 
 type Settings = NonNullable<Awaited<ReturnType<typeof fetchSettings>>>;
@@ -18,6 +19,7 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
   const worktree = settings.worktree as Obj;
   const tool = preferredTool || (session?.default_tool as string) || "";
   const acp = (session?.acp_defaults as Obj)?.[tool || currentTool] as Obj;
+  const sessionDirs = parseSessionDirs(session?.default_dirs);
   return {
     yoloMode: (session?.yolo_mode_default as boolean) ?? false,
     sandboxEnabled: (sandbox?.enabled_by_default as boolean) ?? false,
@@ -31,5 +33,24 @@ export function profileDefaults(settings: Settings, preferredTool: string, curre
     agentEffort: typeof acp?.effort === "string" ? acp.effort : "",
     // `auto` (or unset) keeps the dashboard's own default, the structured view.
     useStructuredView: (settings.acp as Obj)?.default_new_session_view !== "terminal",
+    // Omitted when the profile names none, so a profile switch leaves the
+    // wizard's current list alone.
+    ...(sessionDirs ? { sessionDirs } : {}),
   };
+}
+
+/** `[session] default_dirs` from `/api/settings`, keeping only well-formed
+ *  entries. The server re-validates whatever the wizard submits. Empty means
+ *  the caller should leave the current list alone. */
+function parseSessionDirs(raw: unknown): SessionDirInput[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const dirs = raw.flatMap((entry): SessionDirInput[] => {
+    const e = entry as { path?: unknown; access?: unknown };
+    if (typeof e.path !== "string" || e.path.length === 0) return [];
+    if (e.access === "read-only" || e.access === "read-write") {
+      return [{ path: e.path, access: e.access }];
+    }
+    return [];
+  });
+  return dirs.length > 0 ? dirs : undefined;
 }

@@ -22,6 +22,7 @@ import { toastBus } from "../../lib/toastBus";
 import { normalizeProjectPathKey } from "../../lib/registeredProjects";
 import { ProjectStep } from "./steps/ProjectStep";
 import { SessionStep } from "./steps/SessionStep";
+import { SessionDirsEditor } from "./steps/SessionDirsEditor";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
 import { AgentOptions } from "./steps/AgentOptions";
 import { LaunchFooter } from "./LaunchFooter";
@@ -301,6 +302,13 @@ export function SessionWizard({ onClose, onCreated, prefill, nameOnly = false }:
               Shown in the dashboard. Renaming it later does not rename the git branch.
             </p>
           </div>
+
+          {!nameOnly && (
+            <SessionDirsEditor
+              dirs={state.data.sessionDirs}
+              onChange={(dirs) => handleChange("sessionDirs", dirs)}
+            />
+          )}
 
           {!nameOnly && (
             <>

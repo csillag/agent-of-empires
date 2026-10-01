@@ -31,6 +31,9 @@ export function buildCreateRequest(d: WizardData, acpCapable: boolean): CreateSe
     extra_args: d.extraArgs || undefined,
     command_override: d.commandOverride || undefined,
     custom_instruction: d.customInstruction || undefined,
+    // Empty rows (an "Add directory" left blank) are dropped; the server
+    // validates the rest and rejects the create on a bad path.
+    session_dirs: d.sessionDirs.map((s) => ({ path: s.path.trim(), access: s.access })).filter((s) => s.path),
     profile: d.profile || undefined,
     view: structured ? "structured" : "terminal",
     agent_model: structured && d.agentModel ? d.agentModel : undefined,

@@ -864,6 +864,9 @@ fn stage_teardown_worktrees(
         // store may only go once the container is provably gone.
         container_gone = !matches!(outcome, crate::containers::Teardown::Failed(_));
         deletion_messages_for(outcome, messages, errors);
+        if container_gone {
+            crate::session::sandbox_bind::remove_staged_agent_home(&request.instance.id);
+        }
     }
 
     stage_remove_worktrees_and_branches(
