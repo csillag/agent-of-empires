@@ -46,6 +46,9 @@ pub(super) struct Session {
     pub(super) session_from_storage: bool,
     pub(super) channels: SessionChannels,
     pub(super) steering_capable: bool,
+    /// Grok's ACP stack strips one leading `_` before dispatch. See
+    /// [`crate::acp::acp_client::steer::GrokSteerRequest`].
+    pub(super) grok_shell: bool,
     pub(super) source_profile: Option<String>,
     pub(super) default_effort: Option<String>,
     pub(super) default_mode: Option<String>,
