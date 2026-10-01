@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs on g4 as root. run-job <sha> <job>...
+# Serializes jobs, then enters the build chroot in a private mount namespace
+# (mounts vanish with the job) and runs job.sh as csillag.
+set -u
+C=/srv/aoe-build/excalibur-arm64
+exec 9>/srv/aoe-build/job.lock
+if ! flock -n 9; then echo "=== waiting for the running job to finish"; flock 9; fi
+exec unshare -m sh -c '
+    set -e
+    C='"$C"'
+    mount --make-rslave /
+    mount -t proc proc $C/proc
+    mount --rbind /dev $C/dev
+    mount -t tmpfs -o mode=1777 tmpfs $C/tmp
+    mount -t tmpfs -o mode=1777 tmpfs $C/dev/shm
+    exec chroot --userspec=csillag:csillag $C /usr/bin/env -i HOME=/home/csillag USER=csillag LANG=C.UTF-8 \
+        PATH=/usr/local/bin:/usr/bin:/bin TERM=dumb sh /home/csillag/job.sh "$@"' sh "$@"

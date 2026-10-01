@@ -1,0 +1,29 @@
+#!/bin/sh
+# bootstrap-chroot '<packages>'   (run on g4 as root, by rebuild-chroot)
+# Expects $D/superego-pins and the repacked *.deb files next to this script.
+set -eu
+D=/srv/aoe-build
+N=$D/excalibur-arm64.new
+M=http://ftp.fau.de/devuan/merged
+K=/usr/share/keyrings/devuan-archive-keyring.gpg
+rm -rf $N
+# The host keyring is copied in: the buildd variant has no devuan-keyring, and
+# freia's signing key must be trusted inside the chroot too.
+mmdebstrap --variant=buildd --components=main,contrib,non-free,non-free-firmware --keyring=$K \
+  --include=ca-certificates,git,curl,pkg-config,cmake,libssl-dev,zlib1g-dev,libzstd-dev,rsync,python3,passwd,tmux,procps,locales \
+  --customize-hook="cp $K \$1/etc/apt/trusted.gpg.d/" \
+  --customize-hook="echo 'deb $M freia main contrib non-free non-free-firmware' > \$1/etc/apt/sources.list.d/freia.list" \
+  --customize-hook="printf 'Package: *\nPin: release n=freia\nPin-Priority: 100\n' > \$1/etc/apt/preferences.d/freia" \
+  --customize-hook="cp $D/superego-pins \$1/etc/apt/preferences.d/superego-pins" \
+  excalibur $N "deb $M excalibur main contrib non-free non-free-firmware" \
+  "deb $M excalibur-security main contrib non-free non-free-firmware"
+mkdir -p $N/tmp/repack && cp $D/*.deb $N/tmp/repack/
+mount --bind /dev/pts $N/dev/pts 2>/dev/null || true
+chroot $N sh -c "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -q /tmp/repack/*.deb $1" > $D/install.log 2>&1 \
+  || { umount $N/dev/pts 2>/dev/null; tail -20 $D/install.log; exit 1; }
+umount $N/dev/pts 2>/dev/null || true
+chroot $N apt-get clean
+chroot $N useradd -m -u 1000 -U -s /bin/bash csillag
+chroot $N su csillag -c 'git init -q --bare ~/aoe.git'
+rm -rf $N/tmp/repack $D/*.deb
+echo "bootstrap ok: $N"

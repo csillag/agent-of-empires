@@ -1,0 +1,126 @@
+#!/bin/bash
+# aoe-remote [-C <repo>] [--host <node> | --hosts <n1,n2,...>] <commit-ish> <job>...
+#
+# Build/test an exact agent-of-empires commit on a brain cell (GB10, 20 cores)
+# inside a Devuan excalibur chroot whose toolchain and -dev libraries match
+# superego's versions, so the binary links the same distro libs.
+#   jobs:  build    dev-release --features web; binary to ~/aoe-build/aoe-<sha8>
+#          lint     cargo fmt --check + cargo clippy --all-targets
+#          libtest  cargo test --lib
+#          itest    cargo test --features web --test integration (dev profile)
+#          web      npm ci + format:check, lint, tsc -b, vitest, coverage matrix
+#   --host  one build host (default g4). Every host has its own chroot, repo,
+#           target dir and job lock, set up by rebuild-chroot --host <node>.
+#   --hosts spread the jobs over several hosts and run them at the same time;
+#           jobs are assigned longest first to the least-loaded host.
+# Log: ~/aoe-build/remote-logs/<sha8>-<jobs>[@<host>].log. Exit 0 only if every
+# job passed. Jobs on one host are serialized; a second caller waits.
+set -u
+C=/srv/aoe-build/excalibur-arm64
+HERE=$(dirname "$(readlink -f "$0")")
+REPO=$HOME/local/src/agent-of-empires
+HOSTS=g4
+PARALLEL=0
+while [ $# -gt 0 ]; do
+    case $1 in
+      -C)      REPO=$2; shift 2 ;;
+      --host)  HOSTS=$2; shift 2 ;;
+      --hosts) HOSTS=$(echo "$2" | tr ',' ' '); PARALLEL=1; shift 2 ;;
+      *)       break ;;
+    esac
+done
+[ $# -ge 2 ] || { sed -n '2,19p' "$0"; exit 2; }
+SHA=$(git -C "$REPO" rev-parse --verify --quiet "$1^{commit}") || { echo "no such commit: $1" >&2; exit 2; }
+shift
+S8=${SHA:0:8}
+OUT=$HOME/aoe-build
+mkdir -p "$OUT/remote-logs"
+SSH="ssh -o BatchMode=yes -o ServerAliveInterval=30"
+
+fqdn() { echo "brain-cell-$1.lan"; }
+
+summary() { # summary <log>
+    grep -E '^=== (source|STEP .* EXIT|JOB|LDD|COPY|distro)|^test result:|^error(\[|:)|^warning: unused|^FAILED|^failures:$|^    [a-z_:]+$' "$1" | grep -v '^=== STEP [^=]*: [^=]*$'
+}
+
+# run_on <node> <log> <job>...: deploy the job scripts, push the commit, run the
+# jobs, and copy the binary back if one was built. Returns the jobs' status.
+run_on() {
+    local node=$1 log=$2; shift 2
+    local h rc bin
+    h=$(fqdn "$node")
+    # Copy then rename: a job already running keeps reading its own inode.
+    scp -q "$HERE/job.sh" "csillag@$h:$C/home/csillag/job.sh.new" &&
+    ssh -o BatchMode=yes "csillag@$h" "mv -f $C/home/csillag/job.sh.new $C/home/csillag/job.sh" &&
+    scp -q "$HERE/run-job" "root@$h:/srv/aoe-build/run-job.new" &&
+    ssh -o BatchMode=yes "root@$h" "mv -f /srv/aoe-build/run-job.new /srv/aoe-build/run-job" ||
+        { echo "=== deploying job scripts to $node failed" > "$log"; return 1; }
+    git -C "$REPO" push -q -f "ssh://csillag@$h$C/home/csillag/aoe.git" "$SHA:refs/jobs/$SHA" ||
+        { echo "=== git push to $node failed" > "$log"; return 1; }
+    $SSH "root@$h" /srv/aoe-build/run-job "$SHA" "$@" > "$log" 2>&1
+    rc=$?
+    if grep -q '^=== JOB build EXIT=0$' "$log"; then
+        bin=$OUT/aoe-$S8
+        # Never replace a binary someone may be deploying from.
+        [ -e "$bin" ] && bin=$OUT/aoe-$S8.remote
+        if scp -q "csillag@$h:$C/home/csillag/out/aoe-$SHA" "$bin.tmp" && chmod 0755 "$bin.tmp" && mv -f "$bin.tmp" "$bin"; then
+            {
+                echo "=== ldd $bin (on superego)"
+                ldd "$bin"
+                echo "=== distro C libs linked: $(ldd "$bin" | grep -oE 'lib(git2|sqlite3|ssl|crypto|zstd)\.so[^ ]*' | tr '\n' ' ')"
+                if ldd "$bin" | grep -q 'not found'; then echo "=== LDD FAILED: unresolved libraries"; rc=1
+                else echo "=== LDD OK"; fi
+            } >> "$log"
+        else
+            echo "=== COPY-BACK FAILED" >> "$log"; rc=1
+        fi
+    fi
+    return $rc
+}
+
+if [ $PARALLEL = 0 ]; then
+    LOG=$OUT/remote-logs/$S8-$(IFS=+; echo "$*").log
+    [ "$HOSTS" = g4 ] || LOG=${LOG%.log}@$HOSTS.log
+    echo "aoe-remote: $S8 [$*] on $HOSTS, log $LOG"
+    run_on "$HOSTS" "$LOG" "$@"
+    RC=$?
+    summary "$LOG"
+    echo "aoe-remote: exit $RC"
+    exit $RC
+fi
+
+# Parallel: longest job first, each to the host with the least assigned time.
+# Weights are measured seconds on a warm target dir (2026-09-23, g4).
+weight() { case $1 in libtest) echo 540 ;; build) echo 320 ;; itest) echo 180 ;; lint) echo 145 ;; web) echo 95 ;; *) echo 100 ;; esac; }
+declare -A LOAD JOBS
+for n in $HOSTS; do LOAD[$n]=0; JOBS[$n]=""; done
+for j in $(for j in "$@"; do echo "$(weight "$j") $j"; done | sort -rn | cut -d' ' -f2); do
+    best=""
+    for n in $HOSTS; do
+        if [ -z "$best" ] || [ "${LOAD[$n]}" -lt "${LOAD[$best]}" ]; then best=$n; fi
+    done
+    LOAD[$best]=$(( LOAD[$best] + $(weight "$j") ))
+    JOBS[$best]="${JOBS[$best]} $j"
+done
+
+declare -A PID LOGOF
+for n in $HOSTS; do
+    [ -n "${JOBS[$n]}" ] || continue
+    # shellcheck disable=SC2086
+    set -- ${JOBS[$n]}
+    LOGOF[$n]=$OUT/remote-logs/$S8-$(IFS=+; echo "$*")@$n.log
+    echo "aoe-remote: $S8 [$*] on $n, log ${LOGOF[$n]}"
+    run_on "$n" "${LOGOF[$n]}" "$@" &
+    PID[$n]=$!
+done
+RC=0
+for n in "${!PID[@]}"; do
+    wait "${PID[$n]}" || RC=1
+done
+for n in $HOSTS; do
+    [ -n "${LOGOF[$n]:-}" ] || continue
+    echo "--- $n:${JOBS[$n]}"
+    summary "${LOGOF[$n]}"
+done
+echo "aoe-remote: exit $RC"
+exit $RC
