@@ -127,7 +127,7 @@ export function Composer(props: Props) {
 
   usePluginDraftOperations(sessionId, client, taRef);
   usePrimerPrefill(props.primerPrefill, loadText);
-  useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef);
+  useDraftPersistence(sessionId, client, composerText, draftTextRef, taRef, queuedPrompts);
   useInitialFocus(isMobile, taRef);
   // Sidebar session selection focuses the composer even when already mounted.
   useFocusTerminalTarget("composer", taRef);

@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAui, useAuiState } from "@assistant-ui/react";
 import type { Unstable_TriggerAdapter, Unstable_TriggerItem } from "@assistant-ui/core";
 
-import { getDraft, setDraft } from "../../lib/acpDrafts";
+import { getDraft, setDraft, unsentDraftOnUnload } from "../../lib/acpDrafts";
 import type { AcpState, PromptAttachmentInput, PromptCapabilities, QueuedPrompt } from "../../lib/acpTypes";
 import { useClearAliases } from "../../lib/agentProfileContext";
 import { fitTextarea, fileToBase64, kindSupported, MAX_ATTACHMENTS, mimeToKind } from "./composerInput";
@@ -75,7 +75,12 @@ export function useDraftPersistence(
   composerText: string,
   draftTextRef: React.RefObject<string>,
   taRef: TextareaRef,
+  queuedPrompts: readonly QueuedPrompt[],
 ) {
+  const queuedPromptsRef = useRef(queuedPrompts);
+  useEffect(() => {
+    queuedPromptsRef.current = queuedPrompts;
+  }, [queuedPrompts]);
   useEffect(() => {
     const saved = getDraft(sessionId);
     if (saved && client.getState().text === "") {
@@ -85,17 +90,35 @@ export function useDraftPersistence(
       });
     }
     const flush = () => setDraft(sessionId, draftTextRef.current);
-    // iOS Safari fires pagehide only on real unload, not on app switch.
-    const onHidden = () => {
-      if (document.visibilityState === "hidden") flush();
+    // Rescue queued prompts the server never confirmed. Hidden runs the same
+    // flush: it fires after pagehide, and a plain flush last would drop the
+    // rescued text. Latched so the second signal is a no-op; re-armed on return.
+    let unloaded = false;
+    let unlatch: ReturnType<typeof setTimeout> | undefined;
+    const unloadFlush = () => {
+      if (unloaded) return;
+      unloaded = true;
+      setDraft(sessionId, unsentDraftOnUnload(draftTextRef.current, queuedPromptsRef.current));
+      // A cancelled beforeunload never gets a later `visible` to clear the
+      // latch. A real unload fires pagehide and hidden in one task, so this
+      // macrotask cannot land between them.
+      clearTimeout(unlatch);
+      unlatch = setTimeout(() => {
+        unloaded = false;
+      }, 0);
     };
-    window.addEventListener("beforeunload", flush);
-    window.addEventListener("pagehide", flush);
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") unloadFlush();
+      else unloaded = false;
+    };
+    window.addEventListener("beforeunload", unloadFlush);
+    window.addEventListener("pagehide", unloadFlush);
     document.addEventListener("visibilitychange", onHidden);
     return () => {
-      window.removeEventListener("beforeunload", flush);
-      window.removeEventListener("pagehide", flush);
+      window.removeEventListener("beforeunload", unloadFlush);
+      window.removeEventListener("pagehide", unloadFlush);
       document.removeEventListener("visibilitychange", onHidden);
+      clearTimeout(unlatch);
       flush();
     };
   }, [client, sessionId, draftTextRef, taRef]);

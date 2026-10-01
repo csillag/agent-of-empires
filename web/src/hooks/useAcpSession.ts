@@ -23,11 +23,25 @@ import {
 } from "../lib/api";
 import { classifyResolveResponse, reducer, type Action } from "./acpSession/reducer";
 import { ACP_MAX_RETRIES, useAcpConnection } from "./acpSession/useAcpConnection";
-import { cacheGet, cacheSet, sweepExpiredStorage } from "./acpSession/stateCache";
+import {
+  cacheGet,
+  cacheSet,
+  persistState,
+  resetStorageSweep,
+  sweepExpiredStorage,
+} from "./acpSession/stateCache";
+import { LEGACY_KEY_PREFIX, STORAGE_KEY_PREFIX } from "../lib/acpStateStorage";
 import { useLatestRef } from "./useLatestRef";
 
 export { reducer, transcriptDeltaAction, type Action } from "./acpSession/reducer";
 export { clearAcpCache, useBackgroundAgents } from "./acpSession/stateCache";
+
+export const __test = { persistState, resetStorageSweep, STORAGE_KEY_PREFIX, LEGACY_KEY_PREFIX };
+
+/** Drop expired badge entries and every frozen `aoe:acp-state:v1:` snapshot. */
+export function sweepAcpStateStorage(): void {
+  sweepExpiredStorage();
+}
 
 type PromptSendResult =
   | { kind: "dispatched" }
