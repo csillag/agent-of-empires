@@ -91,6 +91,10 @@ enum RestartDecision {
     /// banner nobody may be watching, so the handle is dropped and a startup
     /// failure recorded for the reconciler to fresh-spawn from.
     LeaveToReconciler,
+    /// The daemon ordered this restart (a drained build-stale respawn,
+    /// `aoe acp restart`). The resume pass owns it. Drop the handle, with
+    /// no crash banner and no stop.
+    DaemonRestart,
     /// The handle was removed (shutdown or delete).
     Gone,
     /// The registry entry was deleted under a live handle (`aoe acp stop|kill`).
@@ -113,6 +117,10 @@ impl<S: BroadcastSink> Drain<S> {
                 "drain channel closed (agent connection task ended); evaluating respawn"
             );
             if end.agent_unresponsive {
+                // The runner deletes its own registry record as it exits, and a
+                // missing record reads as `aoe acp stop`. Mark this generation
+                // first so the kill is the restart it is.
+                worker_registry::mark_restart_pending(&self.session_id, lease.epoch());
                 kill_wedged_runner(&*self.process_control, &self.session_id).await;
             }
             if end.rate_limited {
@@ -134,7 +142,7 @@ impl<S: BroadcastSink> Drain<S> {
                 self.drop_handle(&lease).await;
                 return;
             }
-            let Some(config) = self.approve_respawn(&lease).await else {
+            let Some(config) = self.approve_respawn(&lease, end.agent_unresponsive).await else {
                 return;
             };
             match self.respawn(&lease, config).await {
@@ -300,9 +308,9 @@ impl<S: BroadcastSink> Drain<S> {
     }
 
     /// Decide whether the closed worker respawns, publishing why when it does not.
-    async fn approve_respawn(&self, lease: &Lease) -> Option<SpawnConfig> {
+    async fn approve_respawn(&self, lease: &Lease, killed_as_unresponsive: bool) -> Option<SpawnConfig> {
         let session_id = &self.session_id;
-        match restart_decision(&self.workers, session_id).await {
+        match restart_decision(&self.workers, session_id, killed_as_unresponsive).await {
             RestartDecision::Respawn(config) => {
                 info!(
                     target: "acp.supervisor",
@@ -338,6 +346,13 @@ impl<S: BroadcastSink> Drain<S> {
                     "attached worker connection died; leaving the fresh spawn to the reconciler"
                 );
                 lock_recover(&self.startup_failures).insert(session_id.clone());
+            }
+            RestartDecision::DaemonRestart => {
+                info!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "daemon-ordered restart; dropping the handle for the resume pass"
+                );
             }
             RestartDecision::Gone => return None,
             RestartDecision::UserStopped => {
@@ -623,7 +638,11 @@ impl<S: BroadcastSink> Drain<S> {
     }
 }
 
-async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecision {
+async fn restart_decision(
+    workers: &Workers,
+    session_id: &str,
+    killed_as_unresponsive: bool,
+) -> RestartDecision {
     let mut guard = workers.lock().await;
     let Some(handle) = guard.get_mut(session_id) else {
         debug!(
@@ -637,13 +656,36 @@ async fn restart_decision(workers: &Workers, session_id: &str) -> RestartDecisio
         handle.kind,
         WorkerKind::Runner { .. } | WorkerKind::Attached
     );
-    if runner_managed && matches!(worker_registry::load(session_id), Ok(None)) {
+    if runner_managed
+        && !killed_as_unresponsive
+        && worker_registry::peek_restart_marker(session_id) == Some(handle.lease.epoch())
+    {
         debug!(
             target: "acp.supervisor",
             session = %session_id,
-            "restart_decision: registry entry gone, treating as user-initiated stop"
+            "restart_decision: the daemon ordered this restart; leaving it to the resume pass"
         );
-        return RestartDecision::UserStopped;
+        return RestartDecision::DaemonRestart;
+    }
+    if runner_managed && matches!(worker_registry::load(session_id), Ok(None)) {
+        // A marker for this generation means the daemon killed the runner in
+        // order to restart it. Consume it and fall through to the respawn.
+        if killed_as_unresponsive
+            && worker_registry::take_restart_marker(session_id, handle.lease.epoch())
+        {
+            debug!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "restart_decision: registry entry gone under this generation's restart marker; respawning"
+            );
+        } else {
+            debug!(
+                target: "acp.supervisor",
+                session = %session_id,
+                "restart_decision: registry entry gone, treating as user-initiated stop"
+            );
+            return RestartDecision::UserStopped;
+        }
     }
     let now = Instant::now();
     let pre_count = handle.restart_history.len();
@@ -725,26 +767,49 @@ mod tests {
         worker_registry::save(&worker_record("s-1", std::process::id(), socket.clone())).unwrap();
         sup.test_install_runner("s-1", runner_config(socket.clone()), None)
             .await;
-        sup.test_install_runner("s-stop", runner_config(socket), None)
+        let lease = sup
+            .test_install_runner("s-stop", runner_config(socket), None)
             .await;
 
         for i in 0..MAX_RESPAWNS_IN_WINDOW {
             assert!(
                 matches!(
-                    restart_decision(&sup.workers, "s-1").await,
+                    restart_decision(&sup.workers, "s-1", false).await,
                     RestartDecision::Respawn(_)
                 ),
                 "decision #{i} should be Respawn",
             );
         }
         assert!(matches!(
-            restart_decision(&sup.workers, "s-1").await,
+            restart_decision(&sup.workers, "s-1", false).await,
             RestartDecision::BudgetBurned
         ));
-        let decision = restart_decision(&sup.workers, "s-stop").await;
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "no registry entry means a user stop, got {decision:?}"
+        );
+        worker_registry::mark_restart_pending("s-stop", lease.epoch() + 1);
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
+        assert!(
+            matches!(decision, RestartDecision::UserStopped),
+            "a stale-generation marker must not authorize a restart, got {decision:?}"
+        );
+        worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", false).await;
+        assert!(
+            matches!(decision, RestartDecision::DaemonRestart),
+            "a restart the daemon ordered must not be read as a crash, got {decision:?}"
+        );
+        assert!(
+            worker_registry::take_restart_marker("s-stop", lease.epoch()),
+            "the marker must be left for the reaper"
+        );
+        worker_registry::mark_restart_pending("s-stop", lease.epoch());
+        let decision = restart_decision(&sup.workers, "s-stop", true).await;
+        assert!(
+            matches!(decision, RestartDecision::Respawn(_)),
+            "this generation's marker must turn a missing record into a respawn, got {decision:?}"
         );
     }
 
