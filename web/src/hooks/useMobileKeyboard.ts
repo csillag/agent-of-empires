@@ -8,7 +8,9 @@ interface MobileKeyboardSnapshot {
   keyboardHeight: number;
 }
 
-export function useMobileKeyboard() {
+/** `enabled` false leaves the viewport machinery unwired. A suspended view is
+ *  not on screen, so its measurements are meaningless and its polling is wasted. */
+export function useMobileKeyboard(enabled = true) {
   const { state, setState } = useSnapshotStore<MobileKeyboardSnapshot>(() => ({
     isMobile: typeof window !== "undefined" && !!window.matchMedia?.("(pointer: coarse)").matches,
     keyboardOpen: false,
@@ -34,7 +36,7 @@ export function useMobileKeyboard() {
   }, [update]);
 
   useEffect(() => {
-    if (!state.isMobile) return;
+    if (!enabled || !state.isMobile) return;
     const vv = window.visualViewport;
     if (!vv) return;
 
@@ -123,7 +125,7 @@ export function useMobileKeyboard() {
       if (orientTimer) clearTimeout(orientTimer);
       for (const off of stop) off();
     };
-  }, [state.isMobile, update]);
+  }, [enabled, state.isMobile, update]);
 
   return state;
 }

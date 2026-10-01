@@ -91,6 +91,14 @@ describe("useMobileKeyboard", () => {
     expect(ctl.listenerCount("resize") + ctl.listenerCount("scroll")).toBe(0);
   });
 
+  it("wires nothing while disabled, even on a coarse pointer", () => {
+    stubMatchMedia(true);
+    const ctl = stubVisualViewport(800);
+    renderHook(() => useMobileKeyboard(false));
+    expect(ctl.listenerCount("resize")).toBe(0);
+    expect(ctl.listenerCount("scroll")).toBe(0);
+  });
+
   it("measures the keyboard inset, ignores a URL-bar nudge, and closes on dismiss", () => {
     const { result, resizeTo } = mountMobile();
     resizeTo(760);

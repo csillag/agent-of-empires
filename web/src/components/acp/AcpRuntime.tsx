@@ -9,7 +9,7 @@ import {
 } from "@assistant-ui/react";
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
-import { useAcpSession } from "../../hooks/useAcpSession";
+import { useAcpSession, type ResumePhase } from "../../hooks/useAcpSession";
 import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { isVisiblyBusy } from "../../lib/acpTypes";
@@ -30,6 +30,9 @@ interface Props {
   snoozedUntil?: string | null;
   /** Render rows before the latest `/clear` instead of folding them. */
   showClearedTurns?: boolean;
+  /** False while this view is suspended in the keep-alive set: the tree stays
+   *  mounted, the socket and the timers do not. */
+  active?: boolean;
   children: (ctx: AcpContext) => ReactNode;
 }
 
@@ -37,6 +40,12 @@ export interface AcpContext {
   state: AcpState;
   status: Session["status"];
   hasEverOpened: boolean;
+  /** Catch-up phase of a resumed view; drives the catching-up strip. */
+  resumePhase: ResumePhase;
+  /** The last resume could not fetch what it missed; the view is behind. */
+  resumeFailed: boolean;
+  /** The transcript was discarded because the conversation was replaced. */
+  conversationReset: boolean;
   /** The auto-reconnect backoff is armed between a close and the next dial. */
   reconnecting: boolean;
   retryCount: number;
@@ -82,7 +91,8 @@ function RuntimeHost({ adapter, children }: { adapter: ExternalStoreAdapter<Thre
 
 /** Staged attachments persisted per session, with a ref mirror for `onNew`. */
 function usePendingAttachments(sessionId: string) {
-  // The view remounts per session, so the initializer seeds the right draft once.
+  // Each kept session has its own layer, so this mount keeps one sessionId for
+  // its whole life and the initializer seeds that session's draft once.
   const [pendingAttachments, setPendingAttachments] = useState<PromptAttachmentInput[]>(() =>
     getDraftAttachments(sessionId),
   );
@@ -108,9 +118,10 @@ export function AcpRuntime({
   archivedAt = null,
   snoozedUntil = null,
   showClearedTurns = false,
+  active = true,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, active);
   const agentProfile = useAgentProfile();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const onCancel = useCancelEscalation(
@@ -193,6 +204,9 @@ export function AcpRuntime({
         state: acp.state,
         status: acp.status,
         hasEverOpened: acp.hasEverOpened,
+        resumePhase: acp.resumePhase,
+        resumeFailed: acp.resumeFailed,
+        conversationReset: acp.conversationReset,
         reconnecting: acp.reconnecting,
         retryCount: acp.retryCount,
         retryCountdown: acp.retryCountdown,

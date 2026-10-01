@@ -33,18 +33,24 @@ const getReplayPair = (sid: string, params: string): Promise<[Response, Response
 const readRows = async (res: Response): Promise<TranscriptRow[]> =>
   ((await res.json()) as ReplayPageResponse).rows ?? [];
 
-/** Catch up from `lastSeq.current`, updating it on a cold open. Errors are swallowed; a later lagged notice retries. */
+/** Catch up from `lastSeq.current`, updating it on a cold open.
+ *  False when a page never landed, so the caller can say the view is behind.
+ *  A thrown error is the same failure. */
 export async function fetchReplay(
   sid: string,
   lastSeq: { current: number },
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
-): Promise<void> {
+  /** Warm replay found the server ahead of what this view had already folded. */
+  onServerAhead?: () => void,
+  /** The server's seq counter restarted below this view's cursor. */
+  onConversationReset?: () => void,
+): Promise<boolean> {
   try {
-    if (lastSeq.current === 0) await fetchTail(sid, lastSeq, dispatch, setHasMoreOlder);
-    else await fetchForward(sid, lastSeq.current, dispatch);
+    if (lastSeq.current === 0) return await fetchTail(sid, lastSeq, dispatch, setHasMoreOlder);
+    return await fetchForward(sid, lastSeq.current, dispatch, onServerAhead, onConversationReset);
   } catch {
-    // Best effort.
+    return false;
   }
 }
 
@@ -53,15 +59,15 @@ async function fetchTail(
   lastSeq: { current: number },
   dispatch: Dispatch,
   setHasMoreOlder: (value: boolean) => void,
-): Promise<void> {
+): Promise<boolean> {
   const [tailRes, tailRowsRes] = await getReplayPair(sid, `before=${TAIL_BEFORE}&limit=${REPLAY_PAGE_SIZE}`);
-  if (!tailRes.ok) return;
+  if (!tailRes.ok) return false;
   const tail = (await tailRes.json()) as ReplayPageResponse;
   if (tail.lost) {
     dispatch({ kind: "lagged", skipped: tail.highest_seq });
-    return;
+    return true;
   }
-  if (!tailRowsRes.ok) return;
+  if (!tailRowsRes.ok) return false;
   const tailRowsPage = (await tailRowsRes.json()) as ReplayPageResponse;
   const rows = toActivityRows(tailRowsPage.rows ?? [], sid);
   dispatch({ kind: "frames", frames: tail.frames ?? [], rows, oldestSeq: tail.next_cursor ?? 0 });
@@ -78,25 +84,37 @@ async function fetchTail(
     }
   }
   dispatch({ kind: "lagged_resolved" });
+  return true;
 }
 
-async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch): Promise<void> {
+async function fetchForward(
+  sid: string,
+  lastSeq: number,
+  dispatch: Dispatch,
+  onServerAhead?: () => void,
+  onConversationReset?: () => void,
+): Promise<boolean> {
   const firstSince = Math.max(0, lastSeq - REPLAY_OVERLAP);
   let cursor = firstSince;
   let target: number | null = null;
   for (;;) {
     const [res, rowsRes] = await getReplayPair(sid, `since=${cursor}&limit=${REPLAY_PAGE_SIZE}`);
-    if (!res.ok || !rowsRes.ok) return;
+    if (!res.ok || !rowsRes.ok) return false;
     const data = (await res.json()) as ReplayPageResponse;
     const pageRows = await readRows(rowsRes);
     if (target === null) {
       target = data.highest_seq;
+      // The server is ahead of what this view had already folded.
+      if (data.highest_seq > lastSeq) onServerAhead?.();
       // The server's log is behind our cursor (e.g. it was reset), so start over.
-      if (data.highest_seq < firstSince) dispatch({ kind: "reset" });
+      if (data.highest_seq < firstSince) {
+        dispatch({ kind: "reset" });
+        onConversationReset?.();
+      }
     }
     if (data.lost) {
       dispatch({ kind: "lagged", skipped: data.highest_seq });
-      return;
+      return true;
     }
     if (data.frames.length > 0 || pageRows.length > 0) {
       dispatch({ kind: "frames", frames: data.frames, rows: toActivityRows(pageRows, sid) });
@@ -106,6 +124,7 @@ async function fetchForward(sid: string, lastSeq: number, dispatch: Dispatch): P
     cursor = next;
   }
   dispatch({ kind: "lagged_resolved" });
+  return true;
 }
 
 /** Fetch the page below `before`. Returns whether more older history remains, or null on failure. */

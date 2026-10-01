@@ -19,6 +19,11 @@ import { cacheGet } from "./stateCache";
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
+/** Where a resumed view is in its catch-up. `checking` means the replay has
+ *  been asked and has not answered; `catching_up` means it answered that the
+ *  server is ahead and the rows are landing. Only the latter earns a strip. */
+export type ResumePhase = "idle" | "checking" | "catching_up";
+
 export const ACP_MAX_RETRIES = 7;
 const ACP_RETRY_BASE_MS = 1000;
 const ACP_RETRY_CAP_MS = 30000;
@@ -70,8 +75,17 @@ export function useAcpConnection(
   sessionIdRef: RefObject<string | null>,
   state: AcpState,
   dispatch: Dispatch<Action>,
+  /** False while the view is suspended: no socket, no timer, status closed. */
+  active = true,
 ) {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [resumePhase, setResumePhase] = useState<ResumePhase>("idle");
+  // The last warm replay did not complete. The phase is idle again and a live
+  // socket stays open, so this is the only signal that the transcript is behind.
+  const [resumeFailed, setResumeFailed] = useState(false);
+  // The last replay found the daemon's seq counter below this view: the
+  // conversation on screen was replaced while we were away.
+  const [conversationReset, setConversationReset] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [retryCount, setRetryCount] = useState(0);
   const [retryCountdown, setRetryCountdown] = useState(0);
@@ -79,6 +93,7 @@ export function useAcpConnection(
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [hasEverOpened, setHasEverOpened] = useState(false);
 
+  const activeRef = useLatestRef(active);
   const lastSeqRef = useLatestRef(state.lastSeq);
   const oldestSeqRef = useLatestRef(state.oldestSeq);
   const hasMoreOlderRef = useLatestRef(hasMoreOlder);
@@ -116,19 +131,21 @@ export function useAcpConnection(
   }, [clearRetryTimers]);
 
   const tryAutoReconnect = useCallback(() => {
+    if (!activeRef.current) return;
     const ready = wsRef.current?.readyState;
     if (ready === WebSocket.CONNECTING) return;
     // An OPEN socket only counts as alive while it keeps hearing from the server.
     if (ready === WebSocket.OPEN && Date.now() - lastServerMsgRef.current < ACP_WS_STALE_MS) return;
     redial();
-  }, [redial]);
+  }, [redial, activeRef]);
 
   useEffect(() => {
+    if (!active) return;
     const id = setInterval(() => {
       if (wsRef.current?.readyState === WebSocket.OPEN) tryAutoReconnect();
     }, ACP_WS_WATCHDOG_INTERVAL_MS);
     return () => clearInterval(id);
-  }, [tryAutoReconnect]);
+  }, [tryAutoReconnect, active]);
 
   const visCounterRef = useRef(0);
   const subscribeVisibilityCount = useCallback(
@@ -182,10 +199,11 @@ export function useAcpConnection(
     }
   }, [dispatch, sessionIdRef, oldestSeqRef, hasMoreOlderRef]);
 
-  const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
-  if (sessionId !== trackedSessionId) {
-    setTrackedSessionId(sessionId);
-    setStatus(sessionId ? "connecting" : "closed");
+  const tracked = active ? sessionId : null;
+  const [trackedSessionId, setTrackedSessionId] = useState(tracked);
+  if (tracked !== trackedSessionId) {
+    setTrackedSessionId(tracked);
+    setStatus(tracked ? "connecting" : "closed");
     setReconnecting(false);
     setRetryCount(0);
     setRetryCountdown(0);
@@ -199,7 +217,13 @@ export function useAcpConnection(
     loadingOlderRef.current = false;
     lastSeqRef.current = cached?.lastSeq ?? 0;
     oldestSeqRef.current = cached?.oldestSeq ?? 0;
-    if (!sessionId) return;
+    if (!sessionId || !active) {
+      settersRef.current.setStatus("closed");
+      return;
+    }
+    // A resume leaves the status state "closed". Set it with the dial, or the
+    // view reports a dropped socket for the whole handshake.
+    settersRef.current.setStatus("connecting");
     dispatch({ kind: "hydrate", state: cached ?? emptyAcpState() });
     retryCountRef.current = 0;
     let cancelled = false;
@@ -233,6 +257,32 @@ export function useAcpConnection(
       }, delayMs);
     };
 
+    const replay = async () => {
+      if (lastSeqRef.current === 0) {
+        // A cold open has nothing to catch up on, and an older resume's
+        // failure is no longer this view's story.
+        setResumeFailed(false);
+        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+        return;
+      }
+      setResumeFailed(false);
+      setConversationReset(false);
+      setResumePhase("checking");
+      try {
+        const ok = await fetchReplay(
+          sessionId,
+          lastSeqRef,
+          dispatch,
+          setHasMoreOlder,
+          () => setResumePhase("catching_up"),
+          () => setConversationReset(true),
+        );
+        if (!ok) setResumeFailed(true);
+      } finally {
+        setResumePhase("idle");
+      }
+    };
+
     const handleMessage = (data: ServerMessage) => {
       const kind = typeof data === "object" && data !== null && "kind" in data ? data.kind : undefined;
       switch (kind) {
@@ -240,7 +290,7 @@ export function useAcpConnection(
           return;
         case "lagged":
           dispatch({ kind: "lagged", skipped: (data as { skipped?: number }).skipped ?? 0 });
-          void fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+          void replay();
           return;
         case "reduced_state": {
           const { state: reduced, unchanged } = data as { state?: ReducedState; unchanged?: string[] };
@@ -281,7 +331,7 @@ export function useAcpConnection(
       const myGen = dialGenRef.current;
       const isCurrentDial = () => !cancelled && dialGenRef.current === myGen;
       void (async () => {
-        await fetchReplay(sessionId, lastSeqRef, dispatch, setHasMoreOlder);
+        await replay();
         if (!isCurrentDial()) return;
         const protocol = window.location.protocol === "https:" ? "wss" : "ws";
         const url = `${protocol}://${window.location.host}/sessions/${encodeURIComponent(sessionId)}/acp/ws?since=${lastSeqRef.current}`;
@@ -331,7 +381,7 @@ export function useAcpConnection(
       wsRef.current = null;
       connectRef.current = null;
     };
-  }, [sessionId, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef]);
+  }, [sessionId, active, dispatch, clearRetryTimers, lastSeqRef, oldestSeqRef]);
 
   const manualReconnect = useCallback(() => {
     setReconnecting(false);
@@ -345,6 +395,9 @@ export function useAcpConnection(
     retryCountdown,
     manualReconnect,
     hasEverOpened,
+    resumePhase,
+    resumeFailed,
+    conversationReset,
     loadOlder,
     hasMoreOlder,
     loadingOlder,

@@ -12,10 +12,11 @@ export interface PromptRepinInput {
    *  device, a drained queue entry, a replay). One bump per prompt, whatever
    *  the path. */
   promptSeq: number;
-  /** Whether the session socket has opened. `fetchReplay` lands the
-   *  transcript (and its prompt bumps) before the WebSocket dials and
-   *  `hasEverOpened` flips only in `onopen`, so a bump seen while this is
-   *  false is hydration, not a submit — unless it is this client's own. */
+  /** Whether the session socket is open right now. `fetchReplay` lands the
+   *  transcript (and its prompt bumps) before the WebSocket dials, so a bump
+   *  seen while this is false is hydration, not a submit, unless it is this
+   *  client's own. A resumed view replays the same way, which is why this is
+   *  the live socket and not "has ever opened". */
   live: boolean;
   /** Whether this client has an optimistic prompt in flight
    *  (`inflightPromptIds` non-empty). A bump that arrives with one is a local
