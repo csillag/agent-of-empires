@@ -526,10 +526,13 @@ impl Session {
         match res.as_ref().map(SteerOutcome::from_response) {
             Ok(SteerOutcome::Injected) => {
                 info!(target: "acp.protocol", session = %label, "_session/steering injected into the running turn");
-                // The running turn still owns its Stopped. Injection can
-                // swallow an update the watchdog awaited, so it counts as
-                // progress.
-                turn.apply(LifecycleSignal::Progress);
+                // The running turn still owns its Stopped. The cost report
+                // that closes the pre-empted generation is not the wrap-up.
+                turn.watchdog.apply_steer_injected(
+                    Instant::now(),
+                    chrono::Utc::now(),
+                    turn.cfg,
+                );
             }
             Ok(SteerOutcome::PromptRequired) => {
                 // The turn settled first and the content is untouched: run it
