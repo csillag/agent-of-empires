@@ -305,7 +305,7 @@ pub async fn reconcile_acp_workers(
         }
         target.in_flight_turn =
             query_store(&state.acp_event_store, &id, "in-flight turn", |s, id| {
-                s.has_in_flight_turn(id)
+                s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id)
             })
             .await
             .unwrap_or(false);
