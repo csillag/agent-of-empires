@@ -118,6 +118,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 let settlement =
                     tear_down_runner(&*self.process_control, session_id, identity).await;
                 self.settle(&lease, settlement);
+                self.cancel_dead_requests(session_id);
                 // Publish now so the UI clears its thinking state before the next reap tick.
                 if !is_test_worker(&handle) {
                     // The worker's tailer died with it, so a sub-agent still
@@ -558,8 +559,35 @@ mod tests {
     use super::super::test_support::*;
     use super::super::{ResumeKind, ResumeReservationOutcome};
     use super::*;
+    use crate::acp::approvals::Nonce;
+    use crate::acp::elicitations::ElicitationOutcome;
     use crate::acp::runner_lifecycle::test_support::FakeProcessControl;
     use std::sync::Arc;
+
+    /// A worker's open question dies with it, so stopping the worker must
+    /// clear the card instead of leaving an answer to 404.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn shutdown_cancels_the_questions_of_the_stopped_worker() {
+        let (_home, _tmp) = isolate_home();
+        let sink = VecSink::new();
+        *sink.stale_elicitation_nonces.lock().unwrap() = vec![Nonce("e-open".into())];
+        let sup = Supervisor::new(sink.clone());
+        sup.test_insert_worker("s-ask").await;
+        sup.shutdown_idle("s-ask").await.expect("shutdown ok");
+        let frames = sink.frames.lock().unwrap().clone();
+        assert!(
+            frames.iter().any(|f| matches!(
+                &f.2,
+                Event::ElicitationResolved {
+                    nonce,
+                    outcome: ElicitationOutcome::Cancelled,
+                    ..
+                } if nonce.0 == "e-open"
+            )),
+            "expected the open question cancelled, got {frames:?}"
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial]

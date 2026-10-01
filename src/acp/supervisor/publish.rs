@@ -201,6 +201,44 @@ impl<S: BroadcastSink> Supervisor<S> {
         cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
     }
 
+    /// Resolve as cancelled every approval and question still open for a
+    /// worker that is gone. Its agent can no longer receive the answer, so a
+    /// card left standing would 404 on submit. Unlike the restart sweeps it
+    /// publishes no `Stopped`: the caller owns the turn state.
+    pub(super) fn cancel_dead_requests(&self, session_id: &str) {
+        let approvals = self.sink.unresolved_approval_nonces(session_id);
+        let elicitations = self.sink.unresolved_elicitation_nonces(session_id);
+        if approvals.is_empty() && elicitations.is_empty() {
+            return;
+        }
+        info!(
+            target: "acp.supervisor",
+            session = %session_id,
+            approvals = approvals.len(),
+            elicitations = elicitations.len(),
+            "cancelling requests left open by a stopped worker"
+        );
+        for nonce in approvals {
+            self.publish_next(
+                session_id,
+                &Event::ApprovalResolved {
+                    nonce,
+                    decision: ApprovalDecision::Cancelled,
+                },
+            );
+        }
+        for nonce in elicitations {
+            self.publish_next(
+                session_id,
+                &Event::ElicitationResolved {
+                    nonce,
+                    outcome: ElicitationOutcome::Cancelled,
+                    answers: Vec::new(),
+                },
+            );
+        }
+    }
+
     /// Detach background sub-agents the previous daemon left outstanding.
     /// See [`detach_orphaned_background_agents_on`].
     pub(super) fn detach_orphaned_background_agents(&self, session_id: &str) {
