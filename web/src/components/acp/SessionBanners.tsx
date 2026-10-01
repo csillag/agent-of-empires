@@ -61,11 +61,6 @@ export function SessionBanners({
       {state.nextWakeupAt && idle && (
         <ScheduledWakeupBanner wakeAt={state.nextWakeupAt} reason={state.nextWakeupReason} />
       )}
-      {state.monitorArmed && !state.nextWakeupAt && idle && (
-        <ChipBanner tone="violet" icon="👁" detail={state.monitorDescription}>
-          Monitoring a background job
-        </ChipBanner>
-      )}
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
     </>
   );

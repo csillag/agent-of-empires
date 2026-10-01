@@ -562,11 +562,6 @@ export interface AcpState {
   queuedPrompts: QueuedPrompt[];
   nextWakeupAt: string | null;
   nextWakeupReason: string | null;
-  /** An armed `Monitor` has no fire time; cleared when the user takes over or the fired turn ends. */
-  monitorArmed: boolean;
-  /** A tool call started after `MonitorArmed`, so the next `Stopped` may clear the badge. */
-  monitorWorkSeen: boolean;
-  monitorDescription: string | null;
   cancelling: boolean;
   /** When the cancel watchdog will SIGTERM the worker. */
   cancelEscalatesAt: string | null;
@@ -831,9 +826,6 @@ export function emptyAcpState(): AcpState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
-    monitorArmed: false,
-    monitorWorkSeen: false,
-    monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
     compacting: false,
@@ -877,10 +869,6 @@ function applyNewTurnResets(next: AcpState): void {
       next.nextWakeupReason = null;
     }
   }
-  // A monitor never self-fires a prompt, so any prompt here is the user taking over.
-  next.monitorArmed = false;
-  next.monitorWorkSeen = false;
-  next.monitorDescription = null;
   next.contextPrimerAvailable = null;
 }
 
@@ -907,10 +895,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallStarted" in event) {
-    // A tool call after arming means the monitor fired.
-    if (next.monitorArmed) {
-      next.monitorWorkSeen = true;
-    }
     return next;
   }
   if ("UsageUpdated" in event) {
@@ -989,11 +973,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Whether this `Stopped` ends the turn is the daemon's call (see closeTurn); the escalation deadline is ours.
     next.cancelEscalatesAt = null;
     closeTurn(next);
-    if (next.monitorArmed && next.monitorWorkSeen) {
-      next.monitorArmed = false;
-      next.monitorWorkSeen = false;
-      next.monitorDescription = null;
-    }
     // Any stop other than the limit itself ends the rate-limit park.
     if (event.Stopped.reason !== "rate_limited" && event.Stopped.reason !== "rate_limit_exhausted_retries") {
       next.rateLimit = null;
@@ -1119,9 +1098,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("MonitorArmed" in event) {
-    next.monitorArmed = true;
-    next.monitorWorkSeen = false;
-    next.monitorDescription = event.MonitorArmed.description ?? null;
+    // Old logs still carry this. The background registry replaced the badge.
     return next;
   }
   if ("CancelRequested" in event) {

@@ -334,6 +334,82 @@ pub struct BackgroundAgentRecord {
     pub warning: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundKind {
+    Monitor,
+    Shell,
+    Wakeup,
+    Subagent,
+    Workflow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundEndReason {
+    Stopped,
+    TimedOut,
+    Finished,
+    Fired,
+    Lost,
+}
+
+/// Why a live item died with its worker. Only the causes the agent did not
+/// choose wake it to re-arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundLossCause {
+    NewBuild,
+    Respawn,
+    WedgeKill,
+    UserStop,
+    IdleCap,
+}
+
+impl BackgroundLossCause {
+    pub fn wakes_agent(self) -> bool {
+        matches!(self, Self::NewBuild | Self::Respawn | Self::WedgeKill)
+    }
+
+    pub fn describe(self) -> &'static str {
+        match self {
+            Self::NewBuild => "restart onto a new build",
+            Self::Respawn => "worker restart",
+            Self::WedgeKill => "stuck agent killed",
+            Self::UserStop => "stopped by the owner",
+            Self::IdleCap => "idle for 24 h",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundEnd {
+    pub reason: BackgroundEndReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<BackgroundLossCause>,
+    pub at: DateTime<Utc>,
+}
+
+/// One piece of background work an agent left running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundItem {
+    pub kind: BackgroundKind,
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<BackgroundEnd>,
+}
+
+impl BackgroundItem {
+    pub fn is_live(&self) -> bool {
+        self.ended.is_none()
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AcpState {
     pub session_id: AcpSessionId,
@@ -659,9 +735,34 @@ pub enum Event {
         at: DateTime<Utc>,
         reason: Option<String>,
     },
-    /// The agent armed the Claude SDK's `Monitor` tool.
+    /// No longer emitted. The background registry replaced this badge.
+    /// Kept so old event logs still deserialize.
     MonitorArmed {
         description: Option<String>,
+    },
+    /// Background work the agent started. See `crate::acp::background`.
+    BackgroundItemStarted {
+        kind: BackgroundKind,
+        id: String,
+        #[serde(default)]
+        tool_call_id: Option<String>,
+        #[serde(default)]
+        label: Option<String>,
+        started_at: DateTime<Utc>,
+        #[serde(default)]
+        expires_at: Option<DateTime<Utc>>,
+    },
+    /// A background item ended. `cause` is set only for `reason: Lost`.
+    BackgroundItemEnded {
+        id: String,
+        reason: BackgroundEndReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cause: Option<BackgroundLossCause>,
+        at: DateTime<Utc>,
+    },
+    /// The agent was sent a note about lost items up to `up_to`.
+    BackgroundLossNoted {
+        up_to: DateTime<Utc>,
     },
     /// The conversation was cleared (`/clear` or a driven reset).
     SessionCleared,
@@ -927,7 +1028,10 @@ impl AcpState {
             | Event::AgentThoughtChunk { .. }
             | Event::ConversationSummary { .. }
             | Event::WakeupScheduled { .. }
-            | Event::MonitorArmed { .. } => {}
+            | Event::MonitorArmed { .. }
+            | Event::BackgroundItemStarted { .. }
+            | Event::BackgroundItemEnded { .. }
+            | Event::BackgroundLossNoted { .. } => {}
         }
         self.last_seq = self.last_seq.saturating_add(1);
         self.updated_at = Utc::now();
@@ -1052,6 +1156,43 @@ mod tests {
             AgentName("aoe-agent".into()),
             Some("claude-opus-4-7".into()),
         )
+    }
+
+    #[test]
+    fn background_events_round_trip_through_serde() {
+        let at = chrono::Utc::now();
+        for event in [
+            Event::BackgroundItemStarted {
+                kind: BackgroundKind::Monitor,
+                id: "blrdo677j".into(),
+                tool_call_id: Some("toolu_1".into()),
+                label: Some("adam run".into()),
+                started_at: at,
+                expires_at: None,
+            },
+            Event::BackgroundItemEnded {
+                id: "blrdo677j".into(),
+                reason: BackgroundEndReason::Lost,
+                cause: Some(BackgroundLossCause::NewBuild),
+                at,
+            },
+            Event::BackgroundLossNoted { up_to: at },
+        ] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        }
+        let json = serde_json::to_string(&Event::BackgroundItemEnded {
+            id: "x".into(),
+            reason: BackgroundEndReason::TimedOut,
+            cause: None,
+            at,
+        })
+        .unwrap();
+        assert!(
+            json.contains("\"timed_out\"") && !json.contains("cause"),
+            "{json}"
+        );
     }
 
     fn applied(events: impl IntoIterator<Item = Event>) -> AcpState {

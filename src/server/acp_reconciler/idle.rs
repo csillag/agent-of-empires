@@ -1,5 +1,6 @@
 //! Idle auto-stop (#1689) and repair of turns that ended with no terminal event (#3190).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -96,6 +97,16 @@ pub(super) async fn repair_missing_terminal(state: &Arc<AppState>) {
             );
         }
     }
+}
+
+/// How long background work alone may keep an agent awake without events.
+const BACKGROUND_KEEPALIVE_CAP_MS: i64 = 86_400_000;
+
+/// A live background item keeps the worker up until the session has been
+/// silent for the cap. Past that, the idle stop loses the items as `IdleCap`.
+fn background_holds(has_live: bool, last_event_ms: Option<i64>, now_ms: i64) -> bool {
+    has_live
+        && last_event_ms.is_none_or(|ms| now_ms.saturating_sub(ms) < BACKGROUND_KEEPALIVE_CAP_MS)
 }
 
 /// A worker is auto-stopped only when enabled, not mid-turn, and both its last
@@ -199,6 +210,25 @@ pub(super) async fn reap_idle_workers(state: &Arc<AppState>) {
             return;
         }
     };
+    // A live background item is the agent's signal that it expects to be
+    // woken by that work, not by a user turn. Past the cap the idle stop
+    // reaps it anyway and the item is lost as `IdleCap`.
+    let with_live: HashSet<String> = {
+        let store = Arc::clone(&state.acp_event_store);
+        let ids: Vec<String> = live.iter().map(|(id, _, _)| id.clone()).collect();
+        tokio::task::spawn_blocking(move || {
+            let now = chrono::Utc::now();
+            ids.into_iter()
+                .filter(|id| store.background_items(id, now).iter().any(|item| item.is_live()))
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let held_at = chrono::Utc::now().timestamp_millis();
+    live.retain(|(id, _, _)| {
+        !background_holds(with_live.contains(id), latest.get(id).copied(), held_at)
+    });
     let now_ms = chrono::Utc::now().timestamp_millis();
     for (id, profile, idle_secs) in live {
         // Pre-check before the registry read. `None` is deliberate: worker age
@@ -286,6 +316,15 @@ mod tests {
     use crate::acp::state::{SessionUsage, ToolCall, UsageCost};
     use crate::acp::Event;
     use chrono::Utc;
+
+    #[test]
+    fn background_holds_an_agent_awake_up_to_the_cap() {
+        const H: i64 = 3_600_000;
+        assert!(background_holds(true, Some(0), 2 * H));
+        assert!(!background_holds(true, Some(0), 24 * H));
+        assert!(!background_holds(false, Some(0), 2 * H));
+        assert!(background_holds(true, None, 2 * H));
+    }
 
     #[test]
     fn should_auto_stop_policy() {

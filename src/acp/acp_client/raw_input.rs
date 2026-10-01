@@ -1,7 +1,8 @@
-//! Events synthesized from a tool call's raw input: wakeups, monitors, and
-//! background agent launches.
+//! Events synthesized from a tool call's raw input: wakeups and background
+//! agent launches.
 
-use crate::acp::state::Event;
+use crate::acp::state::{BackgroundEndReason, BackgroundKind, Event};
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 
 /// Reads `delaySeconds` (a number, or a numeric string) into an absolute wake
@@ -58,24 +59,74 @@ pub(super) fn wakeup_event_from_raw(raw_input: &serde_json::Value) -> Option<Eve
     Some(Event::WakeupScheduled { at, reason })
 }
 
-/// `None` for a frame carrying neither `description` nor `command`:
-/// claude-agent-acp sends the initial `tool_call` with empty args, and that
-/// must not arm the badge.
-pub(super) fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
-    let description = raw_input
-        .get("description")
+/// Background work from claude-agent-acp's PostToolUse hook frame: a started
+/// Monitor, backgrounded Bash, or async Workflow, or a TaskStop / finished
+/// TaskOutput.
+pub(super) fn background_item_event_from_hook(
+    payload: &serde_json::Value,
+    now: DateTime<Utc>,
+) -> Option<Event> {
+    let claude = payload.get("_meta")?.get("claudeCode")?;
+    let resp = claude.get("toolResponse")?;
+    let tool_call_id = payload
+        .get("toolCallId")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let has_command = raw_input.get("command").and_then(|v| v.as_str()).is_some();
-    if description.is_none() && !has_command {
-        return None;
+        .map(str::to_string);
+    let text =
+        |v: &serde_json::Value, k: &str| v.get(k).and_then(|s| s.as_str()).map(str::to_string);
+    let start = |kind, id: String, label: Option<String>, expires_at| {
+        Some(Event::BackgroundItemStarted {
+            kind,
+            id,
+            tool_call_id: tool_call_id.clone(),
+            label,
+            started_at: now,
+            expires_at,
+        })
+    };
+    match claude.get("toolName")?.as_str()? {
+        "Monitor" => {
+            let id = text(resp, "taskId")?;
+            let persistent = resp
+                .get("persistent")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let timeout_ms = resp.get("timeoutMs").and_then(|v| v.as_i64()).unwrap_or(0);
+            let expires = (!persistent && timeout_ms > 0)
+                .then(|| now + chrono::Duration::milliseconds(timeout_ms));
+            start(BackgroundKind::Monitor, id, None, expires)
+        }
+        "Bash" => start(
+            BackgroundKind::Shell,
+            text(resp, "backgroundTaskId")?,
+            None,
+            None,
+        ),
+        "Workflow" if resp.get("status").and_then(|v| v.as_str()) == Some("async_launched") => {
+            let label = text(resp, "summary").or_else(|| text(resp, "workflowName"));
+            start(BackgroundKind::Workflow, text(resp, "taskId")?, label, None)
+        }
+        "TaskStop" => Some(Event::BackgroundItemEnded {
+            id: text(resp, "task_id")?,
+            reason: BackgroundEndReason::Stopped,
+            cause: None,
+            at: now,
+        }),
+        "TaskOutput" => {
+            let task = resp.get("task")?;
+            let status = task.get("status")?.as_str()?;
+            if matches!(status, "running" | "pending") {
+                return None;
+            }
+            Some(Event::BackgroundItemEnded {
+                id: text(task, "task_id")?,
+                reason: BackgroundEndReason::Finished,
+                cause: None,
+                at: now,
+            })
+        }
+        _ => None,
     }
-    info!(
-        target: "acp.protocol.wakeup",
-        description = ?description,
-        "emitting MonitorArmed from Monitor tool args"
-    );
-    Some(Event::MonitorArmed { description })
 }
 
 /// A Claude async sub-agent launch, arriving as `_meta.claudeCode` with

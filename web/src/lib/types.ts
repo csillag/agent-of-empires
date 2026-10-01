@@ -89,13 +89,36 @@ export interface SessionResponse {
   /** When the agent's pending `ScheduleWakeup` fires. */
   next_wakeup_at?: string;
   next_wakeup_reason?: string;
-  monitor_active?: boolean;
-  monitor_description?: string;
+  /** Background work. Absent when there is none to show. */
+  background?: BackgroundSummary;
   /** One-line explanation when a lifecycle action took a non-default path,
    *  e.g. a start that fell back to a fresh conversation because the stored
    *  one could not be resumed. Present only on the start/ensure responses
    *  that carry it; absent on regular session fetches. */
   message?: string;
+}
+
+export type BackgroundKind = "monitor" | "shell" | "wakeup" | "subagent" | "workflow";
+
+export interface BackgroundEnd {
+  reason: "stopped" | "timed_out" | "finished" | "fired" | "lost";
+  cause?: "new_build" | "respawn" | "wedge_kill" | "user_stop" | "idle_cap";
+  at: string;
+}
+
+export interface BackgroundItem {
+  kind: BackgroundKind;
+  id: string;
+  label?: string;
+  started_at: string;
+  expires_at?: string;
+  ended?: BackgroundEnd;
+}
+
+export interface BackgroundSummary {
+  live: number;
+  lost_since?: string;
+  items: BackgroundItem[];
 }
 
 export interface PlanSummary {

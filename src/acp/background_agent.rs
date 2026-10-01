@@ -60,7 +60,7 @@ impl TranscriptSource {
     }
 
     /// Read the bytes appended since `offset` (0-based).
-    async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
+    pub(crate) async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
         match self {
             TranscriptSource::Host => {
                 let Ok(mut file) = tokio::fs::File::open(path).await else {

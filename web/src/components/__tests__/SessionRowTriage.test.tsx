@@ -35,8 +35,13 @@ describe("SessionRow chips", () => {
     ["smart_rename running", { view: "structured", smart_rename: "running" }, ["Naming"], ["Will auto-name"]],
     ["smart_rename inactive", { view: "structured", smart_rename: "inactive" }, [], ["Naming", "Will auto-name"]],
     ["worker stopping", { view: "structured", acp_worker_state: "stopping" }, ["Stopping"], []],
-    ["armed monitor", { monitor_active: true, monitor_description: "clippy passes" }, ["Monitoring clippy passes"], []],
-    ["no monitor", {}, [], [/^Monitoring/]],
+    [
+      "live background",
+      { background: { live: 2, items: [{ kind: "monitor", id: "m", started_at: PAST }] } },
+      ["Background: 2 live"],
+      [],
+    ],
+    ["no background", {}, [], [/^Background:/]],
   ] as [string, Partial<SessionResponse>, (string | RegExp)[], (string | RegExp)[]][])(
     "%s",
     (_name, over, present, absent) => {

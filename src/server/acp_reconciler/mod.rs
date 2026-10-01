@@ -235,6 +235,9 @@ pub async fn reconcile_acp_workers(
     // entries would block legitimate spawns.
     sweep_orphan_workers(state, &live).await;
     readopt_orphan_runners(state, attempted).await;
+    // Queue a wake note for background work a worker restart just lost,
+    // before this tick's queue drain delivers it.
+    note_background_losses(state).await;
     drain_pending_initial_turns(state).await;
     drain_queued_prompts(state).await;
 
@@ -362,6 +365,49 @@ pub async fn reconcile_acp_workers(
             Err(e) => {
                 tracing::error!(target: "acp.supervisor", "resume task panicked: {e}");
             }
+        }
+    }
+}
+
+/// Tell an agent which background items it lost with its worker, once per
+/// loss. The note goes through the prompt queue, so it waits behind a
+/// running turn and wakes nothing that is dormant by choice.
+async fn note_background_losses(state: &Arc<AppState>) {
+    let ids: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_structured() && !i.is_archived() && !i.is_trashed())
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in ids {
+        let store = Arc::clone(&state.acp_event_store);
+        let probe = id.clone();
+        let lost = tokio::task::spawn_blocking(move || store.unnoted_background_losses(&probe))
+            .await
+            .unwrap_or_default();
+        let Some(up_to) = lost
+            .iter()
+            .filter_map(|item| item.ended.as_ref().map(|end| end.at))
+            .max()
+        else {
+            continue;
+        };
+        let text = crate::acp::background::loss_note(&lost);
+        let queued = state
+            .session_service
+            .enqueue_prompt(
+                &id,
+                uuid::Uuid::new_v4().to_string(),
+                text,
+                Vec::new(),
+                None,
+                chrono::Utc::now().to_rfc3339(),
+            )
+            .await;
+        if queued.is_some() {
+            state.acp_supervisor.note_background_losses(&id, up_to);
         }
     }
 }

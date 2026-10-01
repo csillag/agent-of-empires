@@ -235,6 +235,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_runner_version = worker_registry::RUNNER_VERSION,
                     "replacing incompatible structured view runner"
                 );
+                state
+                    .acp_supervisor
+                    .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
                 worker_registry::terminate_and_wait(&id).await;
             }
             AdoptDecision::RespawnStaleIdle => {
@@ -245,6 +248,9 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     new_build = crate::build_info::BUILD_VERSION,
                     "respawning idle build-stale structured view worker on current binary"
                 );
+                state
+                    .acp_supervisor
+                    .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
                 worker_registry::terminate_and_wait(&id).await;
             }
             // A dead record can still hold a live pid whose socket vanished.
@@ -510,6 +516,9 @@ pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
         if let Some(generation) = generation {
             worker_registry::mark_restart_pending(&id, generation);
         }
+        state
+            .acp_supervisor
+            .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
         worker_registry::terminate_and_wait(&id).await;
         state.acp_supervisor.clear_respawn_pending(&id);
     }

@@ -116,6 +116,29 @@ impl<S: BroadcastSink> Drain<S> {
                 agent_unresponsive = end.agent_unresponsive,
                 "drain channel closed (agent connection task ended); evaluating respawn"
             );
+            // Detach and replacement remove this lease's handle first; neither
+            // loses the agent's work.
+            let still_ours = self
+                .workers
+                .lock()
+                .await
+                .get(&self.session_id)
+                .is_some_and(|handle| handle.lease.epoch() == lease.epoch());
+            if still_ours {
+                let cause = if end.agent_unresponsive {
+                    crate::acp::state::BackgroundLossCause::WedgeKill
+                } else if matches!(worker_registry::load(&self.session_id), Ok(None)) {
+                    crate::acp::state::BackgroundLossCause::UserStop
+                } else {
+                    crate::acp::state::BackgroundLossCause::Respawn
+                };
+                super::publish::mark_background_lost_via(
+                    &*self.sink,
+                    &self.next_seqs,
+                    &self.session_id,
+                    cause,
+                );
+            }
             if end.agent_unresponsive {
                 // The runner deletes its own registry record as it exits, and a
                 // missing record reads as `aoe acp stop`. Mark this generation

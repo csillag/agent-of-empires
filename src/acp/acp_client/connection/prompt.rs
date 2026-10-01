@@ -472,6 +472,14 @@ impl Session {
 
     async fn on_orphan_check(&mut self, turn: &mut Turn) -> Flow {
         let label = self.shared.session_label.clone();
+        let sub_agents_running = !self
+            .shared
+            .between_prompt
+            .bg_agents
+            .lock()
+            .is_ok_and(|agents| agents.is_empty());
+        turn.watchdog
+            .release_async_agent_floor(sub_agents_running);
         let fire = turn.watchdog.should_fire(Instant::now(), turn.cfg);
         let off_protocol = turn.watchdog.off_protocol_work_seen();
         if fire && turn.watchdog.cost_seen() && off_protocol.is_none() {

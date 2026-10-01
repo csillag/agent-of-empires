@@ -230,10 +230,9 @@ pub struct SessionResponse {
     pub next_wakeup_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_wakeup_reason: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub monitor_active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub monitor_description: Option<String>,
+    /// Background work of an acp session. Absent when there is none to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<crate::acp::background::BackgroundSummary>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

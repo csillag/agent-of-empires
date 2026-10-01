@@ -228,6 +228,17 @@ impl SilentOrphanWatchdog {
     pub(super) fn saw_progress(&self) -> bool {
         self.saw_first_progress
     }
+
+    /// Clears the async-agent floor once every tracked sub-agent has ended
+    /// and the turn's end-of-turn cost has been reported.
+    pub(super) fn release_async_agent_floor(&mut self, sub_agents_running: bool) {
+        if self.cost_seen
+            && !sub_agents_running
+            && self.off_protocol_work_seen == Some(OffProtocolWorkKind::AsyncAgent)
+        {
+            self.off_protocol_work_seen = None;
+        }
+    }
 }
 
 /// Terminal `Stopped` reason for a prompt turn, highest precedence first.
@@ -788,6 +799,23 @@ mod tests {
         for ([rl, fs, po, au, sd, pc, fin], want) in cases {
             assert_eq!(terminal_stop_reason(rl, fs, po, au, sd, pc, fin), want);
         }
+    }
+
+    #[tokio::test]
+    async fn release_async_agent_floor_gates_on_cost_and_live_sub_agents() {
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let arm = |running: bool| {
+            let mut w = SilentOrphanWatchdog::new();
+            w.apply_signal(L::Progress, t0, wall, CFG);
+            w.apply_signal(start("tc", false), t0, wall, CFG);
+            w.apply_signal(done("tc", true, Some(K::AsyncAgent)), t0, wall, CFG);
+            w.apply_signal(L::TerminalUsage, t0, wall, CFG);
+            w.release_async_agent_floor(running);
+            w
+        };
+        assert!(arm(false).should_fire(t0 + CFG.fast_grace + Duration::from_secs(1), CFG));
+        assert!(!arm(true).should_fire(t0 + CFG.fast_grace + Duration::from_secs(1), CFG));
     }
 
     #[test]

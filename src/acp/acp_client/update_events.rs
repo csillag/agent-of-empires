@@ -14,7 +14,7 @@ use super::config_options::map_acp_config_option;
 use super::lifecycle::{detect_off_protocol_work_completed, OffProtocolWorkKind};
 use super::plan::{extract_plan_from_switch_mode, map_plan_status, plan_status_to_str};
 use super::raw_input::{
-    background_agent_launched_from_value, monitor_event_from_raw, wakeup_event_from_raw,
+    background_agent_launched_from_value, background_item_event_from_hook, wakeup_event_from_raw,
 };
 use super::tool_output::{
     extract_diffs_from_content, extract_memory_recall, extract_tool_content_text,
@@ -121,7 +121,6 @@ fn wake_tool_event(
     }
     match title? {
         "ScheduleWakeup" => wakeup_event_from_raw(raw),
-        "Monitor" => monitor_event_from_raw(raw),
         _ => None,
     }
 }
@@ -310,8 +309,16 @@ pub(super) fn map_update_to_events(
                     content: content_text,
                 });
             } else if events.is_empty() {
-                // A metadata-only update may be an async sub-agent launch.
+                // A metadata-only update may be an async sub-agent launch or,
+                // for Claude, a PostToolUse hook frame for a background item.
                 let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                if profile.supports_wakeup_tools {
+                    if let Some(event) =
+                        background_item_event_from_hook(&payload, chrono::Utc::now())
+                    {
+                        events.push(event);
+                    }
+                }
                 match background_agent_launched_from_value(&payload) {
                     Some(event) => events.push(event),
                     None => events.push(Event::RawAgentUpdate { payload }),
@@ -897,20 +904,17 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Event::WakeupScheduled { .. })));
 
-        let events = update(
+        // Title-and-args Monitor frames no longer arm a badge. The registry
+        // starts from the PostToolUse hook, which carries the task id.
+        assert!(!update(
             "Monitor",
             Some(serde_json::json!({
                 "command": "until cargo clippy; do sleep 5; done",
                 "description": "clippy passes",
             })),
-        );
-        assert!(events.iter().any(|e| matches!(
-            e,
-            Event::MonitorArmed { description } if description.as_deref() == Some("clippy passes")
-        )));
-        assert!(!update("Monitor", Some(serde_json::json!({})))
-            .iter()
-            .any(|e| matches!(e, Event::MonitorArmed { .. })));
+        )
+        .iter()
+        .any(|e| matches!(e, Event::MonitorArmed { .. } | Event::BackgroundItemStarted { .. })));
     }
 
     #[test]

@@ -103,6 +103,8 @@ impl<S: BroadcastSink> Supervisor<S> {
             stored_id = ?config.stored_acp_session_id,
             "spawning structured view worker"
         );
+        // Anything still live belonged to a worker that is gone.
+        self.mark_background_lost(session_id, crate::acp::state::BackgroundLossCause::Respawn);
         // Clear a partial replay from a failed import before session/load re-emits it.
         if config.seed_history_replay {
             self.sink.clear_session_events(session_id);

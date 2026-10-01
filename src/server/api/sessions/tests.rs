@@ -1443,6 +1443,55 @@ fn apply_diff_base_override_writes_only_the_named_repo() {
 }
 
 #[test]
+fn session_response_surfaces_base_branch_when_set() {
+    let mut inst = make_test_instance();
+    inst.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "feature/test".to_string(),
+        main_repo_path: "/tmp/repo".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: Some("release-1.2".to_string()),
+    });
+    let resp = SessionResponse::from_instance(&inst, false);
+    assert_eq!(resp.base_branch.as_deref(), Some("release-1.2"));
+
+    // Field is omitted from the wire JSON when None so old clients
+    // don't see a flood of nulls.
+    inst.worktree_info.as_mut().unwrap().base_branch = None;
+    let json = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    assert!(
+        json.get("base_branch").is_none(),
+        "base_branch should be omitted when None, got: {json}"
+    );
+}
+
+#[test]
+fn session_response_carries_the_background_summary() {
+    let inst = make_test_instance();
+    let item = crate::acp::state::BackgroundItem {
+        kind: crate::acp::state::BackgroundKind::Monitor,
+        id: "m1".into(),
+        label: Some("watch".into()),
+        started_at: chrono::Utc::now(),
+        expires_at: None,
+        ended: None,
+    };
+    let summary = crate::acp::background::BackgroundSummary::from_items(vec![item]).unwrap();
+
+    let mut resp = SessionResponse::from_instance(&inst, false);
+    resp.background = Some(summary);
+    let json = serde_json::to_value(&resp).unwrap();
+    assert_eq!(json["background"]["live"], 1);
+    assert_eq!(json["background"]["items"][0]["kind"], "monitor");
+    assert!(json["background"].get("lost_since").is_none());
+    assert!(json.get("monitor_active").is_none());
+    assert!(json.get("monitor_description").is_none());
+
+    let no_background = serde_json::to_value(SessionResponse::from_instance(&inst, false)).unwrap();
+    assert!(no_background.get("background").is_none());
+}
+
+#[test]
 fn session_response_serializes_to_json() {
     let json =
         serde_json::to_value(SessionResponse::from_instance(&make_test_instance(), false)).unwrap();
