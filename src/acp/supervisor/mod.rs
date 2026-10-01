@@ -409,6 +409,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         lock_recover(&self.lifecycle).is_owned(session_id)
     }
 
+    /// Wall-clock ms of the last notification a live worker received, or
+    /// `None` without a worker or before its first notification.
+    pub async fn last_notification_ms(&self, session_id: &str) -> Option<i64> {
+        self.workers
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|handle| handle.client.last_notification_ms())
+    }
+
     pub async fn count(&self) -> usize {
         self.workers.lock().await.len()
     }

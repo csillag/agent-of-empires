@@ -125,6 +125,7 @@ async fn cancel_under_flood() {
         default_model: None,
         mcp_servers: Vec::new(),
         runner: None,
+        last_notification_at: Arc::new(AtomicI64::new(0)),
     };
     let connection =
         tokio::spawn(SELECT_PROBE.scope(probe, run_connection_task(transport, params)));

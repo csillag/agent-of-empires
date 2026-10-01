@@ -25,7 +25,7 @@ use agent_client_protocol::schema::v1::{
     WriteTextFileRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -82,6 +82,10 @@ pub(super) struct ConnectionParams {
     pub(super) default_model: Option<String>,
     pub(super) mcp_servers: Vec<McpServer>,
     pub(super) runner: Option<RunnerLink>,
+    /// Epoch-ms of the last notification past the session fence. 0 = none yet.
+    /// Shared with `AcpClient` so the idle reaper can see activity the event
+    /// store drops as history replay.
+    pub(super) last_notification_at: Arc<AtomicI64>,
 }
 
 /// Handlers compute an answer without knowing whether the request arrived over
@@ -148,6 +152,7 @@ pub(super) async fn run_connection_task<W, R>(
         default_model,
         mcp_servers,
         runner,
+        last_notification_at,
     } = params;
     let label = resources.label.clone();
     let (lifecycle_tx, lifecycle_rx) = mpsc::channel(128);
@@ -185,6 +190,7 @@ pub(super) async fn run_connection_task<W, R>(
         prompt_in_flight,
         resources.sandbox.as_ref(),
         ingress.clone(),
+        last_notification_at,
     ));
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
 
