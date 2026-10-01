@@ -3,9 +3,10 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { loadScrollState, restoredScrollTop, saveScrollState } from "../../lib/acpScrollState";
-import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
+import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
 import { promptRepinDecision } from "../../lib/promptRepin";
 import { repinOnResize } from "../../lib/repinOnResize";
+import { nextStick } from "../../lib/stickToBottom";
 
 /** Stick-to-bottom, earlier-history auto-load, and PWA-reopen scroll restore
  *  for the transcript viewport. These observers own bottom-following; the
@@ -37,6 +38,9 @@ export function useTranscriptScroll({
   // Sampled on scroll: by the time a ResizeObserver fires, layout has already
   // settled, so pinned-ness must be read before the resize.
   const wasAtBottomRef = useRef<boolean>(true);
+  // Last scrollTop a scroll event saw or a repin wrote. A stale scroll event
+  // after content grows is not an upward move, so it must not un-stick.
+  const lastScrollTopRef = useRef(0);
   // Last time we sampled at the bottom. iOS fires an interim scroll during a
   // keyboard resize that clears `wasAtBottomRef` but cannot clear this.
   const lastAtBottomAtRef = useRef(0);
@@ -53,7 +57,15 @@ export function useTranscriptScroll({
     wasAtBottomRef.current = true;
     lastAtBottomAtRef.current = performance.now();
     setAtBottom(true);
-    vp.scrollTo({ top: vp.scrollHeight, behavior });
+    // Smooth animation reports its own scroll events. An instant write does
+    // not, so record the scrollTop it lands on or the next event looks like
+    // the reader moved up.
+    if (behavior === "smooth") {
+      vp.scrollTo({ top: vp.scrollHeight, behavior });
+    } else {
+      vp.scrollTop = vp.scrollHeight;
+      lastScrollTopRef.current = vp.scrollTop;
+    }
   }, []);
   const scrollToBottom = useCallback(() => pinToBottom("smooth"), [pinToBottom]);
 
@@ -133,21 +145,30 @@ export function useTranscriptScroll({
       gestureActive = true;
       scheduleGestureClear();
     };
-    const sample = (force = false) => {
-      if (force || !isCoarse || gestureActive) {
-        const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
-        const prevStuck = wasAtBottomRef.current;
-        wasAtBottomRef.current = pinned;
-        if (pinned) lastAtBottomAtRef.current = performance.now();
-        setAtBottom((prev) => (prev === pinned ? prev : pinned));
-        // Gated on the restore having run: the forced mount sample reads a tall
-        // transcript at scrollTop 0 as unpinned and would clobber the saved intent.
-        if (pinned !== prevStuck && didRestoreScrollRef.current) {
-          saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
-        }
-        // Momentum scrolling fires with no fresh touchmove; keep the gesture alive.
-        if (gestureActive) scheduleGestureClear();
+    const writeScrollTop = (top: number) => {
+      vp.scrollTop = top;
+      lastScrollTopRef.current = vp.scrollTop;
+    };
+    const sample = () => {
+      // Coarse pointers only re-sample during a gesture. A repin's scroll
+      // event otherwise arrives after content grew and would look unpinned.
+      const userMayScroll = !isCoarse || gestureActive;
+      const prevStuck = wasAtBottomRef.current;
+      const next = nextStick(
+        { stuck: prevStuck, lastTop: lastScrollTopRef.current },
+        { scrollTop: vp.scrollTop, clientHeight: vp.clientHeight, scrollHeight: vp.scrollHeight },
+        userMayScroll,
+      );
+      lastScrollTopRef.current = next.lastTop;
+      wasAtBottomRef.current = next.stuck;
+      if (next.stuck) lastAtBottomAtRef.current = performance.now();
+      setAtBottom((prev) => (prev === next.stuck ? prev : next.stuck));
+      // Gated on the restore having run: the mount sample must not clobber
+      // the saved intent.
+      if (next.stuck !== prevStuck && didRestoreScrollRef.current) {
+        saveScrollState(sessionId, { stuck: next.stuck, top: vp.scrollTop });
       }
+      if (gestureActive) scheduleGestureClear();
       const decision = autoLoadDecision({
         scrollTop: vp.scrollTop,
         clientHeight: vp.clientHeight,
@@ -161,7 +182,7 @@ export function useTranscriptScroll({
       if (decision.fire) requestEarlierHistory();
     };
     const onScroll = () => sample();
-    sample(true);
+    sample();
     vp.addEventListener("scroll", onScroll, { passive: true });
     vp.addEventListener("wheel", markGesture, { passive: true });
     vp.addEventListener("touchmove", markGesture, { passive: true });
@@ -169,7 +190,7 @@ export function useTranscriptScroll({
     // soft keyboard animation in lockstep.
     const vv = typeof window !== "undefined" ? window.visualViewport : null;
     const onVvResize = () => {
-      if (wasAtBottomRef.current) vp.scrollTop = vp.scrollHeight;
+      if (wasAtBottomRef.current) writeScrollTop(vp.scrollHeight);
     };
     vv?.addEventListener("resize", onVvResize);
 
@@ -184,7 +205,7 @@ export function useTranscriptScroll({
       // current stick intent so an intervening user scroll wins.
       const applyStart = () => {
         const top = restoredScrollTop(saved, wasAtBottomRef.current, vp.scrollHeight, vp.clientHeight);
-        if (top != null) vp.scrollTop = top;
+        if (top != null) writeScrollTop(top);
       };
       applyStart();
       requestAnimationFrame(() => requestAnimationFrame(applyStart));
@@ -203,7 +224,7 @@ export function useTranscriptScroll({
     // header collapse) can resize it.
     const wasAtBottom = () => wasAtBottomRef.current;
     const repin = () => {
-      vp.scrollTop = vp.scrollHeight;
+      writeScrollTop(vp.scrollHeight);
     };
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
@@ -213,12 +234,12 @@ export function useTranscriptScroll({
       const anchor = pendingScrollAnchorRef.current;
       if (anchor != null) {
         const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
-        if (delta > 0) vp.scrollTop += delta;
+        if (delta > 0) writeScrollTop(vp.scrollTop + delta);
         pendingScrollAnchorRef.current = null;
         return;
       }
       if (wasAtBottomRef.current) {
-        vp.scrollTop = vp.scrollHeight;
+        writeScrollTop(vp.scrollHeight);
       }
     });
     if (content) contentRo.observe(content);
@@ -254,6 +275,7 @@ export function useTranscriptScroll({
     const start = performance.now();
     const pin = () => {
       vp.scrollTop = vp.scrollHeight;
+      lastScrollTopRef.current = vp.scrollTop;
       if (performance.now() - start < 500) raf = requestAnimationFrame(pin);
     };
     raf = requestAnimationFrame(pin);
