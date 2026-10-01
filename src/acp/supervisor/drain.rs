@@ -16,8 +16,8 @@ use super::launch::{
 };
 use super::teardown::{settle_lease, tear_down_replacement, tear_down_runner, wait_for_exit};
 use super::{
-    lock_recover, next_seq, BroadcastSink, Launcher, PendingContextReset, ResumeReservation,
-    SeqMap, SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
+    lock_recover, BroadcastSink, Launcher, PendingContextReset, ResumeReservation, SessionPublisher,
+    SharedSet, Supervisor, WorkerKind, Workers, MAX_RESPAWNS_IN_WINDOW, RESPAWN_BACKOFF,
     RESTART_WINDOW,
 };
 use crate::acp::acp_client::{AcpError, SpawnConfig};
@@ -39,7 +39,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             session_id,
             sink: Arc::clone(&self.sink),
             workers: Arc::clone(&self.workers),
-            next_seqs: Arc::clone(&self.next_seqs),
+            publisher: Arc::clone(&self.publisher),
             incompatible_binaries: Arc::clone(&self.incompatible_binaries),
             lifecycle: Arc::clone(&self.lifecycle),
             process_control: Arc::clone(&self.process_control),
@@ -62,7 +62,7 @@ struct Drain<S> {
     session_id: String,
     sink: Arc<S>,
     workers: Workers,
-    next_seqs: Arc<SeqMap>,
+    publisher: Arc<SessionPublisher<S>>,
     incompatible_binaries: Arc<std::sync::Mutex<HashMap<String, String>>>,
     lifecycle: Arc<std::sync::Mutex<LifecycleTable>>,
     process_control: Arc<dyn ProcessControl>,
@@ -103,8 +103,7 @@ enum RestartDecision {
 
 impl<S: BroadcastSink> Drain<S> {
     fn publish(&self, event: Event) {
-        let seq = next_seq(&self.next_seqs, &self.session_id);
-        self.sink.publish(&self.session_id, seq, &event);
+        self.publisher.publish(&self.session_id, &event);
     }
 
     async fn run(mut self, mut lease: Lease, mut inbound: mpsc::Receiver<Event>) {
@@ -195,9 +194,8 @@ impl<S: BroadcastSink> Drain<S> {
                 Event::AgentStartupError { .. } if !established => end.startup_failed = true,
                 Event::AcpSessionAssigned { acp_session_id } => {
                     if let Some(pending) = self.context_reset.take() {
-                        self.sink.publish_from_worker(
+                        self.publisher.publish_from_worker(
                             &self.session_id,
-                            next_seq(&self.next_seqs, &self.session_id),
                             &Event::SessionContextReset {
                                 reason: pending.reason,
                             },
@@ -222,9 +220,8 @@ impl<S: BroadcastSink> Drain<S> {
                         };
                         if let Some(error) = failure {
                             end.startup_failed = true;
-                            self.sink.publish_from_worker(
+                            self.publisher.publish_from_worker(
                                 &self.session_id,
-                                next_seq(&self.next_seqs, &self.session_id),
                                 &Event::AgentStartupError {
                                     message: format!(
                                         "Could not commit the isolated native context: {error}"
@@ -288,10 +285,9 @@ impl<S: BroadcastSink> Drain<S> {
                 }
                 _ => {}
             }
-            let seq = next_seq(&self.next_seqs, &self.session_id);
             // Tagged so a frame queued by a replaced worker cannot mutate runtime state.
-            self.sink
-                .publish_from_worker(&self.session_id, seq, &event, generation);
+            self.publisher
+                .publish_from_worker(&self.session_id, &event, generation);
         }
         end
     }
@@ -322,8 +318,7 @@ impl<S: BroadcastSink> Drain<S> {
                 self.notify.notify_waiters();
             }
             super::publish::detach_orphaned_background_agents_on(
-                &*self.sink,
-                &self.next_seqs,
+                &self.publisher,
                 &self.session_id,
                 "the worker that was tracking this sub-agent stopped; tracking stopped",
             );
@@ -499,10 +494,9 @@ impl<S: BroadcastSink> Drain<S> {
         // no tailer is respawned on replay, so requests and background
         // sub-agents still unresolved in the log are orphaned by the crashed
         // worker this replaces.
-        super::publish::cancel_orphaned_requests_on(&*self.sink, &self.next_seqs, session_id);
+        super::publish::cancel_orphaned_requests_on(&self.publisher, session_id);
         super::publish::detach_orphaned_background_agents_on(
-            &*self.sink,
-            &self.next_seqs,
+            &self.publisher,
             session_id,
             super::publish::WORKER_REPLACED_DETACH_WARNING,
         );
