@@ -98,6 +98,10 @@ const INHERITED_BY_CONTRACT = new Set([
   // value is overwritten at spawn and cannot steer the daemon.
   "AOE_SESSION_DIRS_READ_ONLY",
   "AOE_SESSION_DIRS_READ_WRITE",
+  // Set on a sandbox container (`src/session/sandbox_bind.rs`) so a host
+  // wrapper can skip the agent's own sandbox flag. The daemon writes it and
+  // never reads it.
+  "AOE_CONTAINER_SANDBOX",
   // A marker `aoe` echoes into a pane to probe a login shell, not a variable
   // the daemon resolves anything from.
   "AOE_AGENT_OK",
