@@ -35,6 +35,7 @@ use super::commands::{ClientCmd, ConnectMode};
 use super::control::DaemonControlClient;
 use super::errors::{acp_internal_error, AcpError};
 use super::fs_handlers::{handle_read_text_file, handle_write_text_file};
+use super::grok_ask::{handle_grok_ask_request, GrokAskUserQuestionRequest};
 use super::lifecycle::TerminalClaim;
 use super::pending::PendingResponders;
 use super::permission_handlers::{handle_elicitation_request, handle_permission_request};
@@ -296,6 +297,31 @@ pub(super) async fn run_connection_task<W, R>(
                         };
                         let outcome = handle_elicitation_request(request, event_tx, pending).await;
                         reply(responder, outcome)
+                    }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let event_tx = event_tx.clone();
+                let ingress = ingress.clone();
+                let pending = pending_responders.clone();
+                move |request: GrokAskUserQuestionRequest,
+                      responder: Responder<serde_json::Value>,
+                      _conn| {
+                    let (event_tx, pending, ingress) =
+                        (event_tx.clone(), pending.clone(), ingress.clone());
+                    async move {
+                        let session_id = SessionId::from(request.session_id.clone());
+                        let _guard = match ingress.request(&session_id).await {
+                            Ok(guard) => guard,
+                            Err(error) => return reply(responder, Err(error)),
+                        };
+                        reply(
+                            responder,
+                            handle_grok_ask_request(request, event_tx, pending).await,
+                        )
                     }
                 }
             },
