@@ -64,6 +64,7 @@ function sameLayerProps(a: SessionResponse, b: SessionResponse): boolean {
     a.snoozed_until === b.snoozed_until &&
     a.trashed_at === b.trashed_at &&
     a.is_sandboxed === b.is_sandboxed &&
+    a.thought_display === b.thought_display &&
     a.project_path === b.project_path &&
     a.main_repo_path === b.main_repo_path &&
     a.artifact_dir === b.artifact_dir &&
@@ -115,6 +116,7 @@ const SessionLayer = memo(
             onOpenAgentsPane={onOpenAgentsPane}
             isSandboxed={session.is_sandboxed}
             background={session.background}
+            thoughtDisplay={session.thought_display}
           />
         </Suspense>
       </div>

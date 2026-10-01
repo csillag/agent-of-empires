@@ -14,7 +14,7 @@ import { useHistoryWindow } from "../../hooks/useHistoryWindow";
 import { clearDraft, getDraftAttachments, setDraftAttachments } from "../../lib/acpDrafts";
 import { isVisiblyBusy } from "../../lib/acpTypes";
 import type { AcpState, ApprovalDecision, ElicitationResolution, PromptAttachmentInput } from "../../lib/acpTypes";
-import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAgentProfile, useThoughtDisplay } from "../../lib/agentProfileContext";
 import { canOfferEarlier, earlierAction } from "../../lib/historyScroll";
 import { activityToThreadMessages, clearFoldGeneration } from "./activityMessages";
 import { useCancelEscalation } from "./useCancelEscalation";
@@ -123,6 +123,7 @@ export function AcpRuntime({
 }: Props) {
   const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil, active);
   const agentProfile = useAgentProfile();
+  const thoughtDisplay = useThoughtDisplay();
   const { pendingAttachments, setPendingAttachments, pendingAttachmentsRef } = usePendingAttachments(sessionId);
   const onCancel = useCancelEscalation(
     sessionId,
@@ -162,8 +163,9 @@ export function AcpRuntime({
         showClearedTurns,
         agentProfile.capabilities.todos,
         agentProfile,
+        thoughtDisplay,
       ),
-    [displayActivity, visiblyBusy, showClearedTurns, agentProfile],
+    [displayActivity, visiblyBusy, showClearedTurns, agentProfile, thoughtDisplay],
   );
   const foldGeneration = useMemo(
     () => clearFoldGeneration(displayActivity, showClearedTurns),

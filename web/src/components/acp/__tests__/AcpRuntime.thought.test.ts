@@ -84,3 +84,37 @@ describe("thinking updates", () => {
     expect(out).not.toContain("↳ update");
   });
 });
+
+// Agents in `[acp] reasoning_agents` (grok) stream raw reasoning on the
+// thought channel, not narration. It becomes one `reasoning` part per run,
+// which StructuredView renders collapsed, and never lands in message text.
+describe("raw reasoning (thought_display = reasoning)", () => {
+  function parts(rows: ActivityRow[]) {
+    return activityToThreadMessages(rows, false, false, true, undefined, "reasoning").flatMap((m) =>
+      Array.isArray(m.content) ? (m.content as { type: string; text?: string }[]) : [],
+    );
+  }
+
+  it("keeps a run of thought fragments as one reasoning part, lone spaces included", () => {
+    const out = parts([
+      row("t1", "thinking", "Now read-only survey of all"),
+      row("t2", "thinking", " "),
+      row("t3", "thinking", "8 nodes."),
+    ]);
+    const reasoning = out.filter((p) => p.type === "reasoning");
+    expect(reasoning).toEqual([{ type: "reasoning", text: "Now read-only survey of all 8 nodes." }]);
+    expect(out.some((p) => p.type === "text" && (p.text ?? "").includes("survey"))).toBe(false);
+  });
+
+  it("puts the reply after it in its own text part, without the update tag", () => {
+    const out = parts([row("t1", "thinking", "I should verify the command."), row("m1", "message", "SSH works.")]);
+    expect(out.map((p) => p.type)).toEqual(["reasoning", "text"]);
+    expect(out[1].text).toBe("SSH works.");
+    expect(out[1].text).not.toContain("↳ update");
+  });
+
+  it("starts a new reasoning part after the reply", () => {
+    const out = parts([row("t1", "thinking", "first"), row("m1", "message", "reply"), row("t2", "thinking", "second")]);
+    expect(out.map((p) => p.type)).toEqual(["reasoning", "text", "reasoning"]);
+  });
+});

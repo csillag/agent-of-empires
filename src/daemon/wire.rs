@@ -112,6 +112,24 @@ pub struct PendingApproval {
     pub choice: bool,
 }
 
+/// How a session's ACP thought chunks are shown (see
+/// `SessionResponse::thought_display`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThoughtDisplay {
+    /// Narration addressed to the user: shown as "update" message rows.
+    #[default]
+    Update,
+    /// Raw reasoning: shown as a collapsed thinking block.
+    Reasoning,
+}
+
+impl ThoughtDisplay {
+    pub fn is_update(&self) -> bool {
+        *self == Self::Update
+    }
+}
+
 /// Decoding requires only `id`; every other field defaults so an older daemon cannot break the list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResponse {
@@ -216,6 +234,11 @@ pub struct SessionResponse {
     pub keeps_context: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_aliases: Vec<String>,
+    /// How the web renders this session's thought chunks: `update` rows (a
+    /// narration channel) or a collapsed `reasoning` block (an agent listed
+    /// in `[acp] reasoning_agents`). The session list overlays it per profile.
+    #[serde(default, skip_serializing_if = "ThoughtDisplay::is_update")]
+    pub thought_display: ThoughtDisplay,
     #[serde(default)]
     pub claude_fullscreen: bool,
     #[serde(default)]

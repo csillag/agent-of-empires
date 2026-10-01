@@ -144,6 +144,7 @@ The list is applied at every worker start (spawn, respawn, reattach):
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Read from the global config only, so a profile cannot widen it; changing it from the web needs the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | Registry keys allowed while the restriction is on, e.g. `["claude", "codex"]`. Each alias counts separately, and an empty list denies every agent. A worker on a now-disallowed agent is terminated at its next respawn. |
 | `acp.local_io_agents` | `[]` | Agents not offered aoe's terminal and file capabilities, so they do their own shell and file I/O, e.g. `["grok"]`. Matched against the agent key and the tool name. Global only. Applies when a worker starts. |
+| `acp.reasoning_agents` | `[]` | Agents whose ACP thought channel carries raw reasoning rather than narration addressed to the user, e.g. `["grok"]`. The web dashboard shows their thinking as a collapsed "Thinking…" block per run instead of "↳ update" message rows. Matched against the session's agent key and its tool name. Claude's thought channel (`thinking.display: "updates"`) is narration and is not listed. |
 | `acp.rate_limit_auto_resume` | `false` | Respawn a worker parked on a provider rate limit once the reported reset passes. See [Rate-limit recovery](../structured-view/troubleshooting.md#rate-limits-and-agent-hand-off). |
 
 The rest of `[acp]` tunes the structured view globally; see [Structured View Internals](../development/internals/structured-view.md#global-tuning-acp).
