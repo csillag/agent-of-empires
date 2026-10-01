@@ -194,7 +194,10 @@ pub(super) async fn resume_one(state: Arc<AppState>, target: ResumeTarget) -> Re
                     Ok(Ok(())) => {
                         // Flagged only once attached: a failed attach respawns on the current binary.
                         if decision == AdoptDecision::AdoptStaleForDrain {
-                            state.acp_supervisor.mark_build_respawn_pending(&id);
+                            state.acp_supervisor.mark_build_respawn_pending(
+                                &id,
+                                chrono::Utc::now().timestamp_millis(),
+                            );
                         }
                         tracing::info!(
                             target: "acp.supervisor",
@@ -485,43 +488,71 @@ pub(crate) async fn trigger_resume_background(
     Ok(ResumeTrigger::Started)
 }
 
-/// Respawns adopted build-stale workers once their turn drains (#1754), like
-/// `aoe acp restart`: restart marker, then terminate the stale runner.
-pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) {
-    for id in state.acp_supervisor.respawn_pending_ids() {
-        // A failed probe counts as busy so a live turn is never killed.
-        let in_flight = query_store(
+/// Quiet time after the agent's last proof of idle before a drained worker
+/// is retired, so a follow-up turn already queued can show itself.
+const DRAIN_SETTLE_MS: i64 = 15_000;
+/// How long an unproven idle keeps the old binary.
+const DRAIN_DEFERRAL_CAP_MS: i64 = 30 * 60 * 1000;
+/// A live sub-agent holds a drained build-stale worker this long from the flag.
+const DRAIN_SUBAGENT_CAP_MS: i64 = 3 * 60 * 60 * 1000;
+
+struct DrainProbe {
+    turn_open: bool,
+    idle_since: Option<i64>,
+    /// A background sub-agent that has not completed.
+    holds_background: bool,
+}
+
+/// An open turn always waits. Otherwise the agent must have been quiet for
+/// `DRAIN_SETTLE_MS`, have proven itself idle, and hold no live sub-agent.
+/// Past `DRAIN_DEFERRAL_CAP_MS` an unproven idle no longer holds the worker.
+/// A live sub-agent holds it until `DRAIN_SUBAGENT_CAP_MS`.
+fn drain_ready(now_ms: i64, pending_since_ms: i64, probe: &DrainProbe) -> bool {
+    if probe.turn_open {
+        return false;
+    }
+    if probe
+        .idle_since
+        .is_some_and(|at| now_ms.saturating_sub(at) < DRAIN_SETTLE_MS)
+    {
+        return false;
+    }
+    if probe.holds_background {
+        return now_ms.saturating_sub(pending_since_ms) >= DRAIN_SUBAGENT_CAP_MS;
+    }
+    probe.idle_since.is_some() || now_ms.saturating_sub(pending_since_ms) >= DRAIN_DEFERRAL_CAP_MS
+}
+
+/// Retires adopted build-stale workers once `drain_ready` lets them go.
+pub(super) async fn respawn_drained_stale_workers(state: &Arc<AppState>) -> Vec<String> {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut retired = Vec::new();
+    for (id, pending_since_ms) in state.acp_supervisor.respawn_pending() {
+        let probe = query_store(
             &state.acp_event_store,
             &id,
-            "draining stale worker in-flight",
-            |s, id| s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id),
+            "draining stale worker",
+            |s, id| DrainProbe {
+                turn_open: s.has_in_flight_turn(id) || s.has_agent_turn_in_flight(id),
+                idle_since: s.agent_idle_since(id),
+                holds_background: !s.unresolved_background_agent_ids(id).is_empty(),
+            },
         )
         .await
-        .unwrap_or(true);
-        if in_flight {
+        .unwrap_or(DrainProbe {
+            turn_open: true,
+            idle_since: None,
+            holds_background: true,
+        });
+        if !drain_ready(now_ms, pending_since_ms, &probe) {
             continue;
         }
         tracing::info!(target: "acp.supervisor", session = %id, reason = "build_stale", "stale structured view worker drained; respawning");
-        let generation = state
-            .acp_supervisor
-            .running_identity(&id)
-            .map(|identity| identity.generation)
-            .or_else(|| {
-                worker_registry::load(&id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.generation)
-            });
-        // With nothing naming the runner, a marker written by the stop that removed the record stands.
-        if let Some(generation) = generation {
-            worker_registry::mark_restart_pending(&id, generation);
+        if state.acp_supervisor.retire_build_stale(&id).await {
+            retired.push(id);
         }
-        state
-            .acp_supervisor
-            .mark_background_lost(&id, crate::acp::state::BackgroundLossCause::NewBuild);
-        worker_registry::terminate_and_wait(&id).await;
-        state.acp_supervisor.clear_respawn_pending(&id);
     }
+    retired
 }
 
 #[cfg(test)]
@@ -644,7 +675,9 @@ mod tests {
             .test_install_attached("s-drain", identity)
             .await;
         for id in ["s-drain", "s-drain-gone"] {
-            state.acp_supervisor.mark_build_respawn_pending(id);
+            state
+                .acp_supervisor
+                .mark_build_respawn_pending(id, chrono::Utc::now().timestamp_millis());
             worker_registry::mark_restart_pending(id, 4);
         }
 

@@ -170,8 +170,10 @@ pub async fn reconcile_acp_workers(
     let supervisor = &state.acp_supervisor;
     supervisor.retry_pending_teardowns().await;
 
-    // Before the reaper, so this tick's reaper tears down the drained handle.
-    resume::respawn_drained_stale_workers(state).await;
+    // Retire drained build-stale workers and re-arm each so this tick respawns it.
+    for id in resume::respawn_drained_stale_workers(state).await {
+        forget_session_budget(&id, attempted, parked, respawn_history, capacity_deferred);
+    }
 
     // `aoe acp stop|kill|restart` runs out of process; the reaper surfaces it
     // and returns restart ids, which, like respawn requests (#2109), get a clean slate.

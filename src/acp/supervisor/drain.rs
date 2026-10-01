@@ -132,8 +132,7 @@ impl<S: BroadcastSink> Drain<S> {
                     crate::acp::state::BackgroundLossCause::Respawn
                 };
                 super::publish::mark_background_lost_via(
-                    &*self.sink,
-                    &self.next_seqs,
+                    &self.publisher,
                     &self.session_id,
                     cause,
                 );

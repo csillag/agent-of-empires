@@ -236,7 +236,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         cause: crate::acp::state::BackgroundLossCause,
     ) -> usize {
-        mark_background_lost_via(&*self.sink, &self.next_seqs, session_id, cause)
+        mark_background_lost_via(&self.publisher, session_id, cause)
     }
 
     /// Record that the agent was told about losses up to `up_to`.
@@ -332,70 +332,73 @@ pub(super) fn collect_resumable_background_agent_launches<S: BroadcastSink>(
 
 /// A session's worker is gone: end its live registry items as lost and
 /// detach its unresolved sub-agents.
-pub(super) fn mark_background_lost_via<S: BroadcastSink + ?Sized>(
-    sink: &S,
-    next_seqs: &SeqMap,
+pub(super) fn mark_background_lost_via<S: BroadcastSink>(
+    publisher: &SessionPublisher<S>,
     session_id: &str,
     cause: crate::acp::state::BackgroundLossCause,
 ) -> usize {
-    end_background_items_lost(sink, next_seqs, session_id, cause)
-        + detach_background_agents(sink, next_seqs, session_id, cause)
+    end_background_items_lost(publisher, session_id, cause)
+        + detach_background_agents(publisher, session_id, cause)
 }
 
 /// End the live items the registry tracks itself. Sub-agents are left to
-/// `BackgroundAgentCompleted`, so each item ends exactly once.
-pub(super) fn end_background_items_lost<S: BroadcastSink + ?Sized>(
-    sink: &S,
-    next_seqs: &SeqMap,
+/// `BackgroundAgentCompleted`, so each item ends exactly once. The read and
+/// the publishes share the session lock, so another publisher cannot land
+/// between them.
+pub(super) fn end_background_items_lost<S: BroadcastSink>(
+    publisher: &SessionPublisher<S>,
     session_id: &str,
     cause: crate::acp::state::BackgroundLossCause,
 ) -> usize {
     let at = chrono::Utc::now();
-    let mut ended = 0;
-    for item in sink.live_background_items(session_id) {
-        if item.kind == crate::acp::state::BackgroundKind::Subagent {
-            continue;
+    publisher.with_counter(session_id, |sink, last| {
+        let mut ended = 0;
+        for item in sink.live_background_items(session_id) {
+            if item.kind == crate::acp::state::BackgroundKind::Subagent {
+                continue;
+            }
+            *last = last.saturating_add(1);
+            sink.publish(session_id, *last, &lost_background_end(item.id, cause, at));
+            ended += 1;
         }
-        sink.publish(
-            session_id,
-            next_seq(next_seqs, session_id),
-            &lost_background_end(item.id, cause, at),
-        );
-        ended += 1;
-    }
-    ended
+        ended
+    })
 }
 
 /// Detach every sub-agent still unresolved, each preceded by its loss cause.
-/// The fold pairs that cause with `Detached` when the timestamps match.
-fn detach_background_agents<S: BroadcastSink + ?Sized>(
-    sink: &S,
-    next_seqs: &SeqMap,
+/// The fold pairs that cause with `Detached` when the timestamps match, so
+/// both rows are published under the same session lock.
+fn detach_background_agents<S: BroadcastSink>(
+    publisher: &SessionPublisher<S>,
     session_id: &str,
     cause: crate::acp::state::BackgroundLossCause,
 ) -> usize {
-    let ids = sink.unresolved_background_agent_ids(session_id);
     let at = chrono::Utc::now();
-    for agent_id in &ids {
-        sink.publish(
-            session_id,
-            next_seq(next_seqs, session_id),
-            &lost_background_end(agent_id.clone(), cause, at),
-        );
-        sink.publish(
-            session_id,
-            next_seq(next_seqs, session_id),
-            &Event::BackgroundAgentCompleted {
-                agent_id: agent_id.clone(),
-                status: BackgroundAgentStatus::Detached,
-                tools: Vec::new(),
-                result: None,
-                warning: None,
-                ended_at: at,
-            },
-        );
-    }
-    ids.len()
+    publisher.with_counter(session_id, |sink, last| {
+        let ids = sink.unresolved_background_agent_ids(session_id);
+        for agent_id in &ids {
+            *last = last.saturating_add(1);
+            sink.publish(
+                session_id,
+                *last,
+                &lost_background_end(agent_id.clone(), cause, at),
+            );
+            *last = last.saturating_add(1);
+            sink.publish(
+                session_id,
+                *last,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: agent_id.clone(),
+                    status: BackgroundAgentStatus::Detached,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: at,
+                },
+            );
+        }
+        ids.len()
+    })
 }
 
 fn lost_background_end(
