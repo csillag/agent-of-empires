@@ -1108,6 +1108,21 @@ fn agent_message_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Thinking-update body: the agent's between-tool narration, which Claude Code
+/// requests as thinking "updates". Rendered like a reply, under a small dimmed
+/// tag.
+fn agent_thought_lines(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    if text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![Line::from(Span::styled(
+        "↳ update",
+        Style::default().fg(theme.dimmed),
+    ))];
+    lines.extend(render_agent_message_lines(text));
+    lines
+}
+
 /// Agent reply as theme-neutral markdown, or `…` when it renders empty.
 fn render_agent_message_lines(text: &str) -> Vec<Line<'static>> {
     let body = crate::tui::markdown::render(text);
@@ -1152,6 +1167,22 @@ fn transcript_lines(
                     i += 1;
                 }
                 out.extend(agent_message_lines(&text, theme));
+                out.push(Line::default());
+                continue;
+            }
+            TranscriptRowKind::Thinking => {
+                // Same run-coalescing as `Message`, rendered under an update
+                // tag. See `TranscriptRowKind::Thinking`.
+                let group = &row.group_id;
+                let mut text = String::new();
+                while i < rows.len()
+                    && rows[i].kind == TranscriptRowKind::Thinking
+                    && &rows[i].group_id == group
+                {
+                    text.push_str(&rows[i].text);
+                    i += 1;
+                }
+                out.extend(agent_thought_lines(&text, theme));
                 out.push(Line::default());
                 continue;
             }

@@ -123,8 +123,11 @@ export function activityToThreadMessages(
     } else if (row.kind === "empty_output") {
       // A turn with no output (interactive-only slash commands) gets a muted note.
       currentAssistant.appendText(`_${row.text}_`);
-    } else if (row.kind !== "thinking") {
-      // Thinking shows in the spinner; message and unknown kinds render as text.
+    } else if (row.kind === "thinking") {
+      // A thinking update: between-tool narration Claude Code requests as
+      // display "updates". The thinking phase is still the spinner.
+      currentAssistant.appendThought(row.text);
+    } else {
       currentAssistant.appendText(row.text);
     }
   }
@@ -152,10 +155,19 @@ type DraftPart =
     };
 type ToolPart = Extract<DraftPart, { type: "tool-call" }>;
 
+/** A thinking update as plain message text under a small tag. */
+function formatUpdate(raw: string): string {
+  return `*↳ update*\n\n${raw.trim()}`;
+}
+
 class AssistantBuilder {
   private id: string;
   private createdAt?: Date;
   private parts: DraftPart[] = [];
+  /** The trailing part is an open update the next thought row extends. */
+  private thoughtRunOpen = false;
+  /** Verbatim text of the open update, as streamed. */
+  private thoughtRaw = "";
 
   constructor(id: string, createdAtIso: string) {
     this.id = `assistant-${id}`;
@@ -164,13 +176,35 @@ class AssistantBuilder {
 
   appendText(text: string) {
     if (!text) return;
+    // A trailing update is a text part too. Merging into it would put the
+    // answer under the update tag.
+    const afterThought = this.thoughtRunOpen;
+    this.thoughtRunOpen = false;
     const last = this.parts[this.parts.length - 1];
-    if (last && last.type === "text") last.text += text;
+    if (!afterThought && last && last.type === "text") last.text += text;
     else this.parts.push({ type: "text", text });
+  }
+
+  /** Append update text as its own tagged part. Consecutive thought rows
+   *  extend it. Fragments are joined verbatim and the whole part is re-rendered,
+   *  because they split mid-word. */
+  appendThought(text: string) {
+    if (!text) return;
+    const last = this.parts[this.parts.length - 1];
+    if (this.thoughtRunOpen && last && last.type === "text") {
+      this.thoughtRaw += text;
+      last.text = formatUpdate(this.thoughtRaw);
+      return;
+    }
+    if (!text.trim()) return;
+    this.thoughtRaw = text;
+    this.parts.push({ type: "text", text: formatUpdate(this.thoughtRaw) });
+    this.thoughtRunOpen = true;
   }
 
   /** assistant-ui parts carry no timestamps or titles, so they travel as namespaced args. */
   appendToolCall(tool: ToolCall) {
+    this.thoughtRunOpen = false;
     const argsObj = parseJsonObject(tool.args_preview) ?? {};
     if (tool.name) argsObj._aoe_title = tool.name;
     if (tool.started_at) argsObj._aoe_started_at = tool.started_at;

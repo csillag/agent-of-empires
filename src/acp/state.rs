@@ -582,6 +582,14 @@ pub enum Event {
     AgentMessageChunk {
         text: String,
     },
+    /// Reasoning-summary text from an ACP `agent_thought_chunk` that has words.
+    /// Recent models route narration into this channel instead of a text block,
+    /// so a turn can otherwise arrive as tool calls with no prose. Transcript
+    /// only: `ThinkingStarted` still carries the turn-activity signal. Empty
+    /// signature chunks produce none of these.
+    AgentThoughtChunk {
+        text: String,
+    },
     /// aoe sent `session/cancel` and armed the escalation watchdog.
     CancelRequested {
         escalates_at: DateTime<Utc>,
@@ -916,6 +924,7 @@ impl AcpState {
             | Event::ModeSwitchFailed { .. }
             | Event::RawAgentUpdate { .. }
             | Event::AgentMessageChunk { .. }
+            | Event::AgentThoughtChunk { .. }
             | Event::ConversationSummary { .. }
             | Event::WakeupScheduled { .. }
             | Event::MonitorArmed { .. } => {}
