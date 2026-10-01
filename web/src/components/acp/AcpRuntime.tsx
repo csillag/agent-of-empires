@@ -64,6 +64,7 @@ export interface AcpContext {
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   dismissConfigOptionSwitchFailed: () => void;
+  dismissConfigOptionDeferred: () => void;
   /** Older rows exist above the window, loaded or still on the server. */
   canLoadEarlierHistory: boolean;
   /** Reveal loaded older rows first, then fetch the next page. */
@@ -217,6 +218,7 @@ export function AcpRuntime({
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,
         dismissConfigOptionSwitchFailed: acp.dismissConfigOptionSwitchFailed,
+        dismissConfigOptionDeferred: acp.dismissConfigOptionDeferred,
         canLoadEarlierHistory: canOfferEarlier(canLoadEarlier, hasMoreOlder),
         loadEarlierHistory,
         loadingEarlierHistory: loadingOlder,

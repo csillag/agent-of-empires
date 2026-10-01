@@ -349,7 +349,9 @@ impl<S: BroadcastSink> Supervisor<S> {
                 default_effort: effort,
                 default_effort_explicit: req.effort_explicit,
                 default_mode: acp_defaults.and_then(|defaults| defaults.mode()),
-                default_model: model,
+                // `model` is already pin-resolved, so an assert carries the pin.
+                // Without an assert, a stored model is not re-applied.
+                default_model: req.assert_model.then_some(model).flatten(),
                 socket_path: Some(socket_path),
                 stored_acp_session_id,
                 fork_from,
@@ -858,15 +860,19 @@ pub(super) fn refresh_spawn_model_effort(
     config.default_effort = effort;
 }
 
-/// Point both model channels of a cached respawn config at `model`.
+/// Point the env channel at `model`. An existing config-option assert follows
+/// it, so a pin that moved cannot be overridden by a stale assert. A config
+/// with no assert stays without one.
 pub(super) fn set_spawn_model(config: &mut SpawnConfig, model: Option<String>) {
     config
         .provider_env
         .retain(|(key, _)| key != "AOE_AGENT_MODEL");
-    if let Some(model) = model.clone() {
+    if config.default_model.is_some() {
+        config.default_model = model.clone();
+    }
+    if let Some(model) = model {
         config.provider_env.push(("AOE_AGENT_MODEL".into(), model));
     }
-    config.default_model = model;
 }
 
 #[cfg(test)]

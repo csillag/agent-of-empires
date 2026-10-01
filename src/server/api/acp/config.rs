@@ -1,8 +1,9 @@
 //! Session mode and config-option selectors.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::acp::state::ConfigOptionCategory;
+use crate::acp::supervisor::SupervisorError;
 
 use super::*;
 
@@ -70,13 +71,30 @@ impl PersistedSelector {
         }
     }
 
-    fn apply(self, inst: &mut crate::session::Instance, value: String) {
+    /// `deferred` means no agent took a model pick, so the next spawn must
+    /// assert it. A live model pick disarms that flag.
+    fn apply(self, inst: &mut crate::session::Instance, value: String, deferred: bool) {
         match self {
-            Self::Model => inst.agent_model = Some(value),
+            Self::Model => {
+                inst.agent_model = Some(value);
+                inst.agent_model_pending = deferred;
+            }
             Self::Mode => inst.acp_mode_id = Some(value),
             Self::ThoughtLevel => inst.acp_effort = Some(value),
         }
     }
+}
+
+/// Body of a 202 from `acp_set_config_option`. `deferred` means the pick was
+/// stored for the next spawn because no worker was running.
+#[derive(Debug, Serialize)]
+pub struct SetConfigOptionResponse {
+    pub applied: &'static str,
+}
+
+impl SetConfigOptionResponse {
+    const LIVE: Self = Self { applied: "live" };
+    const DEFERRED: Self = Self { applied: "deferred" };
 }
 
 /// Write a picked value into memory (read by the reconciler) and to disk.
@@ -85,20 +103,22 @@ async fn persist_selector(
     id: &str,
     selector: PersistedSelector,
     value: &str,
+    deferred: bool,
 ) {
     let profile = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return;
         };
-        selector.apply(inst, value.to_string());
+        selector.apply(inst, value.to_string(), deferred);
         inst.source_profile.clone()
     };
     match crate::session::Storage::new(&profile, state.file_watch.clone()) {
         Ok(storage) => {
+            let value_owned = value.to_string();
             if let Err(e) = storage.update(|instances, _groups| {
                 if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    selector.apply(inst, value.to_string());
+                    selector.apply(inst, value_owned.clone(), deferred);
                 }
                 Ok(())
             }) {
@@ -119,6 +139,34 @@ async fn persist_selector(
             );
         }
     }
+}
+
+/// The active pin a parked model pick loses to, if it differs. Picking the
+/// pinned model itself is allowed.
+async fn model_pin_against(state: &Arc<AppState>, id: &str, value: &str) -> Option<String> {
+    let (tool, agent_override, profile, project_path) = {
+        let instances = state.instances.read().await;
+        let inst = instances.iter().find(|i| i.id == id)?;
+        (
+            inst.tool.clone(),
+            inst.agent_name.clone(),
+            inst.source_profile.clone(),
+            std::path::PathBuf::from(&inst.project_path),
+        )
+    };
+    let agent = state
+        .acp_supervisor
+        .pick_agent_for_tool(&tool, agent_override.as_deref(), &profile, &project_path)
+        .await;
+    let pinned = tokio::task::spawn_blocking(move || {
+        crate::session::config::profile_config::resolve_config_or_warn(&profile)
+            .acp
+            .pinned_model_for(&agent)
+    })
+    .await
+    .ok()
+    .flatten()?;
+    (pinned != value.trim()).then_some(pinned)
 }
 
 /// The category the session's agent advertised for `config_id`, from the
@@ -164,16 +212,8 @@ pub async fn acp_set_config_option(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    if let Err(e) = state
-        .acp_supervisor
-        .set_config_option(&id, &req.config_id, &req.value)
-        .await
-    {
-        return supervisor_error_response("set_config_option failed", &e);
-    }
-    count_plan_mode(&state, &req.value);
-    // The reconciler re-applies these fields on every spawn, so without the
-    // write-back a respawn reverts the pick (#3086).
+    // Persist before treating a missing worker as fatal: a parked session is
+    // stopped because of its model, and the pick has to survive until respawn.
     let selector = if req.config_id == "model" {
         Some(PersistedSelector::Model)
     } else {
@@ -184,16 +224,44 @@ pub async fn acp_set_config_option(
             Some(ConfigOptionCategory::Other(_)) | None => None,
         }
     };
-    if let Some(selector) = selector {
-        if selector == PersistedSelector::Model {
-            state
-                .acp_supervisor
-                .refresh_cached_model(&id, &req.value)
-                .await;
+    match state
+        .acp_supervisor
+        .set_config_option(&id, &req.config_id, &req.value)
+        .await
+    {
+        Ok(()) => {
+            count_plan_mode(&state, &req.value);
+            if let Some(selector) = selector {
+                if selector == PersistedSelector::Model {
+                    state
+                        .acp_supervisor
+                        .refresh_cached_model(&id, &req.value)
+                        .await;
+                }
+                persist_selector(&state, &id, selector, &req.value, false).await;
+            }
+            (StatusCode::ACCEPTED, Json(SetConfigOptionResponse::LIVE)).into_response()
         }
-        persist_selector(&state, &id, selector, &req.value).await;
+        Err(SupervisorError::UnknownSession(_)) if selector.is_some() => {
+            let selector = selector.unwrap();
+            if selector == PersistedSelector::Model {
+                if let Some(pinned) = model_pin_against(&state, &id, &req.value).await {
+                    return (
+                        StatusCode::CONFLICT,
+                        format!(
+                            "model is pinned: this session's agent is pinned to {pinned:?}, \
+                             so {:?} would not apply when it starts",
+                            req.value
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+            persist_selector(&state, &id, selector, &req.value, true).await;
+            (StatusCode::ACCEPTED, Json(SetConfigOptionResponse::DEFERRED)).into_response()
+        }
+        Err(e) => supervisor_error_response("set_config_option failed", &e),
     }
-    StatusCode::ACCEPTED.into_response()
 }
 
 #[cfg(test)]
@@ -226,7 +294,7 @@ mod tests {
                 .unwrap();
 
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
-            persist_selector(&state, &id, selector, value).await;
+            persist_selector(&state, &id, selector, value, false).await;
 
             let field = |inst: &crate::session::Instance| match selector {
                 PersistedSelector::Model => inst.agent_model.clone(),

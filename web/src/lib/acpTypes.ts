@@ -114,6 +114,13 @@ export interface ConfigOptionDescriptor {
   options: ConfigOptionChoice[];
 }
 
+/** A pick stored while no worker was running. It applies on the next spawn. */
+export interface ConfigOptionDeferred {
+  configId: string;
+  value: string;
+  at: string;
+}
+
 export interface ConfigOptionSwitchFailure {
   configId: string;
   value: string;
@@ -579,6 +586,8 @@ export interface AcpState {
   } | null;
   configOptions: ConfigOptionDescriptor[];
   configOptionSwitchFailed: ConfigOptionSwitchFailure | null;
+  /** Notice for a pick stored with no worker. Clears when a snapshot shows it applied. */
+  configOptionDeferred: ConfigOptionDeferred | null;
   /** A config option click awaiting the next snapshot; the picker keeps showing the confirmed value. */
   pendingConfigOption: { configId: string; value: string } | null;
   /** The adapter finished streaming but never sent `PromptResponse`; the runner is respawning. */
@@ -837,6 +846,7 @@ export function emptyAcpState(): AcpState {
     lastAgentSwitch: null,
     configOptions: [],
     configOptionSwitchFailed: null,
+    configOptionDeferred: null,
     pendingConfigOption: null,
   };
 }
@@ -957,6 +967,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       if (confirmed) {
         next.configOptionSwitchFailed = null;
       }
+    }
+    if (next.configOptionDeferred) {
+      const deferred = next.configOptionDeferred;
+      const applied = options.some((opt) => opt.id === deferred.configId && opt.current_value === deferred.value);
+      if (applied) next.configOptionDeferred = null;
     }
     return next;
   }
@@ -1130,6 +1145,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.rateLimitParked = false;
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
+    next.configOptionDeferred = null;
     next.pendingConfigOption = null;
     return next;
   }
@@ -1371,6 +1387,7 @@ export function normaliseTurnState(
     usageBaseline?: { cost: number } | null;
     configOptions?: ConfigOptionDescriptor[];
     configOptionSwitchFailed?: ConfigOptionSwitchFailure | null;
+    configOptionDeferred?: ConfigOptionDeferred | null;
     pendingConfigOption?: { configId: string; value: string } | null;
     compactionReminderDismissed?: SessionUsage | null;
   },
@@ -1387,6 +1404,7 @@ export function normaliseTurnState(
   const usageBaseline = state.usageBaseline === undefined ? null : state.usageBaseline;
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
+  const configOptionDeferred = state.configOptionDeferred === undefined ? null : state.configOptionDeferred;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
   const compactionReminderDismissed =
     state.compactionReminderDismissed === undefined ? null : state.compactionReminderDismissed;
@@ -1403,6 +1421,7 @@ export function normaliseTurnState(
     usageBaseline,
     configOptions,
     configOptionSwitchFailed,
+    configOptionDeferred,
     pendingConfigOption,
     compactionReminderDismissed,
     serverTurnActive,

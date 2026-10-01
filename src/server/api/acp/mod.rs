@@ -107,6 +107,7 @@ fn spawn_request_for(
         additional_dirs: vec![],
         provider_env: vec![],
         model: instance.agent_model.clone(),
+        assert_model: instance.agent_model_pending,
         effort: instance.acp_effort.clone(),
         effort_explicit: instance.acp_effort.is_some(),
         stored_acp_session_id: instance.acp_session_id.clone(),

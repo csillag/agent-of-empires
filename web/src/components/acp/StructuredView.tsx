@@ -27,7 +27,7 @@ import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { PlanStrip } from "./PlanStrip";
 import { ModeSwitchFailedNotice, QueuedPromptsStrip, RejectedPromptsStrip } from "./PromptStrips";
 import { SessionBanners } from "./SessionBanners";
-import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
+import { ConfigOptionDeferredNotice, ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { RateLimitRecoverySection, SystemNotices } from "./SystemNotices";
 import { AssistantMessage, UserMessage } from "./ThreadMessages";
@@ -399,6 +399,12 @@ function ComposerDock({
         failure={state.configOptionSwitchFailed}
         configOptions={state.configOptions}
         onDismiss={ctx.dismissConfigOptionSwitchFailed}
+      />
+
+      <ConfigOptionDeferredNotice
+        deferred={state.configOptionDeferred}
+        configOptions={state.configOptions}
+        onDismiss={ctx.dismissConfigOptionDeferred}
       />
 
       <ContextPrimerBanner

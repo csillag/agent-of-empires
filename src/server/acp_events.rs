@@ -187,6 +187,9 @@ pub(super) async fn acp_event_listener(state: Arc<AppState>) {
                     });
                 }
             }
+            // A confirming snapshot means the pick landed. One that does not
+            // leaves the flag armed so the next spawn retries.
+            clear_model_pending_if_applied(&state, &frame.session_id, options).await;
         }
 
         // Smart-rename defer.
@@ -654,6 +657,52 @@ pub(super) async fn recover_structured_unread_after_lag(
 }
 
 /// Fold a derived `AcpSessionChange` into an `Instance`.
+/// Clear `agent_model_pending` when the agent's model option shows the pin
+/// is current. A snapshot that does not confirm leaves it armed.
+async fn clear_model_pending_if_applied(
+    state: &Arc<AppState>,
+    session_id: &str,
+    options: &[crate::acp::state::ConfigOptionDescriptor],
+) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
+            return;
+        };
+        if !inst.agent_model_pending {
+            return;
+        }
+        let Some(pinned) = inst.agent_model.as_deref() else {
+            return;
+        };
+        let applied = options.iter().any(|opt| {
+            matches!(opt.category, crate::acp::state::ConfigOptionCategory::Model)
+                && opt.current_value == pinned
+        });
+        if !applied {
+            return;
+        }
+        inst.agent_model_pending = false;
+        inst.source_profile.clone()
+    };
+    let Ok(storage) = crate::session::Storage::new(&profile, state.file_watch.clone()) else {
+        return;
+    };
+    let id_owned = session_id.to_string();
+    if let Err(e) = storage.update(|instances, _groups| {
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+            inst.agent_model_pending = false;
+        }
+        Ok(())
+    }) {
+        tracing::warn!(
+            target: "acp.event_listener",
+            session = %session_id,
+            "failed to clear agent_model_pending: {e}"
+        );
+    }
+}
+
 pub(super) fn apply_acp_session_change(
     inst: &mut Instance,
     session_id: &str,

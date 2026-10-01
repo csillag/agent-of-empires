@@ -269,6 +269,41 @@ interface NoticeProps {
   onDismiss: () => void;
 }
 
+interface DeferredNoticeProps {
+  deferred: AcpState["configOptionDeferred"];
+  configOptions: AcpState["configOptions"];
+  onDismiss: () => void;
+}
+
+/** A pick stored while no worker was running. Clears when a snapshot shows it applied. */
+export function ConfigOptionDeferredNotice({ deferred, configOptions, onDismiss }: DeferredNoticeProps) {
+  if (!deferred) return null;
+  const config = configOptions.find((c) => c.id === deferred.configId);
+  const optionLabel = config?.options.find((o) => o.value === deferred.value)?.name ?? deferred.value;
+  const configLabel = config?.name ?? deferred.configId;
+  return (
+    <div
+      data-testid="config-option-deferred-notice"
+      role="status"
+      className="flex items-start gap-3 rounded-md border border-sky-800/60 bg-sky-950/40 px-3 py-2 text-[12px] text-sky-100"
+    >
+      <div className="flex-1">
+        <div className="font-medium">
+          {configLabel} will switch to {optionLabel} when the session starts
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={onDismiss}
+        aria-label="Dismiss notice"
+        className="rounded px-1.5 py-0.5 text-sky-100 hover:bg-sky-800/40"
+      >
+        Dismiss
+      </button>
+    </div>
+  );
+}
+
 /** The adapter rejected a config change; the reducer clears this once a snapshot confirms the value. */
 export function ConfigOptionSwitchFailedNotice({ failure, configOptions, onDismiss }: NoticeProps) {
   if (!failure) return null;
