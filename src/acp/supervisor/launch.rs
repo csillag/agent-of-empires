@@ -266,10 +266,9 @@ impl<S: BroadcastSink> Supervisor<S> {
             provider_env.push(("AOE_AGENT_MODEL".into(), model));
         }
         let session_dirs = crate::session::session_dirs::usable(&req.session_dirs);
-        // The session's directory list. A host agent also gets it in its
-        // environment, where a self-sandboxing agent's launcher reads it; a
-        // container-sandboxed agent sees container paths, so it gets neither
-        // the environment nor the read-only marking.
+        // A host agent gets the list in its environment. A container sandbox
+        // bind-mounts the directories itself, so it gets neither this
+        // environment nor the host read-only fs marking.
         let mut additional_dirs = req.additional_dirs.clone();
         for path in crate::session::session_dirs::all_paths(&session_dirs) {
             if !additional_dirs.contains(&path) {

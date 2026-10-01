@@ -465,7 +465,7 @@ impl Instance {
         } else {
             None
         };
-        container_config::build_container_config(
+        let mut config = container_config::build_container_config(
             &self.project_path,
             sandbox,
             container_config::ContainerAgentSelection::new(
@@ -478,7 +478,17 @@ impl Instance {
             &self.id,
             self.workspace_info.as_ref(),
             &self.source_profile,
-        )
+        )?;
+        // The container is the sandbox. Mount the host executable and the
+        // session directories; do not depend on the agent confining itself.
+        crate::session::sandbox_bind::confine_host_agent(
+            &mut config,
+            &self.tool,
+            self.get_tool_command(),
+            &self.session_dirs,
+            &self.id,
+        )?;
+        Ok(config)
     }
 
     /// Run `host_hooks.before_start` on the host and stash the resulting

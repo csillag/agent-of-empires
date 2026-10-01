@@ -6,11 +6,12 @@
 //! `Instance`, and handed to every spawn, respawn and reattach. How it is
 //! enforced depends on the agent:
 //!
+//! - AoE's container sandbox bind-mounts the directories into the container.
+//!   A read-only entry is mounted read-only. The agent is not asked to
+//!   enforce the list.
 //! - aoe's own `fs/*` handler (`crate::acp::fs_handler::FsPolicy`) allows the
 //!   listed directories, and refuses writes into read-only ones.
-//! - Every agent process gets [`ENV_READ_ONLY`] / [`ENV_READ_WRITE`], so a
-//!   launcher can pass the list to an agent that sandboxes itself (grok's
-//!   kernel sandbox takes it through a host wrapper).
+//! - A host process also receives [`ENV_READ_ONLY`] / [`ENV_READ_WRITE`].
 //! - ACP `additionalDirectories` carries all of them at `session/new`, for
 //!   agents that scope themselves by it (claude). That is advisory, not a
 //!   sandbox, and cannot express read-only.
